@@ -1,0 +1,7 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "results": []
+}

@@ -1,0 +1,6 @@
+/target/
+.env
+
+# Private workspace data must never enter the public repository.
+/.backlog/
+/.brv/

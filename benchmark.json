@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "Common Maven repository inspection commands",
+  "cases": [
+    {
+      "id": "find-slf4j-logger-class",
+      "description": "Find JARs containing org.slf4j.Logger",
+      "shell": {
+        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}\" -type f -name '*.jar' -exec sh -c 'jar tf \"$1\" 2>/dev/null | grep -q \"^org/slf4j/Logger.class$\" && printf \"%s\\n\" \"$1\"' _ {} \\;"
+      },
+      "mcp": {
+        "tool": "search_classes",
+        "arguments": {
+          "query": "org.slf4j.Logger"
+        }
+      }
+    },
+    {
+      "id": "list-slf4j-api-versions",
+      "description": "List locally available slf4j-api versions",
+      "shell": {
+        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}/org/slf4j/slf4j-api\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort"
+      },
+      "mcp": {
+        "tool": "list_artifact_versions",
+        "arguments": {
+          "group_id": "org.slf4j",
+          "artifact_id": "slf4j-api"
+        }
+      }
+    },
+    {
+      "id": "read-slf4j-logger-source",
+      "description": "Read org.slf4j.Logger from a sources JAR",
+      "shell": {
+        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}\" -type f -path '*/org/slf4j/slf4j-api/*/slf4j-api-*-sources.jar' -exec unzip -p '{}' org/slf4j/Logger.java \\;"
+      },
+      "mcp": {
+        "tool": "get_class_source",
+        "arguments": {
+          "class_name": "org.slf4j.Logger"
+        }
+      }
+    }
+  ]
+}

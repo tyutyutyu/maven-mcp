@@ -1,0 +1,34 @@
+---
+source: tests/mcp_scenarios.rs
+assertion_line: 102
+expression: execution.response
+---
+{
+  "checksums": [
+    "demo-1.0.jar.sha1"
+  ],
+  "coordinate": "org.example:demo:1.0",
+  "files": [
+    {
+      "classifier": "sources",
+      "file_name": "demo-1.0-sources.jar",
+      "kind": "jar",
+      "readable": true
+    },
+    {
+      "file_name": "demo-1.0.jar",
+      "kind": "jar",
+      "readable": true
+    },
+    {
+      "file_name": "demo-1.0.pom",
+      "kind": "pom"
+    }
+  ],
+  "found": true,
+  "last_updated_markers": [],
+  "repository_ids": [
+    "central"
+  ],
+  "snapshot": false
+}

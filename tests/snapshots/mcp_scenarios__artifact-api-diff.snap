@@ -1,0 +1,18 @@
+---
+source: tests/mcp_scenarios.rs
+assertion_line: 102
+expression: execution.response
+---
+{
+  "added_classes": [
+    "org.example.Inspectable"
+  ],
+  "artifact_id": "demo",
+  "changed_classes": [],
+  "current_version": "2.0",
+  "group_id": "org.example",
+  "previous_version": "1.0",
+  "removed_classes": [
+    "org.example.Bar"
+  ]
+}

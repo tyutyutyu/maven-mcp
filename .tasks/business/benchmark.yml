@@ -1,0 +1,31 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+tasks:
+  run:
+    desc: Benchmark paired shell commands and Maven MCP tool calls
+    vars:
+      SPEC: '{{.SPEC | default "benchmark.json"}}'
+      OUTPUT: '{{.OUTPUT | default "target/benchmark-results.json"}}'
+      MCP_URL: '{{.MCP_URL | default "http://127.0.0.1:8080/mcp"}}'
+      ITERATIONS: '{{.ITERATIONS | default "5"}}'
+      WARMUP: '{{.WARMUP | default "1"}}'
+      TIMEOUT_SECONDS: '{{.TIMEOUT_SECONDS | default "300"}}'
+      MAX_OUTPUT_BYTES: '{{.MAX_OUTPUT_BYTES | default "1048576"}}'
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: test -f "{{.SPEC}}"
+        msg: SPEC must point to an existing benchmark JSON file
+    cmds:
+      - >-
+        cargo run --locked --bin maven-benchmark --
+        --spec "{{.SPEC}}"
+        --mcp-url "{{.MCP_URL}}"
+        --output "{{.OUTPUT}}"
+        --iterations "{{.ITERATIONS}}"
+        --warmup "{{.WARMUP}}"
+        --timeout-seconds "{{.TIMEOUT_SECONDS}}"
+        --max-output-bytes "{{.MAX_OUTPUT_BYTES}}"
+        {{.CLI_ARGS}}

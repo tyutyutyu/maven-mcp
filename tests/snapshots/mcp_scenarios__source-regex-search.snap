@@ -1,0 +1,26 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "incomplete": false,
+  "results": [
+    {
+      "context": "package org.example; public class Foo { int version = 2; }",
+      "entry": "org/example/Foo.java",
+      "line": 1,
+      "source_jar": {
+        "artifact_id": "demo",
+        "class_count": 0,
+        "classifier": "sources",
+        "coordinate": "org.example:demo:2.0:sources",
+        "entry_count": 1,
+        "group_id": "org.example",
+        "path": "org/example/demo/2.0/demo-2.0-sources.jar",
+        "version": "2.0"
+      },
+      "truncated": false
+    }
+  ],
+  "scanned_bytes": 58
+}

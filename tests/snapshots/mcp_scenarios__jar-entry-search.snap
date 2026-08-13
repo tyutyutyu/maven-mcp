@@ -1,0 +1,20 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "entry": "META-INF/services/example.Service",
+      "jar": {
+        "artifact_id": "demo",
+        "class_count": 2,
+        "coordinate": "org.example:demo:1.0",
+        "entry_count": 6,
+        "group_id": "org.example",
+        "path": "org/example/demo/1.0/demo-1.0.jar",
+        "version": "1.0"
+      }
+    }
+  ]
+}

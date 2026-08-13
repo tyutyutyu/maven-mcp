@@ -1,0 +1,19 @@
+services:
+  maven-mcp:
+    build:
+      context: .
+      target: execution
+    environment:
+      MAVEN_PROJECT_ROOT: /workspace
+      MAVEN_EXECUTABLE: /usr/bin/mvn
+      MAVEN_EXECUTION_REPO_PATH: /execution-repository
+      MAVEN_EXECUTION_NETWORK: ${MAVEN_EXECUTION_NETWORK:-false}
+      MAVEN_TIMEOUT_SECONDS: ${MAVEN_TIMEOUT_SECONDS:-300}
+      MAX_MAVEN_OUTPUT_BYTES: ${MAX_MAVEN_OUTPUT_BYTES:-1048576}
+    volumes:
+      - type: bind
+        source: ${MAVEN_PROJECT_ROOT:?Set MAVEN_PROJECT_ROOT to the host Maven project}
+        target: /workspace
+      - type: bind
+        source: ${MAVEN_EXECUTION_REPO_PATH:?Set MAVEN_EXECUTION_REPO_PATH to a dedicated writable Maven repository}
+        target: /execution-repository

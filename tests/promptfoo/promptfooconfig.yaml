@@ -1,0 +1,88 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+description: Maven MCP natural-language tool selection and grounding
+
+prompts:
+  - |
+    You are a Maven repository assistant. Use the connected Maven MCP tools to
+    answer the user's request. Base every artifact, version, JAR, class, and
+    source claim on tool results. If a search is ambiguous, report all relevant
+    local matches. If there is no match, say so plainly and do not invent one.
+
+    User request: {{request}}
+
+providers:
+  - id: "{{ env.PROMPTFOO_PROVIDER }}"
+    config:
+      temperature: 0
+      mcp:
+        enabled: true
+        server:
+          url: "{{ env.PROMPTFOO_MCP_URL }}"
+          name: maven-mcp-fixture
+
+tests:
+  - description: positive class search with a version constraint
+    vars:
+      request: Which local JAR in version 2.0 contains org.example.Modern?
+    assert:
+      - type: javascript
+        value: file://assert-tool-call.cjs
+        config:
+          expectedTool: search_classes
+          expectedArgs:
+            query: Modern
+      - type: javascript
+        value: file://assert-grounded.cjs
+        config:
+          requiredAll: [org.example.Modern, "2.0"]
+          forbidden: ["3.0", org.example.Legacy]
+
+  - description: exact source lookup
+    vars:
+      request: Show me the local Java source of org.example.Foo from demo version 1.0.
+    assert:
+      - type: javascript
+        value: file://assert-tool-call.cjs
+        config:
+          expectedTool: get_class_source
+          expectedArgs:
+            class_name: org.example.Foo
+            version: "1.0"
+      - type: javascript
+        value: file://assert-grounded.cjs
+        config:
+          requiredAll: [org.example, Foo]
+          forbidden: ["3.0", org.example.Missing]
+
+  - description: ambiguous artifact request returns all local versions
+    vars:
+      request: What versions of the demo artifact are available locally under org.example?
+    assert:
+      - type: javascript
+        value: file://assert-tool-call.cjs
+        config:
+          expectedTool: list_artifact_versions
+          expectedArgs:
+            artifact_id: demo
+            group_id: org.example
+      - type: javascript
+        value: file://assert-grounded.cjs
+        config:
+          requiredAll: ["1.0", "2.0"]
+          forbidden: ["3.0"]
+
+  - description: no-match request stays grounded
+    vars:
+      request: Which local JAR contains org.example.DoesNotExist?
+    assert:
+      - type: javascript
+        value: file://assert-tool-call.cjs
+        config:
+          expectedTool: search_classes
+          expectedArgs:
+            query: DoesNotExist
+      - type: javascript
+        value: file://assert-grounded.cjs
+        config:
+          requiredAny: [no match, not found, does not exist, nincs, "0"]
+          forbidden: [demo-1.0.jar, demo-2.0.jar, "3.0"]

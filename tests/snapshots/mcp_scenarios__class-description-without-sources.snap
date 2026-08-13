@@ -1,0 +1,38 @@
+---
+source: tests/mcp_scenarios.rs
+assertion_line: 102
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "annotations": [],
+      "class_file_version": 61,
+      "class_name": "org.example.Inspectable",
+      "constructors": [],
+      "fields": [
+        {
+          "annotations": [],
+          "descriptor": "I",
+          "modifiers": [],
+          "name": "value",
+          "visibility": "public"
+        }
+      ],
+      "interfaces": [],
+      "jar": {
+        "artifact_id": "demo",
+        "class_count": 2,
+        "coordinate": "org.example:demo:2.0",
+        "entry_count": 2,
+        "group_id": "org.example",
+        "path": "org/example/demo/2.0/demo-2.0.jar",
+        "version": "2.0"
+      },
+      "methods": [],
+      "modifiers": [],
+      "super_class": "java.lang.Object",
+      "visibility": "public"
+    }
+  ]
+}

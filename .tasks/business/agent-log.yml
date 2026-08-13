@@ -1,0 +1,24 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+tasks:
+  analyze:
+    desc: Analyze agent terminal commands from a log file or directory
+    requires:
+      vars: [INPUT]
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: test -e "{{.INPUT}}"
+        msg: INPUT must point to an existing log file or directory
+    cmds:
+      - cargo run --locked --bin maven-agent-log -- "{{.INPUT}}" {{.CLI_ARGS}}
+
+  discover:
+    desc: Discover and analyze agent logs from known local storage roots
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo run --locked --bin maven-agent-log -- --discover {{.CLI_ARGS}}

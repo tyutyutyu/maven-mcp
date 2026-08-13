@@ -1,0 +1,335 @@
+scenarios:
+  - id: class-search-simple-name
+    title: Osztály keresése egyszerű névvel
+    description: A Foo osztály minden bináris JAR-verzióját megtalálja.
+    tool: search_classes
+    arguments:
+      query: Foo
+    expect:
+      result_count: 2
+      contains:
+        - class_name: org.example.Foo
+          jar:
+            coordinate: org.example:demo:1.0
+        - class_name: org.example.Foo
+          jar:
+            coordinate: org.example:demo:2.0
+
+  - id: class-search-case-insensitive-limit
+    title: Kis- és nagybetűtől független, limitált keresés
+    description: A keresés case-insensitive, és tiszteletben tartja a kliens limitjét.
+    tool: search_classes
+    arguments:
+      query: fOo
+      limit: 1
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+
+  - id: jar-search-by-version
+    title: JAR keresése artifact és verzió alapján
+    description: A bináris és a sources JAR is megjelenik a verzióra szűrt találatokban.
+    tool: search_jars
+    arguments:
+      query: demo:2.0
+    expect:
+      result_count: 2
+      contains:
+        - coordinate: org.example:demo:2.0
+          class_count: 2
+        - coordinate: org.example:demo:2.0:sources
+          classifier: sources
+
+  - id: jar-entry-search
+    title: Service descriptor keresése egy JAR-ban
+    description: A keresés egy kiválasztott JAR belső entry-neveire szűkíthető.
+    tool: search_jar_entries
+    arguments:
+      query: example.Service
+      jar: demo-1.0.jar
+    expect:
+      result_count: 1
+      contains:
+        - entry: META-INF/services/example.Service
+          jar:
+            coordinate: org.example:demo:1.0
+
+  - id: paginated-class-list
+    title: JAR osztálylistája lapozással
+    description: Az offset és limit csak a visszaadott class listát lapozza, a total teljes marad.
+    tool: list_jar_classes
+    arguments:
+      jar: org.example:demo:1.0
+      offset: 1
+      limit: 1
+    expect:
+      result_count: 1
+      contains:
+        - total: 2
+          offset: 1
+          classes:
+            - org.example.Foo
+
+  - id: source-by-version
+    title: Forráskód lekérése verzió alapján
+    description: A teljes osztálynév és artifact-verzió a megfelelő sources JAR-ra mutat.
+    tool: get_class_source
+    arguments:
+      class_name: org.example.Foo
+      version: "2.0"
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+          source_jar:
+            coordinate: org.example:demo:2.0:sources
+          entry: org/example/Foo.java
+          source: "package org.example; public class Foo { int version = 2; }"
+          truncated: false
+
+  - id: artifact-versions
+    title: Artifact elérhető verziói
+    description: GroupId és artifactId alapján rendezett verziólista érkezik.
+    tool: list_artifact_versions
+    arguments:
+      group_id: org.example
+      artifact_id: demo
+    expect:
+      equals:
+        org.example:demo:
+          - "1.0"
+          - "2.0"
+
+  - id: no-class-match
+    title: Nincs class találat
+    description: Ismeretlen osztálynévre üres, sikeres strukturált válasz érkezik.
+    tool: search_classes
+    arguments:
+      query: DoesNotExist
+    expect:
+      result_count: 0
+      equals:
+        results: []
+
+  - id: class-description-without-sources
+    title: Classfile API leírása forrás-JAR nélkül
+    description: A bináris classfile-ból hierarchia és public mezők kérdezhetők le.
+    tool: describe_class
+    arguments:
+      class_name: org.example.Inspectable
+      version: "2.0"
+      visibility: public
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Inspectable
+          visibility: public
+          super_class: java.lang.Object
+          fields:
+            - name: value
+              descriptor: I
+              visibility: public
+              modifiers: []
+              annotations: []
+
+  - id: exact-service-entry
+    title: Pontos service descriptor kiolvasása
+    description: Egy pontos JAR-entry UTF-8 tartalma strukturáltan érkezik.
+    tool: get_jar_entry
+    arguments:
+      jar: demo-1.0.jar
+      entry: META-INF/services/example.Service
+    expect:
+      result_count: 1
+      contains:
+        - entry: META-INF/services/example.Service
+          content_kind: text
+          text: org.example.Foo
+          original_size: 15
+          truncated: false
+
+  - id: artifact-pom-descriptor
+    title: Artifact POM descriptor
+    description: A deklarált POM property és dependency strukturáltan lekérdezhető.
+    tool: get_artifact_pom
+    arguments:
+      coordinate: org.example:demo:1.0
+    expect:
+      matches:
+        coordinate: org.example:demo:1.0
+        found: true
+        descriptor:
+          packaging: jar
+          properties:
+            java.version: "21"
+          dependencies:
+            - group_id: org.example
+              artifact_id: helper
+              version: ${helper.version}
+              scope: runtime
+              optional: false
+              exclusions: []
+
+  - id: artifact-health
+    title: Lokális artifact állapot
+    description: A checksum és repository-azonosító útvonal vagy credential nélkül látszik.
+    tool: diagnose_artifact
+    arguments:
+      coordinate: org.example:demo:1.0
+    expect:
+      matches:
+        coordinate: org.example:demo:1.0
+        found: true
+        snapshot: false
+        checksums:
+          - demo-1.0.jar.sha1
+        repository_ids:
+          - central
+
+  - id: class-member-search
+    title: Classfile mező keresése
+    description: A mezőnév case-insensitive kereséssel, pontos JAR-ra szűkítve található meg.
+    tool: search_class_members
+    arguments:
+      query: VALUE
+      jar: demo-2.0.jar
+    expect:
+      result_count: 2
+      contains:
+        - class_name: org.example.Foo
+          kind: field
+          name: value
+          signature: I
+        - class_name: org.example.Inspectable
+          kind: field
+          name: value
+          signature: I
+
+  - id: artifact-api-diff
+    title: Artifact verziók API-diffje
+    description: A lokális verziók hozzáadott és eltávolított public osztályai stabilan jelennek meg.
+    tool: compare_artifact_api
+    arguments:
+      group_id: org.example
+      artifact_id: demo
+      previous_version: "1.0"
+      current_version: "2.0"
+    expect:
+      matches:
+        added_classes:
+          - org.example.Inspectable
+        removed_classes:
+          - org.example.Bar
+        changed_classes: []
+
+  - id: jar-content-search
+    title: JAR-erőforrás tartalmi keresése
+    description: A service descriptor tartalma korlátozott kontextussal kereshető.
+    tool: search_jar_content
+    arguments:
+      query: example.foo
+      jar: demo-1.0.jar
+    expect:
+      result_count: 2
+      contains:
+        - entry: META-INF/services/example.Service
+          line: 1
+          context: org.example.Foo
+
+  - id: type-hierarchy-direct
+    title: Közvetlen osztályhierarchia keresése
+    description: A classfile superclass kapcsolat artifacthoz kötötten kereshető.
+    tool: search_type_hierarchy
+    arguments:
+      type_name: java.lang.Object
+      jar: demo-2.0.jar
+    expect:
+      result_count: 2
+      contains:
+        - type_name: org.example.Inspectable
+          relation: extends
+          depth: 1
+          path:
+            - java.lang.Object
+            - org.example.Inspectable
+
+  - id: source-regex-search
+    title: Regex keresés sources artifactban
+    description: Java forrás regexszel, sorszámmal és korlátozott kontextussal kereshető.
+    tool: search_source
+    arguments:
+      query: version\s*=\s*2
+      regex: true
+      jar: demo-2.0-sources.jar
+      context_lines: 1
+    expect:
+      result_count: 1
+      contains:
+        - entry: org/example/Foo.java
+          line: 1
+          truncated: false
+
+  - id: class-declaration-source
+    title: Osztálydeklaráció célzott forrása
+    description: Egy osztály teljes fájl helyett a deklaráció forrásrészleteként kérhető le.
+    tool: get_declaration_source
+    arguments:
+      class_name: org.example.Foo
+      version: "2.0"
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+          kind: class
+          name: org.example.Foo
+          source_jar:
+            coordinate: org.example:demo:2.0:sources
+          entry: org/example/Foo.java
+
+  - id: outbound-class-reference
+    title: Kimenő classfile-referencia keresése
+    description: A kiválasztott osztály constant pool típushivatkozása strukturáltan megjelenik.
+    tool: search_class_references
+    arguments:
+      class_name: org.example.Inspectable
+      direction: outbound
+      kind: class
+      jar: demo-2.0.jar
+    expect:
+      contains:
+        - source_class: org.example.Inspectable
+          target_owner: java.lang.Object
+          kind: class
+
+  - id: service-provider-search
+    title: ServiceLoader provider strukturált keresése
+    description: A META-INF/services kapcsolat service és provider mezőkre bontva érkezik.
+    tool: search_providers
+    arguments:
+      service: example.Service
+      descriptor_kind: service_loader
+    expect:
+      result_count: 1
+      contains:
+        - service: example.Service
+          provider: org.example.Foo
+          descriptor_kind: service_loader
+          entry: META-INF/services/example.Service
+          jar:
+            coordinate: org.example:demo:1.0
+
+  - id: spring-provider-search
+    title: Spring provider strukturált keresése
+    description: A spring.factories kulcs és provider külön mezőként kereshető.
+    tool: search_providers
+    arguments:
+      service: example.Factory
+      descriptor_kind: spring_factories
+    expect:
+      result_count: 1
+      contains:
+        - service: example.Factory
+          provider: org.example.Bar
+          descriptor_kind: spring_factories
+          entry: META-INF/spring.factories

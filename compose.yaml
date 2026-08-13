@@ -1,0 +1,24 @@
+services:
+  maven-mcp:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      MAVEN_REPO_PATH: /maven-repository
+      RUST_LOG: ${RUST_LOG:-maven_mcp=info}
+      MAX_RESULTS: ${MAX_RESULTS:-100}
+      MAX_SOURCE_BYTES: ${MAX_SOURCE_BYTES:-1048576}
+    volumes:
+      - type: bind
+        source: ${MAVEN_REPO_PATH:?Set MAVEN_REPO_PATH to the host Maven repository}
+        target: /maven-repository
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+

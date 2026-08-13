@@ -1,0 +1,86 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+tasks:
+  build:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo build --locked
+
+  format:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo fmt --check
+
+  lint:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo test --all-targets --locked
+
+  verify:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v npx
+        msg: npx is required for MCP conformance
+      - sh: command -v curl
+        msg: curl is required for MCP conformance
+      - sh: test -x scripts/test-pyramid.sh
+        msg: scripts/test-pyramid.sh must be executable
+    cmds:
+      - scripts/test-pyramid.sh
+
+  conformance:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v npx
+        msg: npx is required for MCP conformance
+      - sh: command -v curl
+        msg: curl is required for MCP conformance
+      - sh: test -x scripts/run-conformance.sh
+        msg: scripts/run-conformance.sh must be executable
+    cmds:
+      - scripts/run-conformance.sh {{.CLI_ARGS}}
+
+  inspector:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v npx
+        msg: npx is required for MCP Inspector
+      - sh: command -v curl
+        msg: curl is required for MCP Inspector
+      - sh: test -x scripts/run-inspector.sh
+        msg: scripts/run-inspector.sh must be executable
+    cmds:
+      - scripts/run-inspector.sh {{.CLI_ARGS}}
+
+  agent-eval:
+    requires:
+      vars: [PROMPTFOO_PROVIDER]
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v npx
+        msg: npx is required for Promptfoo
+      - sh: command -v curl
+        msg: curl is required for the fixture MCP server
+      - sh: test -x scripts/run-agent-eval.sh
+        msg: scripts/run-agent-eval.sh must be executable
+    cmds:
+      - scripts/run-agent-eval.sh

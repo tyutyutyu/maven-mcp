@@ -1,0 +1,39 @@
+---
+source: tests/mcp_scenarios.rs
+assertion_line: 102
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "class_name": "org.example.Foo",
+      "jar": {
+        "artifact_id": "demo",
+        "class_count": 2,
+        "coordinate": "org.example:demo:2.0",
+        "entry_count": 2,
+        "group_id": "org.example",
+        "path": "org/example/demo/2.0/demo-2.0.jar",
+        "version": "2.0"
+      },
+      "kind": "field",
+      "name": "value",
+      "signature": "I"
+    },
+    {
+      "class_name": "org.example.Inspectable",
+      "jar": {
+        "artifact_id": "demo",
+        "class_count": 2,
+        "coordinate": "org.example:demo:2.0",
+        "entry_count": 2,
+        "group_id": "org.example",
+        "path": "org/example/demo/2.0/demo-2.0.jar",
+        "version": "2.0"
+      },
+      "kind": "field",
+      "name": "value",
+      "signature": "I"
+    }
+  ]
+}
