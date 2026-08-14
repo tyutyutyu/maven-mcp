@@ -1,34 +1,27 @@
-use std::{
-    fs::File, io::Write, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration,
-};
+#![allow(dead_code)]
+
+use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use axum::Router;
-use maven_mcp::{
-    config::ProjectExecutionConfig, index::MavenIndex, project::MavenRunner, server::MavenMcpServer,
-};
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+use rmcp::{
+    RoleClient, ServiceExt,
+    service::RunningService,
+    transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 pub struct TestServer {
-    _repository: TempDir,
-    _project: Option<TempDir>,
-    endpoint: String,
-    cancellation: CancellationToken,
-    task: JoinHandle<()>,
+    repository: TempDir,
+    project: Option<TempDir>,
 }
 
 impl TestServer {
     pub async fn start() -> Result<Self> {
-        let repository = fixture_repository()?;
-        let index = Arc::new(MavenIndex::build(repository.path(), 50, 1024)?);
-        let handler = MavenMcpServer::new(index);
-        Self::start_handler(repository, None, handler).await
+        Ok(Self {
+            repository: fixture_repository()?,
+            project: None,
+        })
     }
 
     #[allow(dead_code)]
@@ -37,61 +30,51 @@ impl TestServer {
         let project = fixture_project()?;
         let execution_repository = project.path().join("execution-repository");
         std::fs::create_dir(&execution_repository)?;
-        let runner = MavenRunner::discover(&ProjectExecutionConfig {
-            project_root: project.path().to_owned(),
-            maven_executable: None,
-            execution_repository: Some(execution_repository),
-            timeout: Duration::from_secs(2),
-            max_output_bytes: 16_384,
-            max_results: 50,
-            network_enabled: false,
-        })?;
-        let index = Arc::new(MavenIndex::build(repository.path(), 50, 1024)?);
-        let handler = MavenMcpServer::with_runner(index, Some(Arc::new(runner)));
-        Self::start_handler(repository, Some(project), handler).await
-    }
-
-    async fn start_handler(
-        repository: TempDir,
-        project: Option<TempDir>,
-        handler: MavenMcpServer,
-    ) -> Result<Self> {
-        let cancellation = CancellationToken::new();
-        let service = StreamableHttpService::new(
-            move || Ok(handler.clone()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default()
-                .with_json_response(true)
-                .with_cancellation_token(cancellation.child_token()),
-        );
-        let router = Router::new().nest_service("/mcp", service);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let server_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(server_cancellation.cancelled_owned())
-                .await
-                .expect("test HTTP server should run");
-        });
-
         Ok(Self {
-            _repository: repository,
-            _project: project,
-            endpoint: format!("http://{address}/mcp"),
-            cancellation,
-            task,
+            repository,
+            project: Some(project),
         })
     }
 
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    pub async fn connect(&self) -> Result<RunningService<RoleClient, ()>> {
+        self.connect_with_pid().await.map(|(client, _)| client)
     }
 
-    pub async fn stop(self) -> Result<()> {
-        self.cancellation.cancel();
-        self.task.await.context("test server task panicked")?;
-        Ok(())
+    pub async fn connect_with_pid(&self) -> Result<(RunningService<RoleClient, ()>, u32)> {
+        let command =
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp")).configure(|command| {
+                command
+                    .env("MAVEN_REPO_PATH", self.repository.path())
+                    .env("MAX_RESULTS", "50")
+                    .env("MAX_SOURCE_BYTES", "1024")
+                    .env("RUST_LOG", "maven_mcp=warn");
+                if let Some(project) = &self.project {
+                    command
+                        .env("MAVEN_PROJECT_ROOT", project.path())
+                        .env(
+                            "MAVEN_EXECUTION_REPO_PATH",
+                            project.path().join("execution-repository"),
+                        )
+                        .env("MAVEN_TIMEOUT_SECONDS", "2")
+                        .env("MAX_MAVEN_OUTPUT_BYTES", "16384");
+                }
+            });
+        let transport = TokioChildProcess::new(command)?;
+        let process_id = transport.id().context("missing STDIO server process id")?;
+        let client = tokio::time::timeout(Duration::from_secs(300), ().serve(transport))
+            .await
+            .context("STDIO MCP server startup timed out")?
+            .context("STDIO MCP client initialization failed")?;
+        Ok((client, process_id))
+    }
+
+    #[allow(dead_code)]
+    pub fn repository_path(&self) -> &Path {
+        self.repository.path()
+    }
+
+    pub fn project_path(&self) -> Option<&Path> {
+        self.project.as_ref().map(TempDir::path)
     }
 }
 

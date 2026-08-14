@@ -17,7 +17,7 @@ providers:
       mcp:
         enabled: true
         server:
-          url: "{{ env.PROMPTFOO_MCP_URL }}"
+          command: "{{ env.PROMPTFOO_MCP_COMMAND }}"
           name: maven-mcp-fixture
 
 tests:

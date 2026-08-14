@@ -23,7 +23,7 @@ fn promptfoo_agent_eval_is_versioned_and_covers_required_request_classes() -> Re
             .is_some_and(|assertions| assertions.len() == 2)
     }));
     assert!(yaml.contains("env.PROMPTFOO_PROVIDER"));
-    assert!(yaml.contains("env.PROMPTFOO_MCP_URL"));
+    assert!(yaml.contains("env.PROMPTFOO_MCP_COMMAND"));
 
     let script = std::fs::read_to_string("scripts/run-agent-eval.sh")?;
     assert!(script.contains("PROMPTFOO_VERSION=\"0.121.19\""));

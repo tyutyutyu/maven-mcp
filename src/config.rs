@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 
@@ -21,7 +21,6 @@ pub struct ProjectExecutionConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub repository: PathBuf,
-    pub bind_address: SocketAddr,
     pub max_results: usize,
     pub max_source_bytes: usize,
     pub project_execution: Option<ProjectExecutionConfig>,
@@ -39,17 +38,11 @@ impl Config {
             );
         }
 
-        let bind_address = env::var("BIND_ADDRESS")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
-            .parse()
-            .context("BIND_ADDRESS must be an IP:port value")?;
-
         let project_execution = project_execution_from_env()?;
         validate_distinct_repositories(&repository, project_execution.as_ref())?;
 
         Ok(Self {
             repository,
-            bind_address,
             max_results: positive_env("MAX_RESULTS", DEFAULT_MAX_RESULTS)?,
             max_source_bytes: positive_env("MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES)?,
             project_execution,

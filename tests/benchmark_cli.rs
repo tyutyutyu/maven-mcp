@@ -37,14 +37,15 @@ async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Re
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-benchmark"))
         .arg("--spec")
         .arg(&spec_path)
-        .arg("--mcp-url")
-        .arg(server.endpoint())
+        .arg("--mcp-command")
+        .arg(env!("CARGO_BIN_EXE_maven-mcp"))
         .arg("--output")
         .arg(&output_path)
         .arg("--iterations")
         .arg("2")
         .arg("--warmup")
         .arg("1")
+        .env("MAVEN_REPO_PATH", server.repository_path())
         .output()
         .await?;
     assert!(
@@ -99,14 +100,11 @@ async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Re
     assert_eq!(failed["mcp"]["runs"][0]["success"], false);
     assert!(failed["mcp"]["runs"][0]["error"].is_string());
 
-    server.stop().await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn benchmark_cli_preserves_shell_results_when_mcp_is_unreachable() -> Result<()> {
-    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let endpoint = format!("http://{}/mcp", unavailable.local_addr()?);
     let directory = tempfile::tempdir()?;
     let spec_path = directory.path().join("benchmark.json");
     let output_path = directory.path().join("results.json");
@@ -126,8 +124,8 @@ async fn benchmark_cli_preserves_shell_results_when_mcp_is_unreachable() -> Resu
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-benchmark"))
         .arg("--spec")
         .arg(&spec_path)
-        .arg("--mcp-url")
-        .arg(endpoint)
+        .arg("--mcp-command")
+        .arg(directory.path().join("missing-maven-mcp"))
         .arg("--output")
         .arg(&output_path)
         .arg("--iterations")
@@ -147,7 +145,7 @@ async fn benchmark_cli_preserves_shell_results_when_mcp_is_unreachable() -> Resu
         report["cases"][0]["mcp"]["runs"][0]["error"]
             .as_str()
             .unwrap()
-            .contains("initialization")
+            .contains("cannot start MCP command")
     );
     Ok(())
 }

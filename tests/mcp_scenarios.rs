@@ -3,7 +3,7 @@ mod support;
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
+use rmcp::model::CallToolRequestParams;
 use serde::Deserialize;
 use serde_json::Value;
 use support::TestServer;
@@ -45,11 +45,7 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     ensure_unique_ids(&catalog.scenarios)?;
 
     let server = TestServer::start().await?;
-    let client = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            server.endpoint().to_owned(),
-        ))
-        .await?;
+    let client = server.connect().await?;
     let mut executions = Vec::with_capacity(catalog.scenarios.len());
 
     for scenario in catalog.scenarios {
@@ -80,7 +76,6 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     }
 
     client.cancel().await?;
-    server.stop().await?;
     write_markdown_report(&executions)?;
 
     let semantic_failures = executions
@@ -204,7 +199,7 @@ fn write_markdown_report(executions: &[Execution]) -> Result<()> {
     fs::create_dir_all(&report_dir)?;
     let mut report = String::from(
         "# Maven MCP keresési riport\n\n\
-         A riport a `tests/scenarios/maven_search.yaml` scenario-k valódi Streamable HTTP MCP-hívásaiból készült.\n\n",
+         A riport a `tests/scenarios/maven_search.yaml` scenario-k valódi child-process STDIO MCP-hívásaiból készült.\n\n",
     );
     let passed = executions
         .iter()

@@ -5,8 +5,6 @@ version: "3"
 includes:
   dev:
     taskfile: ./.tasks/development.yml
-  mcp:
-    taskfile: ./.tasks/business/mcp.yml
   agent-log:
     taskfile: ./.tasks/business/agent-log.yml
   benchmark:

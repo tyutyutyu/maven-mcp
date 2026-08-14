@@ -2,10 +2,10 @@
 
 ## Project Overview
 
-`maven-mcp` is a Docker-ready MCP server written in Rust 2024. At startup, it
+`maven-mcp` is a native STDIO MCP server written in Rust 2024. At startup, it
 reads the local Maven repository under `MAVEN_REPO_PATH`, builds an in-memory
 index of JARs, classes, sources, and artifact versions, and exposes them through
-searchable Streamable HTTP MCP tools.
+searchable MCP tools. The MCP host owns the child-process lifecycle.
 
 The primary user documentation is `README.md`, the testing strategy is in
 `docs/testing.md`, and architectural decisions are recorded under
@@ -16,9 +16,7 @@ The primary user documentation is `README.md`, the testing strategy is in
 - Rust `1.89` or later, using the 2024 edition.
 - Cargo; always use the versioned `Cargo.lock` file and the `--locked` flag for
   reproducible commands.
-- The full conformance layer requires `node`, `npx`, and `curl`.
-- Container validation requires Docker, and Compose workflows require Docker
-  Compose.
+- Inspector and agent evaluation require `node` and `npx`.
 - The project has no database and no separate build-time code generation step.
 
 ## Repository Map
@@ -27,17 +25,17 @@ The primary user documentation is `README.md`, the testing strategy is in
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
   index, and all search operations.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
-- `src/main.rs`: startup indexing, the Axum router, `/mcp`, `/healthz`, shutdown,
-  and the container-internal health check.
+- `src/main.rs`: startup indexing, STDIO transport, EOF, SIGINT, and SIGTERM
+  lifecycle.
 - `tests/support/mod.rs`: deterministic temporary Maven fixture repository and a
-  real Streamable HTTP test server bound to a random port.
+  real child-process STDIO test server.
 - `tests/mcp_interface.rs`: integration contract for the public MCP tool catalog
   and error semantics.
 - `tests/scenarios/maven_search.yaml`: human-readable search examples.
 - `tests/mcp_scenarios.rs`: scenario interpretation, semantic validation,
   snapshots, and Markdown report generation.
 - `tests/snapshots/`: reviewable public MCP response contracts.
-- `scripts/`: full verification, MCP conformance, and Inspector entry points.
+- `scripts/`: full verification, Inspector, and agent-evaluation entry points.
 
 ## Important Architectural Contracts
 
@@ -67,7 +65,6 @@ The primary user documentation is `README.md`, the testing strategy is in
 `MAVEN_REPO_PATH` is required and must point to an existing directory. Other
 variables are:
 
-- `BIND_ADDRESS`, default: `0.0.0.0:8080`.
 - `MAX_RESULTS`, default: `100`; must be a positive integer.
 - `MAX_SOURCE_BYTES`, default: `1048576`; must be a positive integer.
 - `RUST_LOG`, recommended default: `maven_mcp=info`.
@@ -78,9 +75,10 @@ Run locally:
 MAVEN_REPO_PATH="$HOME/.m2/repository" cargo run --locked
 ```
 
-The MCP endpoint is `http://localhost:8080/mcp`, and the liveness endpoint is
-`http://localhost:8080/healthz`. The index is rebuilt only at startup; restart
-the server after changing a fixture or repository.
+The binary speaks MCP JSON-RPC on stdout and writes diagnostics to stderr. There
+is no port or health endpoint. The index is rebuilt only at startup; let the MCP
+host restart the child after changing a fixture or repository. Configure a
+300-second host startup timeout for large repositories.
 
 ## Development Rules
 
@@ -142,18 +140,17 @@ The complete pre-handoff verification gate is:
 scripts/test-pyramid.sh
 ```
 
-It runs formatting, warning-as-error Clippy, every Cargo test target, and the
-pinned MCP conformance scenarios applicable to the production capabilities.
-The npm-based steps may require network access on their first run.
+It runs formatting, warning-as-error Clippy, and every Cargo test target. The
+integration, lifecycle, scenario, and snapshot targets all start the production
+binary through a real child-process STDIO MCP client.
 
 Test modification rules:
 
 - Cover algorithmic edge cases in the unit tests in `src/index.rs`.
-- Always validate the public protocol through a real Streamable HTTP MCP client;
-  do not rely only on direct Rust method calls.
-- Integration tests must use a temporary fixture repository and
-  `127.0.0.1:0`. They must not depend on the developer's `~/.m2` contents or a
-  fixed port.
+- Always validate the public protocol through a real child-process STDIO MCP
+  client; do not rely only on direct Rust method calls.
+- Integration tests must use a temporary fixture repository. They must not
+  depend on the developer's `~/.m2` contents or a network port.
 - YAML scenario `id` values must be unique and stable because they also become
   snapshot names.
 - Scenario expectations must target public results through `result_count`,
@@ -171,33 +168,17 @@ scripts/run-inspector.sh
 scripts/run-inspector.sh --cli --method tools/list
 ```
 
-## Docker and Runtime Security
+## Native Runtime Security
 
-Build and start with Compose:
-
-```bash
-docker build -t maven-mcp .
-MAVEN_REPO_PATH="$HOME/.m2/repository" docker compose up --build
-```
-
-Docker runtime invariants:
-
-- multi-stage release build;
-- numeric non-root user `10001:10001`;
-- read-only bind mount for the Maven repository;
-- read-only root filesystem and a constrained `/tmp` tmpfs;
-- all capabilities dropped and `no-new-privileges` enabled;
-- a health check that uses the binary's own `--healthcheck` mode;
-- the MCP port published only on `127.0.0.1` by default.
-
-After changing the Dockerfile or Compose configuration, run at least:
-
-```bash
-MAVEN_REPO_PATH="$HOME/.m2/repository" docker compose config --quiet
-docker build -t maven-mcp .
-```
-
-Do not copy a Maven repository, credentials, or an `.env` file into the image.
+- STDIO is the only supported transport; do not add a listening socket or
+  daemon lifecycle without a separately approved ADR.
+- stdout is protocol-only. Logging and diagnostics must remain on stderr.
+- Project execution remains absent unless `MAVEN_PROJECT_ROOT` explicitly names
+  a trusted local project. Never infer trust from the client working directory.
+- Native Maven execution is not a sandbox; plugins and tests run with the local
+  user's permissions.
+- EOF, SIGINT, and SIGTERM must stop the server and every active Maven process
+  group without leaving an orphan.
 
 ## Documentation and Handoff
 
