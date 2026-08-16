@@ -9,11 +9,10 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
-axum = "0.8"
 cafebabe = "0.9"
 clap = { version = "4.6.4", features = ["derive"] }
 nix = { version = "0.31.3", features = ["signal"] }
-rmcp = { version = "3.1.1", features = ["client", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+rmcp = { version = "3.1.1", features = ["client", "transport-child-process", "transport-io"] }
 rayon = "1.11"
 quick-xml = { version = "0.41", features = ["serialize"] }
 regex = "1.12"
@@ -30,7 +29,7 @@ zip = { version = "8.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 insta = { version = "1.48", features = ["json"] }
-rmcp = { version = "3.1.1", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "3.1.1", features = ["client", "transport-child-process", "transport-io"] }
 serde_yaml_ng = "0.10"
 tempfile = "3.20"
 

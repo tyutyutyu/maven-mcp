@@ -3,7 +3,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
+use rmcp::model::CallToolRequestParams;
 use serde_json::{Map, Value, json};
 use support::TestServer;
 
@@ -22,13 +22,9 @@ fn structured(result: rmcp::model::CallToolResult) -> Value {
 }
 
 #[tokio::test]
-async fn streamable_http_mcp_exposes_and_executes_all_tools() -> Result<()> {
+async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
     let server = TestServer::start().await?;
-    let client = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            server.endpoint().to_owned(),
-        ))
-        .await?;
+    let client = server.connect().await?;
 
     let tools = client.list_all_tools().await?;
     let actual_names = tools
@@ -396,17 +392,13 @@ async fn streamable_http_mcp_exposes_and_executes_all_tools() -> Result<()> {
     assert_eq!(versions["org.example:demo"], json!(["1.0", "2.0"]));
 
     client.cancel().await?;
-    server.stop().await
+    Ok(())
 }
 
 #[tokio::test]
-async fn streamable_http_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
+async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
     let server = TestServer::start().await?;
-    let client = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            server.endpoint().to_owned(),
-        ))
-        .await?;
+    let client = server.connect().await?;
 
     let missing_argument = client
         .call_tool(CallToolRequestParams::new("search_classes"))
@@ -458,17 +450,13 @@ async fn streamable_http_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<
     );
 
     client.cancel().await?;
-    server.stop().await
+    Ok(())
 }
 
 #[tokio::test]
 async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> {
     let server = TestServer::start_with_project().await?;
-    let client = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            server.endpoint().to_owned(),
-        ))
-        .await?;
+    let client = server.connect().await?;
 
     let tools = client.list_all_tools().await?;
     let names = tools
@@ -600,5 +588,5 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     assert_eq!(gaps["gaps"][0]["class_name"], "org.example.Foo");
 
     client.cancel().await?;
-    server.stop().await
+    Ok(())
 }

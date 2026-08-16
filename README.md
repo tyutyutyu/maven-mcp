@@ -1,8 +1,8 @@
 # Maven MCP
 
-A Docker-ready MCP server written in Rust that indexes a local Maven repository
-in memory at startup. Its MCP Streamable HTTP endpoint is
-`http://localhost:8080/mcp`.
+A native MCP server written in Rust that indexes a local Maven repository in
+memory at startup. An MCP host such as Codex or GitHub Copilot starts the binary
+as a child process and communicates with it exclusively over STDIO.
 
 ## Features
 
@@ -100,62 +100,80 @@ result limits prevented a complete search.
 `META-INF/spring/*.imports`. Spring `.handlers` and `.schemas` files are not
 provider descriptors and therefore are not included in this structured view.
 
-## Start with Docker Compose
+## Native STDIO startup
 
 ```bash
 export MAVEN_REPO_PATH="$HOME/.m2/repository"
-docker compose up --build
+cargo build --release --locked --bin maven-mcp
 ```
 
-The host repository is mounted read-only into the container. The complete index
-is built before the MCP endpoint opens, so the first startup may take longer for
-a large repository.
+Configure the MCP host to run the resulting `target/release/maven-mcp` binary and
+pass `MAVEN_REPO_PATH` in its environment. The host owns process startup,
+shutdown, and STDIO; there is no port, URL, daemon, health endpoint, Docker
+image, or manual server lifecycle. Allow up to 300 seconds for cold startup on
+a large repository. The complete index is built before initialization finishes.
 
-Use this Streamable HTTP URL in MCP client configuration:
-
-```text
-http://localhost:8080/mcp
-```
-
-Example with MCP Inspector:
+For local source-tree inspection, the bundled helper builds the binary and lets
+MCP Inspector start it over STDIO:
 
 ```bash
-npx @modelcontextprotocol/inspector http://localhost:8080/mcp
+scripts/run-inspector.sh
+scripts/run-inspector.sh --cli --method tools/list
 ```
 
-## Run Docker Directly
+### Codex project configuration
+
+In a trusted project, add `.codex/config.toml` with an absolute installed binary
+path:
+
+```toml
+[mcp_servers.maven-mcp]
+command = "/absolute/path/to/maven-mcp"
+startup_timeout_sec = 300
+
+[mcp_servers.maven-mcp.env]
+MAVEN_REPO_PATH = "/home/user/.m2/repository"
+```
+
+Alternatively, register the same STDIO command with `codex mcp add`. Verify it
+with `codex mcp list` or `/mcp`. See the
+[official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+### GitHub Copilot CLI configuration
+
+Copilot CLI defaults local commands to STDIO. Register the installed binary and
+300-second timeout from a shell where the Maven repository path is known:
 
 ```bash
-docker build -t maven-mcp .
-docker run --rm \
-  -p 127.0.0.1:8080:8080 \
-  -v "$HOME/.m2/repository:/maven-repository:ro" \
-  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
-  maven-mcp
+copilot mcp add \
+  --env MAVEN_REPO_PATH="$HOME/.m2/repository" \
+  --timeout 300000 \
+  maven-mcp -- /absolute/path/to/maven-mcp
+copilot mcp get maven-mcp
 ```
+
+See the
+[official GitHub Copilot CLI MCP documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
 
 ## Opt-in Project Execution
 
-The default image contains only the read-only repository indexer. The larger
-`execution` target, which includes the JDK and Maven, can be built separately
-and started with the additional Compose file:
+Project execution is enabled only when the MCP host explicitly supplies a
+trusted local project root:
 
 ```bash
 export MAVEN_REPO_PATH="$HOME/.m2/repository"
 export MAVEN_PROJECT_ROOT="$PWD"
 mkdir -p "$HOME/.cache/maven-mcp/repository"
 export MAVEN_EXECUTION_REPO_PATH="$HOME/.cache/maven-mcp/repository"
-docker compose -f compose.yaml -f compose.execution.yaml up --build
 ```
 
-The project mount is writable because Maven creates `target/` files; the indexed
-repository remains read-only. The execution repository must be a separate,
-dedicated, writable directory. Maven-level networking is offline by default
-(`--offline`); set `MAVEN_EXECUTION_NETWORK=true` to enable it, but restricting
-the container network remains the operator's responsibility. The server does
-not accept raw Maven goals or arguments, runs one build at a time, applies time
-and output limits, and redacts paths and common credential patterns. This is not
-a security sandbox for malicious project code. See
+The project is writable because Maven creates `target/` files. The execution
+repository must be a separate, dedicated writable directory. Maven is offline
+by default (`--offline`); set `MAVEN_EXECUTION_NETWORK=true` only for a trusted
+project that may resolve dependencies and plugins. The server does not accept
+raw Maven goals or arguments, runs one build at a time, applies time and output
+limits, and redacts paths and common credential patterns. Native execution is
+not a sandbox: Maven plugins and tests run with the local user's permissions. See
 [ADR-0002](docs/decisions/0002-opt-in-project-scoped-maven-execution.md) for the
 detailed decision and threat model.
 
@@ -163,8 +181,7 @@ detailed decision and threat model.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MAVEN_REPO_PATH` | required; `/maven-repository` in the image | Root of the Maven repository. |
-| `BIND_ADDRESS` | `0.0.0.0:8080` | HTTP listen address. |
+| `MAVEN_REPO_PATH` | required | Root of the Maven repository. |
 | `MAX_RESULTS` | `100` | Maximum number of items in one tool response. |
 | `MAX_SOURCE_BYTES` | `1048576` | Maximum size of one source, exact JAR entry, or processed class/resource; returned content is truncated, while oversized inspection input is skipped or reported as an error. |
 | `MAVEN_PROJECT_ROOT` | none | Root for opt-in project execution; a valid `pom.xml` is required. |
@@ -230,8 +247,9 @@ classification, statistics, and reporting remain fully deterministic.
 
 `maven-benchmark` performs paired speed and data-volume measurements for
 previously discovered agent commands and MCP tool calls serving the same goal.
-It connects to an already running Maven MCP server and writes measurements to a
-versioned JSON file from which a separate report can be generated later.
+It starts the configured Maven MCP command as a STDIO child process and writes
+measurements to a versioned JSON file from which a separate report can be
+generated later.
 
 Benchmark specification format:
 
@@ -261,9 +279,11 @@ have reviewed. `cwd` is optional. MCP `arguments` can be omitted when the tool
 expects no arguments. Case IDs must be unique.
 
 ```bash
+cargo build --locked --bin maven-mcp
+export MAVEN_REPO_PATH="$HOME/.m2/repository"
 cargo run --locked --bin maven-benchmark -- \
   --spec benchmark.json \
-  --mcp-url http://127.0.0.1:8080/mcp \
+  --mcp-command target/debug/maven-mcp \
   --iterations 10 \
   --warmup 2 \
   --timeout-seconds 300 \
@@ -303,8 +323,6 @@ task --list-all
 Main user workflows:
 
 ```bash
-MAVEN_REPO_PATH="$HOME/.m2/repository" task mcp:serve
-
 task agent-log:analyze INPUT="$HOME/.codex/sessions" -- \
   --format markdown --category maven
 task agent-log:discover -- --format terminal
@@ -320,7 +338,7 @@ SLF4J class, version, and source lookup commands. The shell side inspects
 
 Every benchmark variable can be overridden. Defaults are `SPEC=benchmark.json`,
 `OUTPUT=target/benchmark-results.json`,
-`MCP_URL=http://127.0.0.1:8080/mcp`, `ITERATIONS=5`, `WARMUP=1`,
+`MCP_COMMAND=target/debug/maven-mcp`, `ITERATIONS=5`, `WARMUP=1`,
 `TIMEOUT_SECONDS=300`, and `MAX_OUTPUT_BYTES=1048576`. Arguments following `--`
 are forwarded unchanged by the `agent-log` and `benchmark` tasks.
 
@@ -333,14 +351,13 @@ task dev:format
 task dev:lint
 task dev:test
 task dev:verify
-task dev:conformance -- --scenario server-initialize
 task dev:inspector -- --cli --method tools/list
 PROMPTFOO_PROVIDER="openai:responses:gpt-5-mini" task dev:agent-eval
 ```
 
 `dev:verify` runs the complete existing `scripts/test-pyramid.sh` gate. The
-conformance, Inspector, and agent-eval tasks require `npx`; HTTP readiness checks
-require `curl`. The Taskfile checks these prerequisites before starting.
+Inspector and agent-eval tasks require `npx`; both launch the MCP binary
+directly over STDIO.
 
 ## Local Development
 
@@ -351,18 +368,20 @@ MAVEN_REPO_PATH="$HOME/.m2/repository" cargo run
 
 Unit tests cover Maven coordinate recognition, search, pagination, classifier
 and multi-release JAR handling, source filtering, truncation, and malformed
-JARs. Integration tests use a real Streamable HTTP MCP server bound to a random
-local port and a real MCP client. They can also be run separately:
+JARs. Integration tests start the real binary as a child-process STDIO MCP
+server and use a real MCP client. They can also be run separately:
 
 ```bash
 cargo test --test mcp_interface
 ```
 
 The integration contract separately verifies that project tools are hidden by
-default and executable through a real HTTP MCP client in opt-in mode.
+default and executable through a real STDIO MCP client in opt-in mode. Lifecycle
+tests ensure EOF and SIGTERM stop the process and stdout contains JSON-RPC only.
 
-Run the complete test pyramid—unit tests, MCP integration, YAML scenarios, JSON
-snapshots, Markdown report, and official MCP conformance—with one command:
+Run the complete test pyramid—unit tests, real child-process STDIO MCP
+integration and lifecycle tests, YAML scenarios, JSON snapshots, and a Markdown
+report—with one command:
 
 ```bash
 scripts/test-pyramid.sh
@@ -389,8 +408,9 @@ scripts/run-agent-eval.sh
 ```
 
 The script pins Promptfoo `0.121.19`, regenerates the
-`target/promptfoo/maven-repository` fixture from Rust, starts a local MCP server,
-runs the evaluation with caching disabled, and exits non-zero on a failed test.
+`target/promptfoo/maven-repository` fixture from Rust, lets Promptfoo start the
+local server over STDIO, runs the evaluation with caching disabled, and exits
+non-zero on a failed test.
 The reviewable HTML is written to `target/promptfoo/report.html`, and the complete
 machine-readable JSON to `target/promptfoo/results.json`. The provider/model is
 configured only through `PROMPTFOO_PROVIDER`, while authentication comes from
@@ -405,9 +425,6 @@ Start MCP Inspector with the fixture repository:
 scripts/run-inspector.sh
 ```
 
-The scenario format, snapshot review, and conformance process are documented in
-[docs/testing.md](docs/testing.md). The rationale is recorded in
+The scenario format, snapshot review, and STDIO integration strategy are
+documented in [docs/testing.md](docs/testing.md). The rationale is recorded in
 [ADR-0001](docs/decisions/0001-scenario-snapshot-test-pyramid.md).
-
-The simple liveness endpoint is `GET /healthz`; it is also used by the Docker
-health check.

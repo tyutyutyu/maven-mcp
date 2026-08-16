@@ -1,33 +1,22 @@
-use std::{
-    env,
-    io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpStream},
-    sync::Arc,
-    time::Duration,
-};
+use std::{io, sync::Arc};
 
 use anyhow::{Context, Result};
-use axum::{Router, routing::get};
 use maven_mcp::{config::Config, index::MavenIndex, project::MavenRunner, server::MavenMcpServer};
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
-use tokio_util::sync::CancellationToken;
+use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if env::args().any(|argument| argument == "--healthcheck") {
-        return healthcheck();
-    }
-
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "maven_mcp=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
         .init();
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     let config = Config::from_env()?;
     tracing::info!(repository = %config.repository.display(), "indexing Maven repository");
@@ -52,51 +41,50 @@ async fn main() -> Result<()> {
         .map(MavenRunner::discover)
         .transpose()?
         .map(Arc::new);
-    let cancellation = CancellationToken::new();
     let server = MavenMcpServer::with_runner(index, runner);
-    let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default()
-            .with_cancellation_token(cancellation.clone())
-            .with_json_response(true),
-    );
-    let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(config.bind_address)
-        .await
-        .with_context(|| format!("cannot bind {}", config.bind_address))?;
-    tracing::info!(address = %config.bind_address, endpoint = "/mcp", "MCP server listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(cancellation))
-        .await
-        .context("HTTP server failed")?;
+    let service = tokio::select! {
+        result = server.serve(rmcp::transport::stdio()) => {
+            result.context("cannot start STDIO MCP server")?
+        }
+        _ = &mut shutdown => exit_after_signal(),
+    };
+    tracing::info!(transport = "stdio", "MCP server ready");
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    tokio::select! {
+        result = &mut waiting => {
+            result.context("STDIO MCP server task failed")?;
+        }
+        _ = &mut shutdown => {
+            cancellation.cancel();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut waiting).await;
+            exit_after_signal();
+        }
+    }
     Ok(())
 }
 
-fn healthcheck() -> Result<()> {
-    let mut address: SocketAddr = env::var("BIND_ADDRESS")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
-        .parse()
-        .context("invalid BIND_ADDRESS")?;
-    if address.ip().is_unspecified() {
-        address.set_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    }
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
-    let mut response = [0_u8; 128];
-    let count = stream.read(&mut response)?;
-    if response[..count].starts_with(b"HTTP/1.1 200") {
-        Ok(())
-    } else {
-        anyhow::bail!("health endpoint did not return HTTP 200")
+fn exit_after_signal() -> ! {
+    // Tokio's process-wide stdin reader uses a blocking thread that cannot be
+    // cancelled. After the MCP service and request futures have been dropped,
+    // terminate explicitly so signal-driven shutdown cannot hang on stdin.
+    std::process::exit(0)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate =
+        signal(SignalKind::terminate()).expect("SIGTERM handler must be installable");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!(signal = "SIGINT", "shutdown requested"),
+        _ = terminate.recv() => tracing::info!(signal = "SIGTERM", "shutdown requested"),
     }
 }
 
-async fn shutdown_signal(cancellation: CancellationToken) {
+#[cfg(not(unix))]
+async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    cancellation.cancel();
 }

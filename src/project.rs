@@ -17,7 +17,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
+    process::{Child, Command},
     sync::{RwLock, Semaphore},
 };
 use walkdir::WalkDir;
@@ -982,13 +982,14 @@ impl MavenRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         command.as_std_mut().process_group(0);
-        let mut child = match command.spawn() {
+        let mut child = match spawn_maven(&mut command).await {
             Ok(child) => child,
             Err(error) => {
                 return self.runner_error(started, format!("cannot start Maven: {error}"));
             }
         };
         let process_id = child.id();
+        let mut process_group = ProcessGroupGuard::new(process_id);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let max_output = self.max_output_bytes;
@@ -1011,6 +1012,7 @@ impl MavenRunner {
                 (MavenRunStatus::Timeout, None, true)
             }
         };
+        process_group.disarm();
         let stdout = stdout_task
             .await
             .ok()
@@ -1331,12 +1333,49 @@ where
     Ok(output)
 }
 
+async fn spawn_maven(command: &mut Command) -> std::io::Result<Child> {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY) && attempt < MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("spawn retry loop must return")
+}
+
 fn terminate_process_group(process_id: Option<u32>) -> Result<()> {
     if let Some(process_id) = process_id {
         let process_id = i32::try_from(process_id).context("process id is too large")?;
         killpg(Pid::from_raw(process_id), Signal::SIGKILL)?;
     }
     Ok(())
+}
+
+struct ProcessGroupGuard {
+    process_id: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(process_id: Option<u32>) -> Self {
+        Self { process_id }
+    }
+
+    fn disarm(&mut self) {
+        self.process_id = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let _ = terminate_process_group(self.process_id);
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -2457,11 +2496,15 @@ mod tests {
 
     fn write_executable(path: &Path, script: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut file = fs::File::create(path).unwrap();
+        let staged = path.with_extension("tmp");
+        let mut file = fs::File::create(&staged).unwrap();
         file.write_all(script.as_bytes()).unwrap();
-        let mut permissions = file.metadata().unwrap().permissions();
+        file.sync_all().unwrap();
+        drop(file);
+        let mut permissions = staged.metadata().unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        fs::set_permissions(&staged, permissions).unwrap();
+        fs::rename(staged, path).unwrap();
     }
 
     fn wrapper_project(script: &str) -> (TempDir, ProjectExecutionConfig) {
@@ -2637,7 +2680,11 @@ mod tests {
                 also_make: false,
             })
             .await;
-        assert_eq!(timed_out.status, MavenRunStatus::Timeout);
+        assert_eq!(
+            timed_out.status,
+            MavenRunStatus::Timeout,
+            "unexpected Maven result: {timed_out:#?}"
+        );
         assert!(timed_out.timed_out);
 
         let (_root, mut output_config) = wrapper_project(
@@ -2861,7 +2908,9 @@ mod tests {
             .await;
         assert_eq!(
             classpath.artifacts,
-            vec!["org.libs:first:2.0", "org.libs:native:3.0:linux"]
+            vec!["org.libs:first:2.0", "org.libs:native:3.0:linux"],
+            "unexpected Maven result: {:#?}",
+            classpath.build.run
         );
         assert!(!classpath.incomplete);
         assert!(
@@ -2882,7 +2931,11 @@ mod tests {
         let tree = runner
             .dependency_tree(Some("core"), Some(DependencyScope::Runtime), None)
             .await;
-        assert!(tree.incomplete);
+        assert!(
+            tree.incomplete,
+            "unexpected Maven result: {:#?}",
+            tree.build.run
+        );
         assert_eq!(tree.build.outcome, MavenBuildOutcome::BuildFailure);
         assert_eq!(tree.dependencies[0].depth, 1);
         assert!(tree.dependencies.iter().any(|node| node.depth >= 2));
@@ -2983,7 +3036,12 @@ printf '%s\n' '[INFO] org.example:core:jar:1.0' '[INFO] +- org.keep:first:jar:2.
             )
             .await;
 
-        assert_eq!(result.status, DependencyResolutionStatus::Available);
+        assert_eq!(
+            result.status,
+            DependencyResolutionStatus::Available,
+            "unexpected Maven result: {:#?}",
+            result.build.run
+        );
         assert_eq!(result.explanations.len(), 1);
         assert_eq!(result.explanations[0].artifact, "org.keep:first:jar");
         assert!(result.build.run.stdout.contains("-Dverbose"));
