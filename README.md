@@ -84,9 +84,7 @@ tools are read-only: they do not extract files or modify Maven metadata.
 Type hierarchy, classfile reference, and provider relationships are built as
 immutable facts at startup. Source JAR contents are not retained in memory:
 `search_source` and `get_declaration_source` read them on demand under the
-configured byte and result limits. See
-[ADR-0003](docs/decisions/0003-immutable-derived-repository-facts.md) for the
-detailed decision.
+configured byte and result limits.
 
 `search_jar_content` examines the manifest, `META-INF/services/*` descriptors,
 and UTF-8 entries with the extensions `conf`, `config`, `factories`, `imports`,
@@ -173,9 +171,7 @@ by default (`--offline`); set `MAVEN_EXECUTION_NETWORK=true` only for a trusted
 project that may resolve dependencies and plugins. The server does not accept
 raw Maven goals or arguments, runs one build at a time, applies time and output
 limits, and redacts paths and common credential patterns. Native execution is
-not a sandbox: Maven plugins and tests run with the local user's permissions. See
-[ADR-0002](docs/decisions/0002-opt-in-project-scoped-maven-execution.md) for the
-detailed decision and threat model.
+not a sandbox: Maven plugins and tests run with the local user's permissions.
 
 ## Environment Variables
 
@@ -416,15 +412,10 @@ machine-readable JSON to `target/promptfoo/results.json`. The provider/model is
 configured only through `PROMPTFOO_PROVIDER`, while authentication comes from
 the provider's standard environment variable; never put secrets in YAML. The
 report may contain complete model output and configuration, so treat it as an
-artifact and do not commit it. See [docs/testing.md](docs/testing.md) for the
-detailed review workflow.
+artifact and do not commit it.
 
 Start MCP Inspector with the fixture repository:
 
 ```bash
 scripts/run-inspector.sh
 ```
-
-The scenario format, snapshot review, and STDIO integration strategy are
-documented in [docs/testing.md](docs/testing.md). The rationale is recorded in
-[ADR-0001](docs/decisions/0001-scenario-snapshot-test-pyramid.md).

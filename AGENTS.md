@@ -7,9 +7,8 @@ reads the local Maven repository under `MAVEN_REPO_PATH`, builds an in-memory
 index of JARs, classes, sources, and artifact versions, and exposes them through
 searchable MCP tools. The MCP host owns the child-process lifecycle.
 
-The primary user documentation is `README.md`, the testing strategy is in
-`docs/testing.md`, and architectural decisions are recorded under
-`docs/decisions/`. This file is the source of agent-specific development rules.
+The primary user documentation is `README.md`. This file is the source of
+agent-specific development rules.
 
 ## Technology and Prerequisites
 
@@ -119,10 +118,10 @@ following together:
 4. At least one relevant YAML scenario when the behavior can be expressed as a
    user-facing search example.
 5. Snapshots, but only after manually reviewing the diff.
-6. The tool list in `README.md` and, when necessary, `docs/testing.md`.
+6. The tool list and relevant usage guidance in `README.md`.
 
-A change to a public response shape is an API change. Document it, and add or
-update an ADR when the decision has lasting architectural consequences.
+A change to a public response shape is an API change. Document it in
+`README.md`.
 
 ## Testing
 
@@ -184,9 +183,6 @@ scripts/run-inspector.sh --cli --method tools/list
 
 - Update `README.md` when user-visible behavior, tools, configuration, or run
   commands change.
-- Update `docs/testing.md` when the testing workflow changes.
-- Record significant architectural or public API decisions in an ADR under
-  `docs/decisions/`.
 - Before handoff, run checks proportionate to the change risk. The mandatory
   final gate for public MCP or broad changes is `scripts/test-pyramid.sh`.
 - Do not commit, push, or accept snapshots without a specific user request.
