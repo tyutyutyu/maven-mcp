@@ -1,4 +1,8 @@
-use std::{fs::File, io::Write, path::Path};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use zip::{ZipWriter, write::SimpleFileOptions};
@@ -8,8 +12,13 @@ const MARKER: &str = ".maven-mcp-eval-fixture";
 fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
-        .context("usage: maven-eval-fixture PATH")?;
-    let root = Path::new(&path);
+        .context("usage: maven-eval-fixture FIXTURE_ROOT")?;
+    let project = create_fixture(Path::new(&path))?;
+    println!("{}", project.display());
+    Ok(())
+}
+
+fn create_fixture(root: &Path) -> Result<PathBuf> {
     if root.exists() {
         if !root.join(MARKER).is_file() {
             bail!(
@@ -21,10 +30,23 @@ fn main() -> Result<()> {
     }
     std::fs::create_dir_all(root)?;
     std::fs::write(root.join(MARKER), "generated; safe to replace\n")?;
-    write_version(root, "1.0", &["org/example/Foo", "org/example/Legacy"])?;
-    write_version(root, "2.0", &["org/example/Foo", "org/example/Modern"])?;
-    println!("{}", root.canonicalize()?.display());
-    Ok(())
+    let repository = root.join("maven-repository");
+    write_version(
+        &repository,
+        "1.0",
+        &["org/example/Foo", "org/example/Legacy"],
+    )?;
+    write_version(
+        &repository,
+        "2.0",
+        &["org/example/Foo", "org/example/Modern"],
+    )?;
+
+    let project = root.join("project");
+    write_project(&project)?;
+    project
+        .canonicalize()
+        .context("generated fixture project must be canonicalizable")
 }
 
 fn write_version(root: &Path, version: &str, classes: &[&str]) -> Result<()> {
@@ -57,6 +79,60 @@ fn write_version(root: &Path, version: &str, classes: &[&str]) -> Result<()> {
             "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>demo</artifactId><version>{version}</version></project>"
         ),
     )?;
+    Ok(())
+}
+
+fn write_project(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root)?;
+    std::fs::create_dir_all(root.join(".mvn/wrapper"))?;
+    std::fs::write(
+        root.join(".mvn/wrapper/maven-wrapper.properties"),
+        "distributionUrl=https://example.invalid/maven.zip\n",
+    )?;
+    std::fs::write(
+        root.join("pom.xml"),
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId>
+  <artifactId>maven-mcp-eval-fixture</artifactId>
+  <version>1.0</version>
+  <packaging>jar</packaging>
+</project>
+"#,
+    )?;
+
+    let wrapper = root.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+
+case " $* " in
+  *" dependency:build-classpath "*)
+    repository=$(CDPATH= cd -- "$PWD/../maven-repository" && pwd)
+    printf '%s\n%s\n' \
+      'Dependencies classpath:' \
+      "$repository/org/example/demo/1.0/demo-1.0.jar:$repository/org/example/demo/2.0/demo-2.0.jar"
+    ;;
+  *)
+    printf '%s\n' '[INFO] BUILD SUCCESS'
+    ;;
+esac
+"#,
+    )?;
+    make_executable(&wrapper)?;
+    Ok(())
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = path.metadata()?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions)?;
+    }
     Ok(())
 }
 
@@ -100,4 +176,45 @@ fn minimal_class(class_name: &str) -> Vec<u8> {
     push_u16(&mut bytes, 0);
     push_u16(&mut bytes, 0);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_fixture;
+    use tempfile::TempDir;
+
+    #[test]
+    fn creates_a_scoped_project_and_two_version_repository() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let fixture_root = root.path().join("fixture");
+        let project = create_fixture(&fixture_root)?;
+
+        assert_eq!(project, fixture_root.join("project").canonicalize()?);
+        assert!(project.join("pom.xml").is_file());
+        assert!(project.join("mvnw").is_file());
+        assert!(
+            fixture_root
+                .join("maven-repository/org/example/demo/1.0/demo-1.0.jar")
+                .is_file()
+        );
+        assert!(
+            fixture_root
+                .join("maven-repository/org/example/demo/2.0/demo-2.0-sources.jar")
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_to_replace_an_unmarked_directory() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let fixture_root = root.path().join("fixture");
+        std::fs::create_dir_all(&fixture_root)?;
+        std::fs::write(fixture_root.join("keep.txt"), "do not replace")?;
+
+        let error = create_fixture(&fixture_root).expect_err("unmarked directory must be safe");
+        assert!(error.to_string().contains("unmarked directory"));
+        assert!(fixture_root.join("keep.txt").is_file());
+        Ok(())
+    }
 }

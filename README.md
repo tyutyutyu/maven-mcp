@@ -403,10 +403,12 @@ export OPENAI_API_KEY="..." # or the standard environment secret for your provid
 scripts/run-agent-eval.sh
 ```
 
-The script pins Promptfoo `0.121.19`, regenerates the
-`target/promptfoo/maven-repository` fixture from Rust, lets Promptfoo start the
-local server over STDIO, runs the evaluation with caching disabled, and exits
-non-zero on a failed test.
+The script pins Promptfoo `0.121.19`, regenerates a marker-protected,
+request-scoped project fixture under `target/promptfoo/fixture` from Rust,
+configures its trusted project directory and local execution repository, and
+passes the generated absolute `project_path` to every MCP request. Promptfoo
+starts the local server over STDIO, runs the evaluation with caching disabled,
+and exits non-zero on a failed test.
 The reviewable HTML is written to `target/promptfoo/report.html`, and the complete
 machine-readable JSON to `target/promptfoo/results.json`. The provider/model is
 configured only through `PROMPTFOO_PROVIDER`, while authentication comes from

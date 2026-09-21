@@ -22,11 +22,23 @@ fn promptfoo_agent_eval_is_versioned_and_covers_required_request_classes() -> Re
             .as_sequence()
             .is_some_and(|assertions| assertions.len() == 2)
     }));
+    assert!(yaml.contains("requireToolEvidence"));
+    assert!(yaml.contains("evidenceAll"));
+    assert!(yaml.contains("evidenceEmpty"));
     assert!(yaml.contains("env.PROMPTFOO_PROVIDER"));
     assert!(yaml.contains("env.PROMPTFOO_MCP_COMMAND"));
+    assert!(yaml.contains("env.PROMPTFOO_PROJECT_PATH"));
+    assert!(tests.iter().all(|test| {
+        test["vars"]["project_path"]
+            .as_str()
+            .is_some_and(|path| path.contains("PROMPTFOO_PROJECT_PATH"))
+    }));
 
     let script = std::fs::read_to_string("scripts/run-agent-eval.sh")?;
     assert!(script.contains("PROMPTFOO_VERSION=\"0.121.19\""));
+    assert!(script.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"));
+    assert!(script.contains("MAVEN_EXECUTION_REPO_PATH"));
+    assert!(script.contains("PROMPTFOO_PROJECT_PATH"));
     assert!(script.contains("--no-cache"));
     assert!(script.contains("report.html"));
     assert!(script.contains("results.json"));

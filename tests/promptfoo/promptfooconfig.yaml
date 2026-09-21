@@ -7,6 +7,7 @@ prompts:
     answer the user's request. Base every artifact, version, JAR, class, and
     source claim on tool results. If a search is ambiguous, report all relevant
     local matches. If there is no match, say so plainly and do not invent one.
+    Every tool call must use this trusted project path: {{project_path}}
 
     User request: {{request}}
 
@@ -23,6 +24,7 @@ providers:
 tests:
   - description: positive class search with a version constraint
     vars:
+      project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
       request: Which local JAR in version 2.0 contains org.example.Modern?
     assert:
       - type: javascript
@@ -30,15 +32,19 @@ tests:
         config:
           expectedTool: search_classes
           expectedArgs:
+            project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
             query: Modern
       - type: javascript
         value: file://assert-grounded.cjs
         config:
+          requireToolEvidence: true
+          evidenceAll: [org.example.Modern, "2.0", demo-2.0.jar]
           requiredAll: [org.example.Modern, "2.0"]
           forbidden: ["3.0", org.example.Legacy]
 
   - description: exact source lookup
     vars:
+      project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
       request: Show me the local Java source of org.example.Foo from demo version 1.0.
     assert:
       - type: javascript
@@ -46,16 +52,20 @@ tests:
         config:
           expectedTool: get_class_source
           expectedArgs:
+            project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
             class_name: org.example.Foo
             version: "1.0"
       - type: javascript
         value: file://assert-grounded.cjs
         config:
+          requireToolEvidence: true
+          evidenceAll: [org.example.Foo, "1.0", "package org.example"]
           requiredAll: [org.example, Foo]
           forbidden: ["3.0", org.example.Missing]
 
   - description: ambiguous artifact request returns all local versions
     vars:
+      project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
       request: What versions of the demo artifact are available locally under org.example?
     assert:
       - type: javascript
@@ -63,16 +73,20 @@ tests:
         config:
           expectedTool: list_artifact_versions
           expectedArgs:
+            project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
             artifact_id: demo
             group_id: org.example
       - type: javascript
         value: file://assert-grounded.cjs
         config:
+          requireToolEvidence: true
+          evidenceAll: ["1.0", "2.0"]
           requiredAll: ["1.0", "2.0"]
           forbidden: ["3.0"]
 
   - description: no-match request stays grounded
     vars:
+      project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
       request: Which local JAR contains org.example.DoesNotExist?
     assert:
       - type: javascript
@@ -80,9 +94,12 @@ tests:
         config:
           expectedTool: search_classes
           expectedArgs:
+            project_path: "{{ env.PROMPTFOO_PROJECT_PATH }}"
             query: DoesNotExist
       - type: javascript
         value: file://assert-grounded.cjs
         config:
+          requireToolEvidence: true
+          evidenceEmpty: true
           requiredAny: [no match, not found, does not exist, nincs, "0"]
           forbidden: [demo-1.0.jar, demo-2.0.jar, "3.0"]
