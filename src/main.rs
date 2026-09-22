@@ -1,12 +1,50 @@
-use std::{io, sync::Arc};
+use std::io;
 
 use anyhow::{Context, Result};
-use maven_mcp::{config::Config, index::MavenIndex, project::MavenRunner, server::MavenMcpServer};
+use clap::{Parser, Subcommand};
+use maven_mcp::{
+    config::Config,
+    runtime_stats::{format_runtime_report, read_runtime_report},
+    server::MavenMcpServer,
+};
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    #[arg(
+        long,
+        global = true,
+        help = "Resolve each Maven child JDK through jenv using the request project"
+    )]
+    jenv: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = "Print live maven-mcp runtime statistics")]
+    Stats {
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Some(Command::Stats { json }) = cli.command {
+        let report = read_runtime_report()?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", format_runtime_report(&report));
+        }
+        return Ok(());
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -18,30 +56,14 @@ async fn main() -> Result<()> {
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
-    let config = Config::from_env()?;
-    tracing::info!(repository = %config.repository.display(), "indexing Maven repository");
-    let index = Arc::new(MavenIndex::build(
-        &config.repository,
-        config.max_results,
-        config.max_source_bytes,
-    )?);
-    let stats = index.stats();
+    let config = Config::from_env_with_jenv(cli.jenv)?;
     tracing::info!(
-        jars = stats.jar_count,
-        source_jars = stats.source_jar_count,
-        classes = stats.class_count,
-        unique_classes = stats.unique_class_count,
-        artifacts = stats.artifact_count,
-        "Maven repository index ready"
+        max_results = config.max_results,
+        max_source_bytes = config.max_source_bytes,
+        "MCP server ready for request-scoped Maven projects"
     );
 
-    let runner = config
-        .project_execution
-        .as_ref()
-        .map(MavenRunner::discover)
-        .transpose()?
-        .map(Arc::new);
-    let server = MavenMcpServer::with_runner(index, runner);
+    let server = MavenMcpServer::new(config);
     let service = tokio::select! {
         result = server.serve(rmcp::transport::stdio()) => {
             result.context("cannot start STDIO MCP server")?

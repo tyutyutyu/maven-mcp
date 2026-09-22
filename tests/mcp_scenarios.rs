@@ -44,7 +44,12 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     ensure!(!catalog.scenarios.is_empty(), "scenario catalog is empty");
     ensure_unique_ids(&catalog.scenarios)?;
 
-    let server = TestServer::start().await?;
+    let server = TestServer::start_with_project().await?;
+    let project_path = server
+        .project_path()
+        .context("scenario fixture must include a Maven project")?
+        .display()
+        .to_string();
     let client = server.connect().await?;
     let mut executions = Vec::with_capacity(catalog.scenarios.len());
 
@@ -54,6 +59,11 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
             .as_object()
             .with_context(|| format!("scenario '{}' arguments must be an object", scenario.id))?
             .clone();
+        let mut arguments = arguments;
+        arguments.insert(
+            "project_path".to_owned(),
+            Value::String(project_path.clone()),
+        );
         let result = client
             .call_tool(CallToolRequestParams::new(scenario.tool.clone()).with_arguments(arguments))
             .await

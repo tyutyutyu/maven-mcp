@@ -1,6 +1,12 @@
 #![allow(dead_code)]
 
-use std::{fs::File, io::Write, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{
+    fs::File,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use rmcp::{
@@ -13,27 +19,65 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 pub struct TestServer {
     repository: TempDir,
-    project: Option<TempDir>,
+    trusted_project_directory: Option<TempDir>,
+    project_path: Option<PathBuf>,
+    jenv_root: Option<TempDir>,
+    inherited_java_home: Option<TempDir>,
 }
 
 impl TestServer {
     pub async fn start() -> Result<Self> {
         Ok(Self {
             repository: fixture_repository()?,
-            project: None,
+            trusted_project_directory: None,
+            project_path: None,
+            jenv_root: None,
+            inherited_java_home: None,
         })
     }
 
     #[allow(dead_code)]
     pub async fn start_with_project() -> Result<Self> {
         let repository = fixture_repository()?;
-        let project = fixture_project()?;
-        let execution_repository = project.path().join("execution-repository");
+        let trusted_project_directory = TempDir::new()?;
+        let project_path = trusted_project_directory
+            .path()
+            .join("nested/projects/fixture-project");
+        fixture_project(&project_path)?;
+        let execution_repository = project_path.join("execution-repository");
         std::fs::create_dir(&execution_repository)?;
+        fixture_execution_repository(&execution_repository)?;
         Ok(Self {
             repository,
-            project: Some(project),
+            trusted_project_directory: Some(trusted_project_directory),
+            project_path: Some(project_path),
+            jenv_root: None,
+            inherited_java_home: None,
         })
+    }
+
+    pub async fn start_with_jenv_project() -> Result<Self> {
+        let mut server = Self::start_with_project().await?;
+        server.jenv_root = Some(fixture_jenv_root()?);
+        let project_path = server
+            .project_path
+            .as_ref()
+            .context("test server has no project")?
+            .clone();
+        server.set_jenv_version(&project_path, "one")?;
+        Ok(server)
+    }
+
+    pub async fn start_with_inherited_java_project() -> Result<Self> {
+        let mut server = Self::start_with_project().await?;
+        let java_home = TempDir::new()?;
+        let project_path = server
+            .project_path
+            .as_ref()
+            .context("test server has no project")?;
+        write_java_asserting_wrapper(project_path, java_home.path())?;
+        server.inherited_java_home = Some(java_home);
+        Ok(server)
     }
 
     pub async fn connect(&self) -> Result<RunningService<RoleClient, ()>> {
@@ -44,19 +88,38 @@ impl TestServer {
         let command =
             tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp")).configure(|command| {
                 command
-                    .env("MAVEN_REPO_PATH", self.repository.path())
                     .env("MAX_RESULTS", "50")
                     .env("MAX_SOURCE_BYTES", "1024")
                     .env("RUST_LOG", "maven_mcp=warn");
-                if let Some(project) = &self.project {
+                if let (Some(trusted_directory), Some(project_path)) =
+                    (&self.trusted_project_directory, &self.project_path)
+                {
                     command
-                        .env("MAVEN_PROJECT_ROOT", project.path())
+                        .env(
+                            "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+                            trusted_directory.path(),
+                        )
                         .env(
                             "MAVEN_EXECUTION_REPO_PATH",
-                            project.path().join("execution-repository"),
+                            project_path.join("execution-repository"),
                         )
                         .env("MAVEN_TIMEOUT_SECONDS", "2")
                         .env("MAX_MAVEN_OUTPUT_BYTES", "16384");
+                }
+                if let Some(jenv_root) = &self.jenv_root {
+                    command
+                        .arg("--jenv")
+                        .env("JENV_ROOT", jenv_root.path())
+                        .env("JENV_VERSION", "must-not-override-project")
+                        .env("JENV_DIR", "/must-not-override-project")
+                        .env_remove("JAVA_HOME")
+                        .env("PATH", "/usr/bin:/bin");
+                }
+                if let Some(java_home) = &self.inherited_java_home {
+                    command.env("JAVA_HOME", java_home.path()).env(
+                        "PATH",
+                        format!("{}/bin:/usr/bin:/bin", java_home.path().display()),
+                    );
                 }
             });
         let transport = TokioChildProcess::new(command)?;
@@ -74,23 +137,92 @@ impl TestServer {
     }
 
     pub fn project_path(&self) -> Option<&Path> {
-        self.project.as_ref().map(TempDir::path)
+        self.project_path.as_deref()
+    }
+
+    pub fn trusted_project_directory(&self) -> Option<&Path> {
+        self.trusted_project_directory.as_ref().map(TempDir::path)
+    }
+
+    pub fn add_trusted_project(&self, name: &str) -> Result<PathBuf> {
+        let trusted_directory = self
+            .trusted_project_directory
+            .as_ref()
+            .context("test server has no trusted project directory")?;
+        let project_path = trusted_directory.path().join("additional").join(name);
+        fixture_project(&project_path)?;
+        std::fs::create_dir(project_path.join("execution-repository"))?;
+        fixture_execution_repository(&project_path.join("execution-repository"))?;
+        Ok(project_path)
+    }
+
+    pub fn set_jenv_version(&self, project_path: &Path, version: &str) -> Result<()> {
+        let jenv_root = self
+            .jenv_root
+            .as_ref()
+            .context("test server has no jenv root")?;
+        std::fs::write(project_path.join(".java-version"), format!("{version}\n"))?;
+        write_java_asserting_wrapper(
+            project_path,
+            &jenv_root.path().join("versions").join(version),
+        )
     }
 }
 
-#[allow(dead_code)]
-fn fixture_project() -> Result<TempDir> {
+fn fixture_jenv_root() -> Result<TempDir> {
     let root = TempDir::new()?;
+    for version in ["one", "two"] {
+        write_executable(
+            &root.path().join("versions").join(version).join("bin/java"),
+            "#!/bin/sh\nexit 0\n",
+        )?;
+    }
+    write_executable(
+        &root.path().join("bin/jenv"),
+        r#"#!/bin/sh
+[ -z "${JENV_VERSION:-}" ] || exit 21
+[ -z "${JENV_DIR:-}" ] || exit 22
+version=$(sed -n '1p' .java-version)
+prefix="$JENV_ROOT/versions/$version"
+[ -d "$prefix" ] || exit 23
+printf '%s\n' "$prefix"
+"#,
+    )?;
+    Ok(root)
+}
+
+fn write_java_asserting_wrapper(project_path: &Path, java_home: &Path) -> Result<()> {
+    write_executable(
+        &project_path.join("mvnw"),
+        &format!(
+            "#!/bin/sh\n[ \"$JAVA_HOME\" = '{}' ] || exit 31\ncase \"$PATH\" in \"$JAVA_HOME/bin:\"*) printf '%s\\n' '[INFO] BUILD SUCCESS' ;; *) exit 32 ;; esac\n",
+            java_home.display()
+        ),
+    )
+}
+
+fn write_executable(path: &Path, contents: &str) -> Result<()> {
+    std::fs::create_dir_all(path.parent().context("executable parent")?)?;
+    std::fs::write(path, contents)?;
+    let mut permissions = path.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn fixture_project(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root)?;
     std::fs::write(
-        root.path().join("pom.xml"),
+        root.join("pom.xml"),
         "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>jar</packaging></project>",
     )?;
-    std::fs::create_dir_all(root.path().join(".mvn/wrapper"))?;
+    std::fs::create_dir_all(root.join(".mvn/wrapper"))?;
     std::fs::write(
-        root.path().join(".mvn/wrapper/maven-wrapper.properties"),
+        root.join(".mvn/wrapper/maven-wrapper.properties"),
         "distributionUrl=https://example.invalid/maven.zip",
     )?;
-    let wrapper = root.path().join("mvnw");
+    let wrapper = root.join("mvnw");
     std::fs::write(
         &wrapper,
         r#"#!/bin/sh
@@ -114,16 +246,16 @@ esac
     let mut permissions = wrapper.metadata()?.permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions)?;
-    let test = root.path().join("src/test/java/org/example/FooTest.java");
+    let test = root.join("src/test/java/org/example/FooTest.java");
     std::fs::create_dir_all(test.parent().context("test source parent")?)?;
     std::fs::write(test, "package org.example; class FooTest {}")?;
-    let report = root.path().join("target/site/jacoco/jacoco.xml");
+    let report = root.join("target/site/jacoco/jacoco.xml");
     std::fs::create_dir_all(report.parent().context("coverage report parent")?)?;
     std::fs::write(
         report,
         r#"<report><package name="org/example"><class name="org/example/Foo"><counter type="LINE" missed="1" covered="9"/></class></package><counter type="LINE" missed="1" covered="9"/></report>"#,
     )?;
-    Ok(root)
+    Ok(())
 }
 
 fn fixture_repository() -> Result<TempDir> {
@@ -196,6 +328,34 @@ fn fixture_repository() -> Result<TempDir> {
         )],
     )?;
     Ok(root)
+}
+
+fn fixture_execution_repository(root: &Path) -> Result<()> {
+    let version = root.join("org/libs/helper/2.0");
+    let fixture_class = minimal_class("org/example/Foo");
+    let scoped_only = minimal_class("org/libs/ScopedOnly");
+    write_jar(
+        &version.join("helper-2.0.jar"),
+        &[
+            ("org/example/Foo.class", &fixture_class),
+            ("org/libs/ScopedOnly.class", &scoped_only),
+        ],
+    )?;
+    write_jar(
+        &version.join("helper-2.0-sources.jar"),
+        &[(
+            "org/example/Foo.java",
+            b"package org.example; public class Foo { int scoped = 2; }",
+        )],
+    )?;
+    std::fs::write(
+        version.join("helper-2.0.pom"),
+        r#"<project>
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>org.libs</groupId><artifactId>helper</artifactId><version>2.0</version>
+        </project>"#,
+    )?;
+    Ok(())
 }
 
 fn minimal_class(class_name: &str) -> Vec<u8> {

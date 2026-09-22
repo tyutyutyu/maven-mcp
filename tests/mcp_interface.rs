@@ -23,8 +23,9 @@ fn structured(result: rmcp::model::CallToolResult) -> Value {
 
 #[tokio::test]
 async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
-    let server = TestServer::start().await?;
+    let server = TestServer::start_with_project().await?;
     let client = server.connect().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
 
     let tools = client.list_all_tools().await?;
     let actual_names = tools
@@ -35,13 +36,24 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "compare_artifact_api",
         "describe_class",
         "diagnose_artifact",
+        "explain_dependency_resolution",
         "get_artifact_pom",
         "get_class_source",
         "get_declaration_source",
+        "get_dependency_tree",
+        "get_effective_pom",
+        "get_jacoco_coverage",
+        "get_jacoco_coverage_gaps",
         "get_jar_entry",
+        "get_last_maven_test_failures",
+        "get_maven_classpath",
         "index_stats",
+        "inspect_maven_project",
         "list_artifact_versions",
         "list_jar_classes",
+        "list_maven_test_classes",
+        "run_maven_lifecycle",
+        "run_maven_test",
         "search_classes",
         "search_class_members",
         "search_class_references",
@@ -53,343 +65,466 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "search_type_hierarchy",
     ]);
     assert_eq!(actual_names, expected_names);
-    assert!(tools.iter().all(|tool| {
-        tool.output_schema
-            .as_ref()
-            .and_then(|schema| schema.get("type"))
-            .and_then(Value::as_str)
-            == Some("object")
-    }));
+    for tool in &tools {
+        assert_eq!(
+            tool.output_schema
+                .as_ref()
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str),
+            Some("object"),
+            "{} output schema must be an object",
+            tool.name
+        );
+    }
+    let lifecycle_schema = tools
+        .iter()
+        .find(|tool| tool.name == "run_maven_lifecycle")
+        .and_then(|tool| tool.output_schema.as_ref())
+        .expect("run_maven_lifecycle must publish an output schema");
+    assert!(
+        lifecycle_schema["properties"]
+            .get("policy_notice")
+            .is_some(),
+        "run_maven_lifecycle schema must expose policy_notice"
+    );
+    for tool in &tools {
+        let required = tool
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("input schema must list required properties");
+        assert!(
+            required.iter().any(|name| name == "project_path"),
+            "{} must require project_path",
+            tool.name
+        );
+    }
 
-    let stats = structured(
+    let project = structured(
         client
-            .call_tool(CallToolRequestParams::new("index_stats"))
+            .call_tool(
+                CallToolRequestParams::new("inspect_maven_project")
+                    .with_arguments(arguments(json!({ "project_path": project_path }))),
+            )
             .await?,
     );
-    assert_eq!(stats["jar_count"], 2);
-    assert_eq!(stats["source_jar_count"], 2);
-    assert_eq!(stats["unique_class_count"], 3);
+    assert_eq!(project["artifact_id"], "fixture-project");
 
     let classes = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("search_classes")
-                    .with_arguments(arguments(json!({ "query": "Foo" }))),
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                    "project_path": server.project_path().unwrap().display().to_string(),
+                    "query": "Foo"
+                }))),
             )
             .await?,
     );
-    assert_eq!(classes["results"].as_array().unwrap().len(), 2);
+    assert_eq!(classes["results"][0]["class_name"], "org.example.Foo");
+    assert_eq!(
+        classes["results"][0]["jar"]["coordinate"],
+        "org.libs:helper:2.0"
+    );
+    let leaked = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("search_jars").with_arguments(arguments(json!({
+                    "project_path": server.project_path().unwrap().display().to_string(),
+                    "query": "demo"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(leaked["results"].as_array().unwrap().len(), 0);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_index_accepts_a_valid_classpath_when_maven_warns_on_stderr() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+printf '%s\n' '[WARNING] benign wrapper warning' >&2
+printf '%s\n' 'Dependencies classpath:' "$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar"
+"#,
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let classes = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                    "project_path": project_path.display().to_string(),
+                    "query": "Foo"
+                }))),
+            )
+            .await?,
+    );
     assert_eq!(classes["results"][0]["class_name"], "org.example.Foo");
 
-    let jars = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_jars")
-                    .with_arguments(arguments(json!({ "query": "demo:2.0" }))),
-            )
-            .await?,
-    );
-    assert_eq!(jars["results"].as_array().unwrap().len(), 2);
-    assert!(
-        jars["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|jar| jar["coordinate"] == "org.example:demo:2.0")
-    );
+    client.cancel().await?;
+    Ok(())
+}
 
-    let entries = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_jar_entries").with_arguments(arguments(json!({
-                    "query": "example.Service",
-                    "jar": "demo-1.0.jar"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(
-        entries["results"][0]["entry"],
-        "META-INF/services/example.Service"
-    );
+#[tokio::test]
+async fn scoped_index_aggregates_classpaths_from_later_reactor_modules() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let entry_content = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_jar_entry").with_arguments(arguments(json!({
-                    "jar": "demo-1.0.jar",
-                    "entry": "META-INF/services/example.Service"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(entry_content["results"][0]["content_kind"], "text");
-    assert_eq!(entry_content["results"][0]["text"], "org.example.Foo");
-    assert_eq!(entry_content["results"][0]["original_size"], 15);
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+printf '%s\n' \
+  '[INFO] Building empty-parent [pom]' \
+  'Dependencies classpath:' \
+  '' \
+  '[INFO] Building dependency-bearing-module [jar]' \
+  'Dependencies classpath:' \
+  "$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar" \
+  '[INFO] Building empty-aggregator [pom]' \
+  'Dependencies classpath:' \
+  ''
+"#,
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
 
-    let binary_entry = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_jar_entry").with_arguments(arguments(json!({
-                    "jar": "demo-1.0.jar",
-                    "entry": "native/image.bin"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(binary_entry["results"][0]["content_kind"], "binary");
-    assert_eq!(
-        binary_entry["results"][0]["bytes"],
-        json!([0, 159, 146, 150])
-    );
-
-    let pom = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_artifact_pom").with_arguments(arguments(json!({
-                    "coordinate": "org.example:demo:1.0"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(pom["found"], true);
-    assert_eq!(pom["descriptor"]["packaging"], "jar");
-    assert_eq!(pom["descriptor"]["properties"]["java.version"], "21");
-    assert_eq!(pom["descriptor"]["dependencies"][0]["scope"], "runtime");
-
-    let description = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("describe_class").with_arguments(arguments(json!({
-                    "class_name": "org.example.Inspectable",
-                    "version": "2.0",
-                    "visibility": "public"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(description["results"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        description["results"][0]["class_name"],
-        "org.example.Inspectable"
-    );
-    assert_eq!(description["results"][0]["super_class"], "java.lang.Object");
-
-    let health = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("diagnose_artifact").with_arguments(arguments(json!({
-                    "coordinate": "org.example:demo:1.0"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(health["found"], true);
-    assert_eq!(health["snapshot"], false);
-    assert_eq!(health["repository_ids"], json!(["central"]));
-    assert_eq!(health["checksums"], json!(["demo-1.0.jar.sha1"]));
-
-    let member_matches = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_class_members").with_arguments(arguments(
-                    json!({ "query": "value", "jar": "demo-2.0.jar" }),
-                )),
-            )
-            .await?,
-    );
-    assert_eq!(member_matches["results"].as_array().unwrap().len(), 2);
-    assert_eq!(member_matches["results"][0]["kind"], "field");
-    assert_eq!(member_matches["results"][0]["name"], "value");
-
-    let api_diff = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("compare_artifact_api").with_arguments(arguments(
-                    json!({
-                        "group_id": "org.example",
-                        "artifact_id": "demo",
-                        "previous_version": "1.0",
-                        "current_version": "2.0"
-                    }),
-                )),
-            )
-            .await?,
-    );
-    assert_eq!(
-        api_diff["added_classes"],
-        json!(["org.example.Inspectable"])
-    );
-    assert_eq!(api_diff["removed_classes"], json!(["org.example.Bar"]));
-
-    let content_matches = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_jar_content").with_arguments(arguments(json!({
-                    "query": "example.foo",
-                    "jar": "demo-1.0.jar"
-                }))),
-            )
-            .await?,
-    );
-    let content_results = content_matches["results"].as_array().unwrap();
-    assert_eq!(content_results.len(), 2);
-    assert!(content_results.iter().any(|result| {
-        result["entry"] == "META-INF/services/example.Service"
-            && result["context"] == "org.example.Foo"
-    }));
-
-    let listed_classes = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("list_jar_classes").with_arguments(arguments(json!({
-                    "jar": "org.example:demo:1.0",
-                    "offset": 1,
-                    "limit": 1
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(listed_classes["results"][0]["total"], 2);
-    assert_eq!(
-        listed_classes["results"][0]["classes"],
-        json!(["org.example.Foo"])
-    );
-
-    let source = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_class_source").with_arguments(arguments(json!({
-                    "class_name": "org.example.Foo",
-                    "version": "2.0"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(source["results"].as_array().unwrap().len(), 1);
-    assert!(
-        source["results"][0]["source"]
-            .as_str()
-            .unwrap()
-            .contains("version = 2")
-    );
-
-    let hierarchy = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_type_hierarchy").with_arguments(arguments(
-                    json!({
-                        "type_name": "java.lang.Object",
-                        "jar": "demo-2.0.jar"
-                    }),
-                )),
-            )
-            .await?,
-    );
-    assert!(
-        hierarchy["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| { item["type_name"] == "org.example.Inspectable" && item["depth"] == 1 })
-    );
-
-    let source_matches = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_source").with_arguments(arguments(json!({
-                    "query": "version\\s*=\\s*2",
-                    "regex": true,
-                    "jar": "demo-2.0-sources.jar",
-                    "context_lines": 1
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(
-        source_matches["results"][0]["entry"],
-        "org/example/Foo.java"
-    );
-    assert_eq!(source_matches["results"][0]["line"], 1);
-
-    let declaration = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_declaration_source").with_arguments(arguments(
-                    json!({
-                        "class_name": "org.example.Foo",
-                        "version": "2.0"
-                    }),
-                )),
-            )
-            .await?,
-    );
-    assert!(
-        declaration["results"][0]["source"]
-            .as_str()
-            .unwrap()
-            .contains("class Foo")
-    );
-
-    let references = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_class_references").with_arguments(arguments(
-                    json!({
-                        "class_name": "org.example.Inspectable",
-                        "direction": "outbound",
-                        "kind": "class",
-                        "jar": "demo-2.0.jar"
-                    }),
-                )),
-            )
-            .await?,
-    );
-    assert!(
-        references["results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| { item["target_owner"] == "java.lang.Object" })
-    );
-
-    let providers = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_providers").with_arguments(arguments(json!({
-                    "service": "example.Service",
-                    "descriptor_kind": "service_loader"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(providers["results"][0]["provider"], "org.example.Foo");
-
-    let spring_providers = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_providers").with_arguments(arguments(json!({
-                    "service": "example.Factory",
-                    "descriptor_kind": "spring_factories"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(
-        spring_providers["results"][0]["provider"],
-        "org.example.Bar"
-    );
-
+    let client = server.connect().await?;
     let versions = structured(
         client
             .call_tool(
                 CallToolRequestParams::new("list_artifact_versions").with_arguments(arguments(
-                    json!({ "group_id": "org.example", "artifact_id": "demo" }),
+                    json!({
+                        "project_path": project_path.display().to_string(),
+                        "group_id": "org.libs",
+                        "artifact_id": "helper"
+                    }),
                 )),
             )
             .await?,
     );
-    assert_eq!(versions["org.example:demo"], json!(["1.0", "2.0"]));
+    assert_eq!(versions["org.libs:helper"], json!(["2.0"]));
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_index_reports_bounded_stdout_only_maven_failures() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+printf '%s\n' '[ERROR] Could not resolve sibling reactor artifact' '[ERROR] Install or package the required sibling modules first'
+i=0
+while [ "$i" -lt 100 ]; do
+  printf '[ERROR] diagnostic-padding-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i"
+  i=$((i + 1))
+done
+exit 1
+"#,
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                "project_path": project_path.display().to_string(),
+                "query": "Foo"
+            }))),
+        )
+        .await
+        .expect_err("a failed Maven classpath build must be an MCP error");
+    let message = error.to_string();
+    assert!(
+        message.contains("Could not resolve sibling reactor artifact"),
+        "{message}"
+    );
+    assert!(message.ends_with('…'), "{message}");
+    assert!(message.chars().count() <= 2_200, "{message}");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_index_reports_unknown_dependency_after_truncated_stdout() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    std::fs::write(
+        project_path.join("pom.xml"),
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId>
+  <artifactId>fixture-project</artifactId>
+  <version>1.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>invalid.example</groupId>
+      <artifactId>missing-library</artifactId>
+      <version>99.0-does-not-exist</version>
+    </dependency>
+  </dependencies>
+</project>"#,
+    )?;
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+grep -q '<artifactId>missing-library</artifactId>' pom.xml || exit 90
+i=0
+while [ "$i" -lt 400 ]; do
+  printf '[INFO] reactor-output-before-resolution-%04d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' "$i"
+  i=$((i + 1))
+done
+printf '%s\n' \
+  '[ERROR] Failed to execute goal on project fixture-project: Could not resolve dependencies' \
+  '[ERROR] dependency: invalid.example:missing-library:jar:99.0-does-not-exist (compile)' \
+  '[ERROR] Could not find artifact invalid.example:missing-library:jar:99.0-does-not-exist'
+exit 1
+"#,
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                "project_path": project_path.display().to_string(),
+                "query": "Foo"
+            }))),
+        )
+        .await
+        .expect_err("an unknown Maven dependency must prevent project indexing");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid.example:missing-library:jar:99.0-does-not-exist"),
+        "missing dependency diagnostic was lost: {message}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_directory_tree_serializes_maven_execution_across_projects() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let first_project = server.project_path().unwrap().to_owned();
+    let second_project = server.add_trusted_project("second-project")?;
+    let marker_directory = tempfile::tempdir()?;
+    let lock = marker_directory.path().join("maven-running");
+    let overlap = marker_directory.path().join("overlap");
+    for project in [&first_project, &second_project] {
+        let wrapper = project.join("mvnw");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ -e '{lock}' ]; then touch '{overlap}'; fi\ntouch '{lock}'\nsleep 1\nrm -f '{lock}'\nprintf '%s\\n' '[INFO] BUILD SUCCESS'\n",
+                lock = lock.display(),
+                overlap = overlap.display(),
+            ),
+        )?;
+        let mut permissions = wrapper.metadata()?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions)?;
+    }
+
+    let client = server.connect().await?;
+    let first = client.call_tool(
+        CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(json!({
+            "project_path": first_project.display().to_string(),
+            "phase": "compile"
+        }))),
+    );
+    let second = client.call_tool(
+        CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(json!({
+            "project_path": second_project.display().to_string(),
+            "phase": "compile"
+        }))),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(structured(first?)["outcome"], "success");
+    assert_eq!(structured(second?)["outcome"], "success");
+    assert!(
+        !overlap.exists(),
+        "Maven processes overlapped across trusted projects"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn jenv_java_selection_is_request_scoped_and_reports_resolution_errors() -> Result<()> {
+    let server = TestServer::start_with_jenv_project().await?;
+    let first_project = server.project_path().unwrap().to_owned();
+    let second_project = server.add_trusted_project("second-java-project")?;
+    server.set_jenv_version(&second_project, "two")?;
+    let client = server.connect().await?;
+
+    for project_path in [&first_project, &second_project] {
+        let result = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                        json!({
+                            "project_path": project_path.display().to_string(),
+                            "phase": "compile"
+                        }),
+                    )),
+                )
+                .await?,
+        );
+        assert_eq!(result["outcome"], "success", "{result:#}");
+    }
+
+    server.set_jenv_version(&first_project, "missing")?;
+    let failure = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": first_project.display().to_string(),
+                        "phase": "compile"
+                    }),
+                )),
+            )
+            .await?,
+    );
+    assert_eq!(failure["outcome"], "runner_error");
+    assert_eq!(failure["run"]["status"], "runner_error");
+    assert!(
+        failure["run"]["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("verify .java-version")
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_jenv_mode_preserves_the_inherited_java_environment() -> Result<()> {
+    let server = TestServer::start_with_inherited_java_project().await?;
+    let client = server.connect().await?;
+    let result = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": server.project_path().unwrap().display().to_string(),
+                        "phase": "compile"
+                    }),
+                )),
+            )
+            .await?,
+    );
+
+    assert_eq!(result["outcome"], "success", "{result:#}");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn project_operations_require_a_configured_trusted_directory() -> Result<()> {
+    let unconfigured_server = TestServer::start().await?;
+    let candidate_project = TestServer::start_with_project().await?;
+    let client = unconfigured_server.connect().await?;
+
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("inspect_maven_project").with_arguments(arguments(json!({
+                "project_path": candidate_project.project_path().unwrap().display().to_string()
+            }))),
+        )
+        .await
+        .expect_err("Maven operations must require a configured trusted directory");
+    assert!(
+        error
+            .to_string()
+            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn maven_lifecycle_reports_build_failure_and_timeout_through_stdio() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap().to_owned();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' '[ERROR] build failed' >&2\nexit 1\n",
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let failure = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": project_path.display().to_string(),
+                        "phase": "compile"
+                    }),
+                )),
+            )
+            .await?,
+    );
+    assert_eq!(failure["outcome"], "build_failure");
+    assert_eq!(failure["run"]["exit_code"], 1);
+
+    std::fs::write(&wrapper, "#!/bin/sh\nsleep 3\n")?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+    let timeout = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": project_path.display().to_string(),
+                        "phase": "verify"
+                    }),
+                )),
+            )
+            .await?,
+    );
+    assert_eq!(timeout["outcome"], "timeout");
+    assert_eq!(timeout["run"]["timed_out"], true);
 
     client.cancel().await?;
     Ok(())
@@ -397,8 +532,9 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
 
 #[tokio::test]
 async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
-    let server = TestServer::start().await?;
+    let server = TestServer::start_with_project().await?;
     let client = server.connect().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
 
     let missing_argument = client
         .call_tool(CallToolRequestParams::new("search_classes"))
@@ -409,12 +545,13 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
             .as_text()
             .unwrap()
             .text
-            .contains("query")
+            .contains("project_path")
     );
 
     let invalid_regex = client
         .call_tool(
             CallToolRequestParams::new("search_source").with_arguments(arguments(json!({
+                "project_path": project_path,
                 "query": "[",
                 "regex": true
             }))),
@@ -426,6 +563,7 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
     let descriptor_without_member = client
         .call_tool(
             CallToolRequestParams::new("get_declaration_source").with_arguments(arguments(json!({
+                "project_path": server.project_path().unwrap().display().to_string(),
                 "class_name": "org.example.Foo",
                 "descriptor": "()V"
             }))),
@@ -456,7 +594,10 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
 #[tokio::test]
 async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> {
     let server = TestServer::start_with_project().await?;
+    let other_server = TestServer::start_with_project().await?;
     let client = server.connect().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
+    let other_project_path = other_server.project_path().unwrap().display().to_string();
 
     let tools = client.list_all_tools().await?;
     let names = tools
@@ -481,17 +622,37 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
 
     let project = structured(
         client
-            .call_tool(CallToolRequestParams::new("inspect_maven_project"))
+            .call_tool(
+                CallToolRequestParams::new("inspect_maven_project")
+                    .with_arguments(arguments(json!({ "project_path": project_path }))),
+            )
             .await?,
     );
     assert_eq!(project["artifact_id"], "fixture-project");
     assert_eq!(project["wrapper"], true);
 
+    let untrusted = client
+        .call_tool(
+            CallToolRequestParams::new("inspect_maven_project")
+                .with_arguments(arguments(json!({ "project_path": other_project_path }))),
+        )
+        .await
+        .expect_err("a project outside the trusted directory tree must be rejected");
+    assert!(
+        untrusted
+            .to_string()
+            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+    );
+
     let lifecycle = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("run_maven_lifecycle")
-                    .with_arguments(arguments(json!({ "phase": "compile" }))),
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": server.project_path().unwrap().display().to_string(),
+                        "phase": "compile"
+                    }),
+                )),
             )
             .await?,
     );
@@ -499,7 +660,11 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
 
     let tests = structured(
         client
-            .call_tool(CallToolRequestParams::new("list_maven_test_classes"))
+            .call_tool(
+                CallToolRequestParams::new("list_maven_test_classes").with_arguments(arguments(
+                    json!({ "project_path": server.project_path().unwrap().display().to_string() }),
+                )),
+            )
             .await?,
     );
     assert_eq!(tests["results"], json!(["org.example.FooTest"]));
@@ -507,6 +672,7 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
         client
             .call_tool(
                 CallToolRequestParams::new("run_maven_test").with_arguments(arguments(json!({
+                    "project_path": server.project_path().unwrap().display().to_string(),
                     "test_class": "org.example.FooTest"
                 }))),
             )
@@ -514,12 +680,37 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     );
     assert_eq!(focused["report_status"], "available");
     assert_eq!(focused["summary"]["passed"], 1);
+    let first_failures = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_last_maven_test_failures").with_arguments(
+                    arguments(json!({
+                        "project_path": server.project_path().unwrap().display().to_string()
+                    })),
+                ),
+            )
+            .await?,
+    );
+    assert_eq!(first_failures["available"], true);
+    let other_failures = client
+        .call_tool(
+            CallToolRequestParams::new("get_last_maven_test_failures")
+                .with_arguments(arguments(json!({ "project_path": other_project_path }))),
+        )
+        .await
+        .expect_err("last-test state must not be observable outside the trusted directory tree");
+    assert!(
+        other_failures
+            .to_string()
+            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+    );
 
     let effective = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("get_effective_pom")
-                    .with_arguments(arguments(json!({}))),
+                CallToolRequestParams::new("get_effective_pom").with_arguments(arguments(json!({
+                    "project_path": server.project_path().unwrap().display().to_string()
+                }))),
             )
             .await?,
     );
@@ -532,8 +723,11 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     let dependency_tree = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("get_dependency_tree")
-                    .with_arguments(arguments(json!({}))),
+                CallToolRequestParams::new("get_dependency_tree").with_arguments(arguments(
+                    json!({
+                        "project_path": server.project_path().unwrap().display().to_string()
+                    }),
+                )),
             )
             .await?,
     );
@@ -545,8 +739,11 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     let resolution = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("explain_dependency_resolution")
-                    .with_arguments(arguments(json!({}))),
+                CallToolRequestParams::new("explain_dependency_resolution").with_arguments(
+                    arguments(json!({
+                        "project_path": server.project_path().unwrap().display().to_string()
+                    })),
+                ),
             )
             .await?,
     );
@@ -562,8 +759,12 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     let classpath = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("get_maven_classpath")
-                    .with_arguments(arguments(json!({ "kind": "test" }))),
+                CallToolRequestParams::new("get_maven_classpath").with_arguments(arguments(
+                    json!({
+                        "project_path": server.project_path().unwrap().display().to_string(),
+                        "kind": "test"
+                    }),
+                )),
             )
             .await?,
     );
@@ -571,7 +772,11 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
 
     let coverage = structured(
         client
-            .call_tool(CallToolRequestParams::new("get_jacoco_coverage"))
+            .call_tool(
+                CallToolRequestParams::new("get_jacoco_coverage").with_arguments(arguments(
+                    json!({ "project_path": server.project_path().unwrap().display().to_string() }),
+                )),
+            )
             .await?,
     );
     assert_eq!(coverage["status"], "available");
@@ -580,12 +785,56 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     let gaps = structured(
         client
             .call_tool(
-                CallToolRequestParams::new("get_jacoco_coverage_gaps")
-                    .with_arguments(arguments(json!({ "limit": 1 }))),
+                CallToolRequestParams::new("get_jacoco_coverage_gaps").with_arguments(arguments(
+                    json!({
+                        "project_path": server.project_path().unwrap().display().to_string(),
+                        "limit": 1
+                    }),
+                )),
             )
             .await?,
     );
     assert_eq!(gaps["gaps"][0]["class_name"], "org.example.Foo");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_resolution_failure_returns_a_policy_notice() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' '[ERROR] Cannot access central in offline mode and the artifact org.example:demo:jar:1.0 has not been downloaded from it before.'\nexit 1\n",
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let result = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
+                    json!({
+                        "project_path": project_path.display().to_string(),
+                        "phase": "compile"
+                    }),
+                )),
+            )
+            .await?,
+    );
+
+    assert_eq!(result["outcome"], "build_failure");
+    assert!(
+        result["policy_notice"]
+            .as_str()
+            .is_some_and(|notice| notice.contains("MAVEN_EXECUTION_NETWORK=true"))
+    );
 
     client.cancel().await?;
     Ok(())

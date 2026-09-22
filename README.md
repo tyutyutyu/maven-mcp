@@ -1,15 +1,21 @@
 # Maven MCP
 
-A native MCP server written in Rust that indexes a local Maven repository in
-memory at startup. An MCP host such as Codex or GitHub Copilot starts the binary
-as a child process and communicates with it exclusively over STDIO.
+A native MCP server written in Rust for request-scoped Maven project inspection.
+An MCP host such as Codex or GitHub Copilot starts the binary as a child process
+and communicates with it exclusively over STDIO. Startup does not scan
+`~/.m2/repository` and does not require a preselected project.
 
 ## Features
 
-The index derives `groupId:artifactId:version[:classifier]` coordinates from the
-Maven directory layout and exposes the following MCP tools:
+Every repository- or project-dependent MCP tool requires a `project_path`
+argument containing an absolute Maven project root with `pom.xml`. The server
+canonicalizes the path per request; Maven-backed operations accept it only when
+it is inside a host-configured trusted directory tree, never because of the
+client's current working directory.
 
-- `index_stats` – statistics for the completed index.
+The server exposes the following MCP tools:
+
+- `index_stats` – statistics for the request-scoped project index.
 - `search_classes` – returns every containing JAR for a partial or fully
   qualified class name.
 - `search_jars` – searches JARs by coordinate, artifact, version, filename, or
@@ -54,9 +60,7 @@ Maven directory layout and exposes the following MCP tools:
 - `list_artifact_versions` – lists locally available versions of an artifact,
   with an optional `groupId` filter.
 
-Project execution is a separate opt-in capability. The following tools are
-available only when `MAVEN_PROJECT_ROOT` is configured and startup project
-validation succeeds:
+Project inspection and execution use the same request `project_path`:
 
 - `inspect_maven_project` – models the root project, Maven Wrapper, and recursive
   reactor modules.
@@ -77,14 +81,21 @@ validation succeeds:
 List-like tools use an MCP-compatible structured root object:
 `{ "results": [...] }`.
 
-The class index handles multi-release JARs and inner classes. Corrupt JARs and
-JARs outside the Maven layout are skipped with a warning. Repository inspection
-tools are read-only: they do not extract files or modify Maven metadata.
-
-Type hierarchy, classfile reference, and provider relationships are built as
-immutable facts at startup. Source JAR contents are not retained in memory:
-`search_source` and `get_declaration_source` read them on demand under the
-configured byte and result limits.
+Repository inspection tools are read-only: they do not extract files or modify
+Maven metadata. The first repository-search request for a project asks Maven for
+the effective test classpath, builds a lazy index only from those local JARs and
+their sibling `-sources.jar` files, and caches that index by canonical
+`project_path`. For a multi-module reactor, classpath sections from every module
+are aggregated; empty parent or aggregator POM sections do not hide dependencies
+reported by later modules. Artifacts present elsewhere in the same local Maven
+repository are not searched unless Maven selected them for the requested
+project. Repeated classfile fact strings are stored once per JAR and referenced
+by compact numeric identifiers, so large dependency sets do not retain a
+separate allocation for every constant-pool reference. The effective classpath
+must be fully resolvable; for example, a reactor dependency on an unbuilt sibling
+SNAPSHOT can prevent the index from being created. In that case the MCP error
+includes a bounded, redacted summary of Maven's error output, regardless of
+whether Maven wrote it to stdout or stderr.
 
 `search_jar_content` examines the manifest, `META-INF/services/*` descriptors,
 and UTF-8 entries with the extensions `conf`, `config`, `factories`, `imports`,
@@ -101,15 +112,30 @@ provider descriptors and therefore are not included in this structured view.
 ## Native STDIO startup
 
 ```bash
-export MAVEN_REPO_PATH="$HOME/.m2/repository"
 cargo build --release --locked --bin maven-mcp
 ```
 
 Configure the MCP host to run the resulting `target/release/maven-mcp` binary and
-pass `MAVEN_REPO_PATH` in its environment. The host owns process startup,
+pass request `project_path` values in tool calls. The host owns process startup,
 shutdown, and STDIO; there is no port, URL, daemon, health endpoint, Docker
-image, or manual server lifecycle. Allow up to 300 seconds for cold startup on
-a large repository. The complete index is built before initialization finishes.
+image, or manual server lifecycle. Startup is lightweight because no repository
+index is built before initialization finishes.
+
+Add `--jenv` to the server command when Maven children must use each project's
+jenv-selected Java instead of relying on the MCP host's inherited `JAVA_HOME`
+and `PATH`.
+
+Runtime diagnostics are available without starting an MCP transport:
+
+```bash
+maven-mcp stats
+maven-mcp stats --json
+```
+
+The stats command reads user-private runtime status files for live host-managed
+STDIO instances and reports PIDs, process RSS where the platform exposes it,
+active project indexes, index sizes, and cache hit/miss/eviction counters. If no
+server is running, it exits successfully with an empty report.
 
 For local source-tree inspection, the bundled helper builds the binary and lets
 MCP Inspector start it over STDIO:
@@ -127,10 +153,8 @@ path:
 ```toml
 [mcp_servers.maven-mcp]
 command = "/absolute/path/to/maven-mcp"
+args = ["--jenv"]
 startup_timeout_sec = 300
-
-[mcp_servers.maven-mcp.env]
-MAVEN_REPO_PATH = "/home/user/.m2/repository"
 ```
 
 Alternatively, register the same STDIO command with `codex mcp add`. Verify it
@@ -144,9 +168,8 @@ Copilot CLI defaults local commands to STDIO. Register the installed binary and
 
 ```bash
 copilot mcp add \
-  --env MAVEN_REPO_PATH="$HOME/.m2/repository" \
   --timeout 300000 \
-  maven-mcp -- /absolute/path/to/maven-mcp
+  maven-mcp -- /absolute/path/to/maven-mcp --jenv
 copilot mcp get maven-mcp
 ```
 
@@ -155,37 +178,79 @@ See the
 
 ## Opt-in Project Execution
 
-Project execution is enabled only when the MCP host explicitly supplies a
-trusted local project root:
+Project execution requires both a host-configured trusted directory and a request
+`project_path` below that directory. Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to a
+platform path-list of existing absolute directories; the server canonicalizes the
+directories at startup. A configured directory can contain Maven projects at any
+depth, and may itself be a Maven project root. Without this variable, all
+Maven-backed project operations are unavailable. The client-supplied
+`project_path` validates the selected project; it never grants trust itself.
+
+For example, on Unix:
 
 ```bash
-export MAVEN_REPO_PATH="$HOME/.m2/repository"
-export MAVEN_PROJECT_ROOT="$PWD"
-mkdir -p "$HOME/.cache/maven-mcp/repository"
-export MAVEN_EXECUTION_REPO_PATH="$HOME/.cache/maven-mcp/repository"
+export MAVEN_TRUSTED_PROJECT_DIRECTORIES="/work/trusted-projects:/srv/build-roots"
+```
+
+Then the client may select a Maven project below either directory:
+
+```json
+{
+  "tool": "inspect_maven_project",
+  "arguments": {
+    "project_path": "/work/trusted-projects/team-a/service"
+  }
+}
 ```
 
 The project is writable because Maven creates `target/` files. The execution
-repository must be a separate, dedicated writable directory. Maven is offline
-by default (`--offline`); set `MAVEN_EXECUTION_NETWORK=true` only for a trusted
-project that may resolve dependencies and plugins. The server does not accept
-raw Maven goals or arguments, runs one build at a time, applies time and output
-limits, and redacts paths and common credential patterns. Native execution is
-not a sandbox: Maven plugins and tests run with the local user's permissions.
+repository, when configured, must be a separate, dedicated writable directory.
+Maven is offline by default (`--offline`); set `MAVEN_EXECUTION_NETWORK=true`
+only for trusted projects that may resolve dependencies and plugins. The server
+does not accept raw Maven goals or arguments, runs at most one Maven process at a
+time across the entire STDIO server, applies time and output limits, and redacts
+paths and common credential patterns. Native execution is not a sandbox: Maven
+plugins and tests run with the local user's permissions.
+
+When an offline Maven run fails because a required remote plugin or artifact is
+not cached locally, the returned `build.policy_notice` explains that the result
+may reflect an intentional security policy or missing MCP server configuration,
+not necessarily a project error. It also names `MAVEN_EXECUTION_NETWORK=true` as
+the opt-in setting for trusted projects. The optional field is omitted from
+successful runs and failures unrelated to offline artifact resolution.
+
+### Request-scoped jenv Java selection
+
+Start the STDIO server with `maven-mcp --jenv` to resolve Java separately for
+every Maven invocation. The server uses `JENV_ROOT` when set, otherwise
+`$HOME/.jenv`, and runs that installation's `bin/jenv prefix` without a shell
+from the request's canonical `project_path`. Inherited `JENV_VERSION` and
+`JENV_DIR` values are deliberately ignored so an unrelated MCP host working
+directory or shell override cannot replace the project's `.java-version`
+selection.
+
+The returned Java home must be absolute, readable, and contain executable
+`bin/java`. Only the Maven child receives the resolved `JAVA_HOME` and a `PATH`
+with that JDK's `bin` prepended; the MCP server environment is not mutated. A
+missing jenv installation, unknown project version, or invalid JDK is returned
+as a structured `runner_error`, and Maven is not started. Without `--jenv`, the
+existing inherited `JAVA_HOME` and `PATH` behavior is unchanged.
 
 ## Environment Variables
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MAVEN_REPO_PATH` | required | Root of the Maven repository. |
 | `MAX_RESULTS` | `100` | Maximum number of items in one tool response. |
 | `MAX_SOURCE_BYTES` | `1048576` | Maximum size of one source, exact JAR entry, or processed class/resource; returned content is truncated, while oversized inspection input is skipped or reported as an error. |
-| `MAVEN_PROJECT_ROOT` | none | Root for opt-in project execution; a valid `pom.xml` is required. |
+| `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots retained in the in-process project-index cache. |
+| `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
-| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository that is separate from the indexed repository. |
+| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for request-scoped Maven execution. |
 | `MAVEN_EXECUTION_NETWORK` | `false` | When `true`, `--offline` is not added to Maven commands. |
 | `MAVEN_TIMEOUT_SECONDS` | `300` | Maximum runtime of one Maven child process. |
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |
+| `MAVEN_MCP_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime` | User-private directory for live runtime status files consumed by `maven-mcp stats`. |
+| `JENV_ROOT` | `$HOME/.jenv` | jenv installation root used only when the server starts with `--jenv`; must be an absolute path when explicitly set. |
 | `RUST_LOG` | `maven_mcp=info` | Logging level/filter. |
 
 `get_class_source` returns a result only when the corresponding sources artifact
@@ -263,7 +328,10 @@ Benchmark specification format:
       },
       "mcp": {
         "tool": "search_classes",
-        "arguments": { "query": "org.example.Foo" }
+        "arguments": {
+          "project_path": "/path/to/project",
+          "query": "org.example.Foo"
+        }
       }
     }
   ]
@@ -276,7 +344,6 @@ expects no arguments. Case IDs must be unique.
 
 ```bash
 cargo build --locked --bin maven-mcp
-export MAVEN_REPO_PATH="$HOME/.m2/repository"
 cargo run --locked --bin maven-benchmark -- \
   --spec benchmark.json \
   --mcp-command target/debug/maven-mcp \
@@ -329,8 +396,8 @@ task benchmark:run SPEC=my-benchmark.json OUTPUT=target/custom-results.json \
 ```
 
 The repository includes a default `benchmark.json` specification for common
-SLF4J class, version, and source lookup commands. The shell side inspects
-`MAVEN_REPO_PATH`, or `$HOME/.m2/repository` when the variable is unset.
+Maven inspection commands. MCP cases that inspect project or repository state
+must include an absolute `project_path` argument.
 
 Every benchmark variable can be overridden. Defaults are `SPEC=benchmark.json`,
 `OUTPUT=target/benchmark-results.json`,
@@ -359,7 +426,7 @@ directly over STDIO.
 
 ```bash
 cargo test
-MAVEN_REPO_PATH="$HOME/.m2/repository" cargo run
+cargo run --locked
 ```
 
 Unit tests cover Maven coordinate recognition, search, pagination, classifier
@@ -371,8 +438,9 @@ server and use a real MCP client. They can also be run separately:
 cargo test --test mcp_interface
 ```
 
-The integration contract separately verifies that project tools are hidden by
-default and executable through a real STDIO MCP client in opt-in mode. Lifecycle
+The integration contract verifies that all project-dependent tools require
+`project_path`, Maven-backed operations require a host-configured trusted
+directory tree, and execution occurs through a real STDIO MCP client. Lifecycle
 tests ensure EOF and SIGTERM stop the process and stdout contains JSON-RPC only.
 
 Run the complete test pyramid—unit tests, real child-process STDIO MCP
@@ -388,6 +456,15 @@ The human-readable report is written to:
 ```text
 target/mcp-test-report/report.md
 ```
+
+### Hosted CI
+
+GitHub Actions runs the same verification gate from
+`.github/workflows/ci.yml` for every push and for pull requests targeting
+`main`. The workflow installs Rust `1.89.0`, uses the committed `Cargo.lock`,
+and runs `scripts/test-pyramid.sh` on Ubuntu. Its job and status-check context
+are both named `CI`, so a repository ruleset can require the successful `CI`
+check before merging.
 
 ### Agent and LLM Evaluation
 

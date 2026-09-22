@@ -2,7 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
     io::Read,
+    num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -33,8 +35,8 @@ struct JarRecord {
     path: PathBuf,
     classes: Vec<String>,
     entries: Vec<String>,
-    type_facts: Vec<TypeFact>,
-    references: Vec<IndexedReference>,
+    fact_strings: Vec<Arc<str>>,
+    class_facts: Vec<IndexedClassFacts>,
     providers: Vec<IndexedProvider>,
 }
 
@@ -50,6 +52,10 @@ impl JarRecord {
                 self.key.group_id, self.key.artifact_id, self.key.version
             ),
         }
+    }
+
+    fn fact_string(&self, id: FactStringId) -> &str {
+        &self.fact_strings[(id.0.get() - 1) as usize]
     }
 }
 
@@ -400,19 +406,54 @@ pub struct ProviderFact {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
-struct TypeFact {
-    child: String,
-    parent: String,
+struct IndexedClassFacts {
+    source_class: FactStringId,
+    parents: Vec<IndexedTypeParent>,
+    references: Vec<IndexedReference>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct IndexedTypeParent {
+    parent: FactStringId,
     relation: TypeRelation,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct IndexedReference {
-    source_class: String,
-    target_owner: String,
-    target_name: Option<String>,
-    target_descriptor: Option<String>,
+    target_owner: FactStringId,
+    target_name: Option<FactStringId>,
+    target_descriptor: Option<FactStringId>,
     kind: ClassReferenceKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+struct FactStringId(NonZeroU32);
+
+#[derive(Default)]
+struct FactStringPool {
+    ids: HashMap<Arc<str>, FactStringId>,
+    values: Vec<Arc<str>>,
+}
+
+impl FactStringPool {
+    fn intern(&mut self, value: &str) -> FactStringId {
+        if let Some(id) = self.ids.get(value) {
+            return *id;
+        }
+        let raw_id = u32::try_from(self.values.len() + 1)
+            .expect("one JAR cannot contain u32::MAX distinct fact strings");
+        let id = FactStringId(
+            NonZeroU32::new(raw_id).expect("fact string IDs start at one by construction"),
+        );
+        let value: Arc<str> = Arc::from(value);
+        self.ids.insert(Arc::clone(&value), id);
+        self.values.push(value);
+        id
+    }
+
+    fn into_values(self) -> Vec<Arc<str>> {
+        self.values
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -423,7 +464,7 @@ struct IndexedProvider {
     entry: String,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct IndexStats {
     pub jar_count: usize,
     pub source_jar_count: usize,
@@ -445,6 +486,49 @@ pub struct MavenIndex {
 
 impl MavenIndex {
     pub fn build(root: &Path, max_results: usize, max_source_bytes: usize) -> Result<Self> {
+        let jar_paths = collect_repository_jars(root);
+        Self::build_from_jars(root, &jar_paths, max_results, max_source_bytes)
+    }
+
+    pub fn build_scoped(
+        repository_root: &Path,
+        classpath_jars: &[PathBuf],
+        max_results: usize,
+        max_source_bytes: usize,
+    ) -> Result<Self> {
+        let mut jar_paths = BTreeSet::new();
+        for path in classpath_jars {
+            let path = match path.canonicalize() {
+                Ok(path) if path.starts_with(repository_root) => path,
+                Ok(path) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping classpath jar outside repository root"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "skipping unreadable classpath jar");
+                    continue;
+                }
+            };
+            jar_paths.insert(path.clone());
+            if let Some(source_path) = source_jar_path(&path)
+                && source_path.is_file()
+            {
+                jar_paths.insert(source_path);
+            }
+        }
+        let jar_paths = jar_paths.into_iter().collect::<Vec<_>>();
+        Self::build_from_jars(repository_root, &jar_paths, max_results, max_source_bytes)
+    }
+
+    fn build_from_jars(
+        root: &Path,
+        jar_paths: &[PathBuf],
+        max_results: usize,
+        max_source_bytes: usize,
+    ) -> Result<Self> {
         let mut index = Self {
             root: root.to_owned(),
             jars: Vec::new(),
@@ -454,24 +538,6 @@ impl MavenIndex {
             max_results,
             max_source_bytes,
         };
-
-        let mut jar_paths = Vec::new();
-        for entry in WalkDir::new(root).follow_links(false).into_iter() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(%error, "unable to inspect repository entry");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if !entry.file_type().is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("jar")
-            {
-                continue;
-            }
-            jar_paths.push(path.to_owned());
-        }
 
         let mut records = jar_paths
             .par_iter()
@@ -1095,44 +1161,49 @@ impl MavenIndex {
         let mut visited_edges = BTreeSet::new();
         let mut matches = Vec::new();
         while let Some((parent, path, depth)) = queue.pop_front() {
-            let mut edges = self
-                .jars
-                .iter()
-                .enumerate()
-                .flat_map(|(jar_index, jar)| {
-                    jar.type_facts
+            let mut edges = Vec::new();
+            for (jar_index, jar) in self.jars.iter().enumerate() {
+                for class in &jar.class_facts {
+                    for fact in class
+                        .parents
                         .iter()
-                        .filter(|fact| fact.parent.eq_ignore_ascii_case(&parent))
-                        .map(move |fact| (jar_index, fact))
-                })
-                .collect::<Vec<_>>();
-            edges.sort_by(|(left_jar, left), (right_jar, right)| {
-                (
-                    &left.child,
-                    &self.jars[*left_jar].relative_path,
-                    left.relation,
-                )
-                    .cmp(&(
-                        &right.child,
-                        &self.jars[*right_jar].relative_path,
-                        right.relation,
-                    ))
-            });
-            for (jar_index, fact) in edges {
+                        .filter(|fact| jar.fact_string(fact.parent).eq_ignore_ascii_case(&parent))
+                    {
+                        edges.push((jar_index, class, fact));
+                    }
+                }
+            }
+            edges.sort_by(
+                |(left_jar, left_class, left), (right_jar, right_class, right)| {
+                    (
+                        self.jars[*left_jar].fact_string(left_class.source_class),
+                        &self.jars[*left_jar].relative_path,
+                        left.relation,
+                    )
+                        .cmp(&(
+                            self.jars[*right_jar].fact_string(right_class.source_class),
+                            &self.jars[*right_jar].relative_path,
+                            right.relation,
+                        ))
+                },
+            );
+            for (jar_index, class, fact) in edges {
                 let jar = &self.jars[jar_index];
+                let child = jar.fact_string(class.source_class);
+                let fact_parent = jar.fact_string(fact.parent);
                 let edge_key = (
-                    fact.child.to_lowercase(),
-                    fact.parent.to_lowercase(),
+                    child.to_lowercase(),
+                    fact_parent.to_lowercase(),
                     jar.coordinate(),
                 );
-                if !visited_edges.insert(edge_key) || path.iter().any(|node| node == &fact.child) {
+                if !visited_edges.insert(edge_key) || path.iter().any(|node| node == child) {
                     continue;
                 }
                 let mut child_path = path.clone();
-                child_path.push(fact.child.clone());
+                child_path.push(child.to_owned());
                 if jar_selector.is_none_or(|selector| matches_selector(jar, selector)) {
                     matches.push(TypeHierarchyMatch {
-                        type_name: fact.child.clone(),
+                        type_name: child.to_owned(),
                         jar: self.summary(jar),
                         relation: fact.relation,
                         depth: depth + 1,
@@ -1143,7 +1214,7 @@ impl MavenIndex {
                     }
                 }
                 if transitive {
-                    queue.push_back((fact.child.clone(), child_path, depth + 1));
+                    queue.push_back((child.to_owned(), child_path, depth + 1));
                 }
             }
             if !transitive {
@@ -1352,39 +1423,48 @@ impl MavenIndex {
                     && jar_selector.is_none_or(|selector| matches_selector(jar, selector))
             })
             .flat_map(|jar| {
-                jar.references
-                    .iter()
-                    .filter(|reference| match direction {
-                        ReferenceDirection::Inbound => {
-                            reference.target_owner.eq_ignore_ascii_case(&class_name)
-                        }
-                        ReferenceDirection::Outbound => {
-                            reference.source_class.eq_ignore_ascii_case(&class_name)
-                        }
-                    })
-                    .filter(|reference| kind.is_none_or(|expected| reference.kind == expected))
-                    .filter(|reference| {
-                        member_name.is_none_or(|expected| {
-                            reference
+                jar.class_facts.iter().flat_map(|class| {
+                    class
+                        .references
+                        .iter()
+                        .filter(|reference| match direction {
+                            ReferenceDirection::Inbound => jar
+                                .fact_string(reference.target_owner)
+                                .eq_ignore_ascii_case(&class_name),
+                            ReferenceDirection::Outbound => jar
+                                .fact_string(class.source_class)
+                                .eq_ignore_ascii_case(&class_name),
+                        })
+                        .filter(|reference| kind.is_none_or(|expected| reference.kind == expected))
+                        .filter(|reference| {
+                            member_name.is_none_or(|expected| {
+                                reference
+                                    .target_name
+                                    .is_some_and(|name| jar.fact_string(name) == expected)
+                            })
+                        })
+                        .filter(|reference| {
+                            descriptor.is_none_or(|expected| {
+                                reference
+                                    .target_descriptor
+                                    .is_some_and(|value| jar.fact_string(value) == expected)
+                            })
+                        })
+                        .map(|reference| ClassReference {
+                            source_class: jar.fact_string(class.source_class).to_owned(),
+                            source_jar: self.summary(jar),
+                            target_owner: jar.fact_string(reference.target_owner).to_owned(),
+                            target_name: reference
                                 .target_name
-                                .as_deref()
-                                .is_some_and(|name| name == expected)
+                                .map(|value| jar.fact_string(value).to_owned()),
+                            target_descriptor: reference
+                                .target_descriptor
+                                .map(|value| jar.fact_string(value).to_owned()),
+                            kind: reference.kind,
+                            target_artifacts: self
+                                .target_artifacts(jar.fact_string(reference.target_owner)),
                         })
-                    })
-                    .filter(|reference| {
-                        descriptor.is_none_or(|expected| {
-                            reference.target_descriptor.as_deref() == Some(expected)
-                        })
-                    })
-                    .map(|reference| ClassReference {
-                        source_class: reference.source_class.clone(),
-                        source_jar: self.summary(jar),
-                        target_owner: reference.target_owner.clone(),
-                        target_name: reference.target_name.clone(),
-                        target_descriptor: reference.target_descriptor.clone(),
-                        kind: reference.kind,
-                        target_artifacts: self.target_artifacts(&reference.target_owner),
-                    })
+                })
             })
             .collect::<Vec<_>>();
         results.sort_by(|left, right| {
@@ -1681,7 +1761,7 @@ fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<J
             return None;
         }
     };
-    let (type_facts, references, providers) = if classifier.as_deref() == Some("sources") {
+    let (class_facts, providers, fact_strings) = if classifier.as_deref() == Some("sources") {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
         collect_jar_facts(path, &entries, max_entry_bytes)
@@ -1693,26 +1773,56 @@ fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<J
         path: path.to_owned(),
         classes,
         entries,
-        type_facts,
-        references,
+        fact_strings,
+        class_facts,
         providers,
     })
+}
+
+fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
+    let mut jar_paths = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(%error, "unable to inspect repository entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !entry.file_type().is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("jar")
+        {
+            continue;
+        }
+        jar_paths.push(path.to_owned());
+    }
+    jar_paths
+}
+
+fn source_jar_path(binary_jar: &Path) -> Option<PathBuf> {
+    let file_name = binary_jar.file_name()?.to_str()?;
+    if file_name.ends_with("-sources.jar") {
+        return None;
+    }
+    let stem = file_name.strip_suffix(".jar")?;
+    Some(binary_jar.with_file_name(format!("{stem}-sources.jar")))
 }
 
 fn collect_jar_facts(
     path: &Path,
     entries: &[String],
     max_entry_bytes: usize,
-) -> (Vec<TypeFact>, Vec<IndexedReference>, Vec<IndexedProvider>) {
+) -> (Vec<IndexedClassFacts>, Vec<IndexedProvider>, Vec<Arc<str>>) {
     let Ok(file) = File::open(path) else {
         return (Vec::new(), Vec::new(), Vec::new());
     };
     let Ok(mut archive) = ZipArchive::new(file) else {
         return (Vec::new(), Vec::new(), Vec::new());
     };
-    let mut type_facts = BTreeSet::new();
-    let mut references = BTreeSet::new();
+    let mut class_facts = Vec::new();
     let mut providers = BTreeSet::new();
+    let mut strings = FactStringPool::default();
     let class_entries = effective_class_entries(entries);
     for entry_path in class_entries {
         let Ok(mut entry) = archive.by_name(&entry_path) else {
@@ -1735,29 +1845,41 @@ fn collect_jar_facts(
         let Ok(parsed) = cafebabe::parse_class_with_options(&bytes, &options) else {
             continue;
         };
-        let source_class = binary_name(&parsed.this_class);
-        if source_class == "module-info" {
+        let source_class_name = binary_name(&parsed.this_class);
+        let source_class = strings.intern(&source_class_name);
+        if source_class_name == "module-info" {
             collect_module_providers(&parsed.attributes, &entry_path, &mut providers);
             continue;
         }
+        let mut parents = Vec::new();
         if let Some(super_class) = &parsed.super_class {
-            type_facts.insert(TypeFact {
-                child: source_class.clone(),
-                parent: binary_name(super_class),
+            parents.push(IndexedTypeParent {
+                parent: strings.intern(&binary_name(super_class)),
                 relation: TypeRelation::Extends,
             });
         }
         for interface in &parsed.interfaces {
-            type_facts.insert(TypeFact {
-                child: source_class.clone(),
-                parent: binary_name(interface),
+            parents.push(IndexedTypeParent {
+                parent: strings.intern(&binary_name(interface)),
                 relation: TypeRelation::Implements,
             });
         }
+        parents.sort_unstable();
+        parents.dedup();
+        let mut references = Vec::new();
         for item in parsed.constantpool_iter() {
-            if let Some(reference) = indexed_reference(&source_class, item) {
-                references.insert(reference);
+            if let Some(reference) = indexed_reference(&source_class_name, item, &mut strings) {
+                references.push(reference);
             }
+        }
+        references.sort_unstable();
+        references.dedup();
+        if !parents.is_empty() || !references.is_empty() {
+            class_facts.push(IndexedClassFacts {
+                source_class,
+                parents,
+                references,
+            });
         }
     }
     for entry_path in entries.iter().filter(|entry| is_provider_descriptor(entry)) {
@@ -1778,9 +1900,9 @@ fn collect_jar_facts(
         }
     }
     (
-        type_facts.into_iter().collect(),
-        references.into_iter().collect(),
+        class_facts,
         providers.into_iter().collect(),
+        strings.into_values(),
     )
 }
 
@@ -1808,7 +1930,11 @@ fn effective_class_entries(entries: &[String]) -> Vec<String> {
     selected.into_values().map(|(_, entry)| entry).collect()
 }
 
-fn indexed_reference(source_class: &str, item: ConstantPoolItem<'_>) -> Option<IndexedReference> {
+fn indexed_reference(
+    source_class: &str,
+    item: ConstantPoolItem<'_>,
+    strings: &mut FactStringPool,
+) -> Option<IndexedReference> {
     let (target_owner, target_name, target_descriptor, kind) = match item {
         ConstantPoolItem::ClassInfo(class_name) => (
             normalize_constant_class(&class_name)?,
@@ -1840,10 +1966,9 @@ fn indexed_reference(source_class: &str, item: ConstantPoolItem<'_>) -> Option<I
         return None;
     }
     Some(IndexedReference {
-        source_class: source_class.to_owned(),
-        target_owner,
-        target_name,
-        target_descriptor,
+        target_owner: strings.intern(&target_owner),
+        target_name: target_name.map(|name| strings.intern(&name)),
+        target_descriptor: target_descriptor.map(|descriptor| strings.intern(&descriptor)),
         kind,
     })
 }
@@ -3686,6 +3811,10 @@ mod tests {
 
     #[test]
     fn indexes_and_filters_constant_pool_references() {
+        assert!(
+            std::mem::size_of::<IndexedReference>() <= 16,
+            "reference records must remain compact because repositories retain millions of them"
+        );
         let root = TempDir::new().unwrap();
         let jar = root.path().join("org/example/demo/1.0/demo-1.0.jar");
         let caller = referencing_class("org/example/Caller", "org/example/Target");
@@ -3698,6 +3827,25 @@ mod tests {
             ],
         );
         let index = build_index(&root, 10, 64 * 1024);
+
+        let jar = &index.jars[0];
+        let caller_facts = jar
+            .class_facts
+            .iter()
+            .filter(|facts| jar.fact_string(facts.source_class) == "org.example.Caller")
+            .collect::<Vec<_>>();
+        assert_eq!(caller_facts.len(), 1, "source class facts must be grouped");
+        let target_owners = caller_facts[0]
+            .references
+            .iter()
+            .filter(|reference| jar.fact_string(reference.target_owner) == "org.example.Target")
+            .map(|reference| reference.target_owner)
+            .collect::<Vec<_>>();
+        assert!(target_owners.len() >= 2);
+        assert!(
+            target_owners.windows(2).all(|pair| pair[0] == pair[1]),
+            "repeated reference strings must use one compact ID per JAR"
+        );
 
         let inbound = index.search_class_references(
             "org.example.Target",

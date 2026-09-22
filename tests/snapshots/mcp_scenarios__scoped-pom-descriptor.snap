@@ -1,0 +1,19 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "coordinate": "org.libs:helper:2.0",
+  "descriptor": {
+    "artifact_id": "helper",
+    "bom_imports": [],
+    "coordinate": "org.libs:helper:2.0",
+    "dependencies": [],
+    "dependency_management": [],
+    "group_id": "org.libs",
+    "packaging": "jar",
+    "properties": {},
+    "version": "2.0"
+  },
+  "found": true
+}

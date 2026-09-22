@@ -7,12 +7,12 @@ expression: execution.response
     {
       "depth": 1,
       "jar": {
-        "artifact_id": "demo",
+        "artifact_id": "helper",
         "class_count": 2,
-        "coordinate": "org.example:demo:2.0",
+        "coordinate": "org.libs:helper:2.0",
         "entry_count": 2,
-        "group_id": "org.example",
-        "path": "org/example/demo/2.0/demo-2.0.jar",
+        "group_id": "org.libs",
+        "path": "org/libs/helper/2.0/helper-2.0.jar",
         "version": "2.0"
       },
       "path": [
@@ -25,20 +25,20 @@ expression: execution.response
     {
       "depth": 1,
       "jar": {
-        "artifact_id": "demo",
+        "artifact_id": "helper",
         "class_count": 2,
-        "coordinate": "org.example:demo:2.0",
+        "coordinate": "org.libs:helper:2.0",
         "entry_count": 2,
-        "group_id": "org.example",
-        "path": "org/example/demo/2.0/demo-2.0.jar",
+        "group_id": "org.libs",
+        "path": "org/libs/helper/2.0/helper-2.0.jar",
         "version": "2.0"
       },
       "path": [
         "java.lang.Object",
-        "org.example.Inspectable"
+        "org.libs.ScopedOnly"
       ],
       "relation": "extends",
-      "type_name": "org.example.Inspectable"
+      "type_name": "org.libs.ScopedOnly"
     }
   ]
 }

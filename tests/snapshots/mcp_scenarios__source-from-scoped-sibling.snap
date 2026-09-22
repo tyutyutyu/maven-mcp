@@ -7,15 +7,15 @@ expression: execution.response
     {
       "class_name": "org.example.Foo",
       "entry": "org/example/Foo.java",
-      "source": "package org.example; public class Foo { int version = 2; }",
+      "source": "package org.example; public class Foo { int scoped = 2; }",
       "source_jar": {
-        "artifact_id": "demo",
+        "artifact_id": "helper",
         "class_count": 0,
         "classifier": "sources",
-        "coordinate": "org.example:demo:2.0:sources",
+        "coordinate": "org.libs:helper:2.0:sources",
         "entry_count": 1,
-        "group_id": "org.example",
-        "path": "org/example/demo/2.0/demo-2.0-sources.jar",
+        "group_id": "org.libs",
+        "path": "org/libs/helper/2.0/helper-2.0-sources.jar",
         "version": "2.0"
       },
       "truncated": false

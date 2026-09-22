@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ffi::OsString,
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -22,7 +22,9 @@ use tokio::{
 };
 use walkdir::WalkDir;
 
-use crate::config::ProjectExecutionConfig;
+use crate::config::{JavaEnvironment, MavenExecutionConfig, ProjectExecutionConfig};
+
+const JENV_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MavenModule {
@@ -127,6 +129,9 @@ pub struct ReactorModuleResult {
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MavenBuildResult {
     pub outcome: MavenBuildOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Server-policy guidance when Maven could not complete the build")]
+    pub policy_notice: Option<String>,
     pub compiler_diagnostics: Vec<CompilerDiagnostic>,
     pub reactor_summary: Vec<ReactorModuleResult>,
     pub run: MavenRunResult,
@@ -371,6 +376,14 @@ pub struct MavenClasspathResult {
     pub build: MavenBuildResult,
 }
 
+#[derive(Debug, Clone)]
+pub struct MavenClasspathPaths {
+    pub artifacts: Vec<String>,
+    pub paths: Vec<PathBuf>,
+    pub incomplete: bool,
+    pub build: MavenBuildResult,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq)]
 pub struct CoverageCounter {
     pub missed: u64,
@@ -446,6 +459,7 @@ impl MavenBuildResult {
     pub fn from_run(run: MavenRunResult) -> Self {
         let combined = format!("{}\n{}", run.stdout, run.stderr);
         let lowercase = combined.to_lowercase();
+        let policy_notice = offline_resolution_policy_notice(&run.status, &lowercase);
         let outcome = match run.status {
             MavenRunStatus::Success => MavenBuildOutcome::Success,
             MavenRunStatus::Timeout => MavenBuildOutcome::Timeout,
@@ -480,11 +494,24 @@ impl MavenBuildResult {
         let reactor_summary = parse_reactor_summary(&combined);
         Self {
             outcome,
+            policy_notice,
             compiler_diagnostics,
             reactor_summary,
             run,
         }
     }
+}
+
+fn offline_resolution_policy_notice(
+    status: &MavenRunStatus,
+    lowercase_output: &str,
+) -> Option<String> {
+    const NOTICE: &str = "Maven could not resolve a remote artifact because maven-mcp is running Maven offline. This can be an intentional security policy or missing MCP server configuration and is not necessarily a project error. If remote resolution is intended for this trusted project, set MAVEN_EXECUTION_NETWORK=true in the MCP server environment and restart the server.";
+
+    matches!(status, MavenRunStatus::BuildFailure)
+        .then_some(lowercase_output)
+        .filter(|output| output.contains("cannot access") && output.contains("in offline mode"))
+        .map(|_| NOTICE.to_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +523,7 @@ pub struct MavenRunner {
     max_output_bytes: usize,
     max_results: usize,
     network_enabled: bool,
+    java_environment: JavaEnvironment,
     execution_repository: Option<PathBuf>,
     permit: Arc<Semaphore>,
     last_test_result: Arc<RwLock<Option<FocusedTestResult>>>,
@@ -503,12 +531,38 @@ pub struct MavenRunner {
 
 impl MavenRunner {
     pub fn discover(config: &ProjectExecutionConfig) -> Result<Self> {
-        let root = config
-            .project_root
-            .canonicalize()
-            .context("MAVEN_PROJECT_ROOT must be a readable directory")?;
+        let root = canonical_project_root(&config.project_root)?;
+        Self::discover_canonical(
+            root,
+            &MavenExecutionConfig {
+                trusted_project_directories: Vec::new(),
+                maven_executable: config.maven_executable.clone(),
+                execution_repository: config.execution_repository.clone(),
+                timeout: config.timeout,
+                max_output_bytes: config.max_output_bytes,
+                max_results: config.max_results,
+                network_enabled: config.network_enabled,
+                java_environment: config.java_environment.clone(),
+            },
+        )
+    }
+
+    pub fn discover_root(root: PathBuf, config: &MavenExecutionConfig) -> Result<Self> {
+        let root = canonical_project_root(&root)?;
+        Self::discover_canonical(root, config)
+    }
+
+    pub fn discover_canonical(root: PathBuf, config: &MavenExecutionConfig) -> Result<Self> {
+        Self::discover_canonical_with_permit(root, config, Arc::new(Semaphore::new(1)))
+    }
+
+    pub fn discover_canonical_with_permit(
+        root: PathBuf,
+        config: &MavenExecutionConfig,
+        permit: Arc<Semaphore>,
+    ) -> Result<Self> {
         if !root.is_dir() || !root.join("pom.xml").is_file() {
-            bail!("MAVEN_PROJECT_ROOT must contain a root pom.xml");
+            bail!("project_path must contain a root pom.xml");
         }
         let executable = select_executable(&root, config.maven_executable.as_deref())?;
         let project = discover_project(&root, matches!(executable, MavenExecutable::Wrapper(_)))?;
@@ -525,8 +579,9 @@ impl MavenRunner {
             max_output_bytes: config.max_output_bytes,
             max_results: config.max_results,
             network_enabled: config.network_enabled,
+            java_environment: config.java_environment.clone(),
             execution_repository,
-            permit: Arc::new(Semaphore::new(1)),
+            permit,
             last_test_result: Arc::new(RwLock::new(None)),
         })
     }
@@ -641,7 +696,7 @@ impl MavenRunner {
             };
             let canonical = path.canonicalize()?;
             if !canonical.starts_with(&self.root) {
-                bail!("test source escaped MAVEN_PROJECT_ROOT");
+                bail!("test source escaped project_path");
             }
             let mut class_name = relative
                 .with_extension("")
@@ -767,9 +822,10 @@ impl MavenRunner {
         if let Some(filter) = coordinate_filter {
             arguments.push(OsString::from(format!("-Dincludes={filter}")));
         }
-        let run = self.execute(arguments).await;
+        let executed = self.execute_with_raw_stdout(arguments).await;
+        let run = executed.result;
         let incomplete = run.stdout_truncated;
-        let dependencies = parse_dependency_tree(&run.stdout);
+        let dependencies = parse_dependency_tree(&executed.raw_stdout);
         DependencyTreeResult {
             dependencies,
             incomplete,
@@ -808,7 +864,8 @@ impl MavenRunner {
             arguments.push(OsString::from(format!("-Dscope={}", scope.argument())));
         }
 
-        let run = self.execute(arguments).await;
+        let executed = self.execute_with_raw_stdout(arguments).await;
+        let run = executed.result;
         let output_truncated = run.stdout_truncated;
         let build = MavenBuildResult::from_run(run);
         if build.outcome != MavenBuildOutcome::Success {
@@ -820,7 +877,7 @@ impl MavenRunner {
                 build,
             };
         }
-        let parsed = parse_dependency_resolution(&build.run.stdout, &self.project);
+        let parsed = parse_dependency_resolution(&executed.raw_stdout, &self.project);
         let mut explanations = parsed.explanations;
         if let Some(filter) = coordinate_filter {
             explanations.retain(|explanation| coordinate_matches(filter, explanation));
@@ -853,12 +910,26 @@ impl MavenRunner {
         module: Option<&str>,
         kind: ClasspathKind,
     ) -> MavenClasspathResult {
+        let result = self.build_classpath_paths(module, kind).await;
+        MavenClasspathResult {
+            artifacts: result.artifacts,
+            incomplete: result.incomplete,
+            build: result.build,
+        }
+    }
+
+    pub async fn build_classpath_paths(
+        &self,
+        module: Option<&str>,
+        kind: ClasspathKind,
+    ) -> MavenClasspathPaths {
         let started = Instant::now();
         let mut arguments = match self.base_arguments(module, false) {
             Ok(arguments) => arguments,
             Err(error) => {
-                return MavenClasspathResult {
+                return MavenClasspathPaths {
                     artifacts: Vec::new(),
+                    paths: Vec::new(),
                     incomplete: false,
                     build: MavenBuildResult::from_run(
                         self.runner_error(started, error.to_string()),
@@ -871,11 +942,14 @@ impl MavenRunner {
             ClasspathKind::Build => "-Dmdep.includeScope=compile",
             ClasspathKind::Test => "-Dmdep.includeScope=test",
         }));
-        let run = self.execute(arguments).await;
+        let executed = self.execute_with_raw_stdout(arguments).await;
+        let run = executed.result;
         let (artifacts, normalization_incomplete) = parse_classpath(&run.stdout);
-        MavenClasspathResult {
+        let (paths, path_incomplete) = parse_classpath_paths(&executed.raw_stdout);
+        MavenClasspathPaths {
             artifacts,
-            incomplete: run.stdout_truncated || normalization_incomplete,
+            paths,
+            incomplete: run.stdout_truncated || normalization_incomplete || path_incomplete,
             build: MavenBuildResult::from_run(run),
         }
     }
@@ -963,14 +1037,28 @@ impl MavenRunner {
     }
 
     async fn execute(&self, arguments: Vec<OsString>) -> MavenRunResult {
+        self.execute_with_raw_stdout(arguments).await.result
+    }
+
+    async fn execute_with_raw_stdout(&self, arguments: Vec<OsString>) -> ExecutedMaven {
         let started = Instant::now();
         let _permit = match self.permit.acquire().await {
             Ok(permit) => permit,
-            Err(error) => return self.runner_error(started, error.to_string()),
+            Err(error) => {
+                return ExecutedMaven {
+                    result: self.runner_error(started, error.to_string()),
+                    raw_stdout: String::new(),
+                };
+            }
         };
         let executable = match self.validated_executable() {
             Ok(executable) => executable,
-            Err(error) => return self.runner_error(started, error.to_string()),
+            Err(error) => {
+                return ExecutedMaven {
+                    result: self.runner_error(started, error.to_string()),
+                    raw_stdout: String::new(),
+                };
+            }
         };
 
         let mut command = Command::new(executable);
@@ -981,11 +1069,20 @@ impl MavenRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Err(error) = self.configure_java_environment(&mut command).await {
+            return ExecutedMaven {
+                result: self.runner_error(started, error.to_string()),
+                raw_stdout: String::new(),
+            };
+        }
         command.as_std_mut().process_group(0);
         let mut child = match spawn_maven(&mut command).await {
             Ok(child) => child,
             Err(error) => {
-                return self.runner_error(started, format!("cannot start Maven: {error}"));
+                return ExecutedMaven {
+                    result: self.runner_error(started, format!("cannot start Maven: {error}")),
+                    raw_stdout: String::new(),
+                };
             }
         };
         let process_id = child.id();
@@ -1004,7 +1101,10 @@ impl MavenRunner {
             Ok(Err(error)) => {
                 let _ = terminate_process_group(process_id);
                 let _ = child.wait().await;
-                return self.runner_error(started, format!("cannot wait for Maven: {error}"));
+                return ExecutedMaven {
+                    result: self.runner_error(started, format!("cannot wait for Maven: {error}")),
+                    raw_stdout: String::new(),
+                };
             }
             Err(_) => {
                 let _ = terminate_process_group(process_id);
@@ -1023,18 +1123,27 @@ impl MavenRunner {
             .ok()
             .and_then(Result::ok)
             .unwrap_or_default();
-        let (stdout_text, stdout_redactions) = self.redact(&stdout.bytes);
-        let (stderr_text, stderr_redactions) = self.redact(&stderr.bytes);
-        MavenRunResult {
-            status,
-            exit_code,
-            duration_ms: elapsed_ms(started),
-            timed_out,
-            stdout: stdout_text,
-            stderr: stderr_text,
-            stdout_truncated: stdout.truncated,
-            stderr_truncated: stderr.truncated,
-            redaction_count: stdout_redactions + stderr_redactions,
+        let failed = !matches!(&status, MavenRunStatus::Success);
+        let stdout_truncated = stdout.truncated;
+        let stderr_truncated = stderr.truncated;
+        let raw_stdout = String::from_utf8_lossy(&stdout.bytes).into_owned();
+        let stdout = stdout.into_bytes(failed);
+        let stderr = stderr.into_bytes(failed);
+        let (stdout_text, stdout_redactions) = self.redact(&stdout);
+        let (stderr_text, stderr_redactions) = self.redact(&stderr);
+        ExecutedMaven {
+            result: MavenRunResult {
+                status,
+                exit_code,
+                duration_ms: elapsed_ms(started),
+                timed_out,
+                stdout: stdout_text,
+                stderr: stderr_text,
+                stdout_truncated,
+                stderr_truncated,
+                redaction_count: stdout_redactions + stderr_redactions,
+            },
+            raw_stdout,
         }
     }
 
@@ -1138,6 +1247,21 @@ impl MavenRunner {
         Ok(self.executable.path())
     }
 
+    async fn configure_java_environment(&self, command: &mut Command) -> Result<()> {
+        let JavaEnvironment::Jenv { root } = &self.java_environment else {
+            return Ok(());
+        };
+        let java_home = resolve_jenv_java_home(root, &self.root).await?;
+        let java_bin = java_home.join("bin");
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(java_bin).chain(std::env::split_paths(&inherited_path)),
+        )
+        .context("cannot construct PATH for jenv-selected Java")?;
+        command.env("JAVA_HOME", java_home).env("PATH", path);
+        Ok(())
+    }
+
     fn redact(&self, bytes: &[u8]) -> (String, usize) {
         let mut output = String::from_utf8_lossy(bytes).into_owned();
         let mut count = 0;
@@ -1170,6 +1294,74 @@ impl MavenRunner {
             redaction_count,
         }
     }
+}
+
+async fn resolve_jenv_java_home(jenv_root: &Path, project_root: &Path) -> Result<PathBuf> {
+    let executable = jenv_root.join("bin/jenv");
+    let executable = executable
+        .canonicalize()
+        .context("configured jenv executable is missing or unreadable")?;
+    if !is_executable(&executable)? {
+        bail!("configured jenv executable is not executable");
+    }
+
+    let mut command = Command::new(executable);
+    command
+        .arg("prefix")
+        .current_dir(project_root)
+        .env("JENV_ROOT", jenv_root)
+        .env_remove("JENV_DIR")
+        .env_remove("JENV_VERSION")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(JENV_RESOLUTION_TIMEOUT, command.output())
+        .await
+        .context("jenv Java resolution timed out")?
+        .context("cannot run configured jenv executable")?;
+    if !output.status.success() {
+        bail!(
+            "jenv could not resolve Java for project_path; verify .java-version and installed jenv versions"
+        );
+    }
+    let prefix = std::str::from_utf8(&output.stdout)
+        .context("jenv returned a non-UTF-8 Java home")?
+        .trim();
+    if prefix.is_empty() || prefix.lines().count() != 1 {
+        bail!("jenv returned an invalid Java home");
+    }
+    let java_home = PathBuf::from(prefix);
+    if !java_home.is_absolute() {
+        bail!("jenv returned a non-absolute Java home");
+    }
+    let java_home = java_home
+        .canonicalize()
+        .context("jenv-selected Java home is missing or unreadable")?;
+    let java = java_home.join("bin/java");
+    if !java_home.is_dir() || !java.is_file() || !is_executable(&java)? {
+        bail!("jenv-selected Java home does not contain executable bin/java");
+    }
+    Ok(java_home)
+}
+
+struct ExecutedMaven {
+    result: MavenRunResult,
+    raw_stdout: String,
+}
+
+pub fn canonical_project_root(project_path: &Path) -> Result<PathBuf> {
+    if !project_path.is_absolute() {
+        bail!("project_path must be an absolute path");
+    }
+    let root = project_path
+        .canonicalize()
+        .context("project_path must be a readable directory")?;
+    if !root.is_dir() {
+        bail!("project_path must be a directory");
+    }
+    if !root.join("pom.xml").is_file() {
+        bail!("project_path must contain a pom.xml");
+    }
+    Ok(root)
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1211,7 +1403,7 @@ fn discover_module(
 ) -> Result<()> {
     let directory = directory.canonicalize()?;
     if !directory.starts_with(root) {
-        bail!("module path escapes MAVEN_PROJECT_ROOT");
+        bail!("module path escapes project_path");
     }
     if !visited.insert(directory.clone()) {
         return Ok(());
@@ -1241,7 +1433,7 @@ fn discover_module(
             .canonicalize()
             .with_context(|| format!("module {child_selector} is not a readable directory"))?;
         if !child.starts_with(root) {
-            bail!("module path escapes MAVEN_PROJECT_ROOT");
+            bail!("module path escapes project_path");
         }
         discover_module(root, &child, &child_selector, discovered, visited)?;
     }
@@ -1255,7 +1447,7 @@ fn normalize_module_selector(parent: &str, module: &str) -> Result<String> {
             .components()
             .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        bail!("module selector must remain inside MAVEN_PROJECT_ROOT");
+        bail!("module selector must remain inside project_path");
     }
     let normalized = if parent == "." {
         module.to_owned()
@@ -1304,7 +1496,18 @@ fn canonicalize_directory(path: &Path, name: &str) -> Result<PathBuf> {
 #[derive(Default)]
 struct BoundedOutput {
     bytes: Vec<u8>,
+    tail: VecDeque<u8>,
     truncated: bool,
+}
+
+impl BoundedOutput {
+    fn into_bytes(self, prefer_tail: bool) -> Vec<u8> {
+        if prefer_tail && self.truncated {
+            self.tail.into_iter().collect()
+        } else {
+            self.bytes
+        }
+    }
 }
 
 async fn read_bounded<R>(reader: Option<R>, limit: usize) -> Result<BoundedOutput>
@@ -1316,6 +1519,7 @@ where
     };
     let mut output = BoundedOutput {
         bytes: Vec::with_capacity(limit),
+        tail: VecDeque::with_capacity(limit),
         truncated: false,
     };
     let mut buffer = [0_u8; 8192];
@@ -1323,6 +1527,16 @@ where
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
+        }
+        if read >= limit {
+            output.tail.clear();
+            output
+                .tail
+                .extend(buffer[read - limit..read].iter().copied());
+        } else {
+            let excess = (output.tail.len() + read).saturating_sub(limit);
+            output.tail.drain(..excess);
+            output.tail.extend(buffer[..read].iter().copied());
         }
         let remaining = limit.saturating_sub(output.bytes.len());
         output
@@ -1514,7 +1728,7 @@ fn discover_report_files(root: &Path) -> Result<Vec<PathBuf>> {
         }
         let canonical = path.canonicalize()?;
         if !canonical.starts_with(root) {
-            bail!("Surefire report escaped MAVEN_PROJECT_ROOT");
+            bail!("Surefire report escaped project_path");
         }
         reports.push(canonical);
     }
@@ -2184,17 +2398,10 @@ fn parse_dependency_tree(output: &str) -> Vec<DependencyNode> {
 }
 
 fn parse_classpath(output: &str) -> (Vec<String>, bool) {
-    let classpath = output
-        .lines()
-        .skip_while(|line| !line.contains("Dependencies classpath:"))
-        .nth(1)
-        .map(str::trim);
-    let Some(classpath) = classpath else {
-        return (Vec::new(), true);
-    };
-    let mut incomplete = false;
-    let mut artifacts = classpath
-        .split(':')
+    let (classpath_lines, mut incomplete) = classpath_lines(output);
+    let mut artifacts = classpath_lines
+        .into_iter()
+        .flat_map(|classpath| classpath.split(':'))
         .filter(|item| !item.is_empty())
         .filter_map(|item| match coordinate_from_repository_path(item) {
             Some(coordinate) => Some(coordinate),
@@ -2207,6 +2414,45 @@ fn parse_classpath(output: &str) -> (Vec<String>, bool) {
     artifacts.sort();
     artifacts.dedup();
     (artifacts, incomplete)
+}
+
+fn parse_classpath_paths(output: &str) -> (Vec<PathBuf>, bool) {
+    let (classpath_lines, mut incomplete) = classpath_lines(output);
+    let mut paths = classpath_lines
+        .into_iter()
+        .flat_map(|classpath| classpath.split(':'))
+        .filter(|item| !item.is_empty())
+        .filter_map(|item| {
+            let path = PathBuf::from(item);
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                incomplete = true;
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    (paths, incomplete)
+}
+
+fn classpath_lines(output: &str) -> (Vec<&str>, bool) {
+    let mut lines = output.lines();
+    let mut classpaths = Vec::new();
+    let mut found_marker = false;
+    let mut incomplete = false;
+    while let Some(line) = lines.next() {
+        if !line.contains("Dependencies classpath:") {
+            continue;
+        }
+        found_marker = true;
+        match lines.next() {
+            Some(classpath) => classpaths.push(classpath.trim()),
+            None => incomplete = true,
+        }
+    }
+    (classpaths, incomplete || !found_marker)
 }
 
 fn coordinate_from_repository_path(path: &str) -> Option<String> {
@@ -2295,7 +2541,7 @@ fn discover_jacoco_reports(root: &Path) -> Result<Vec<PathBuf>> {
         }
         let canonical = path.canonicalize()?;
         if !canonical.starts_with(root) {
-            bail!("JaCoCo report escaped MAVEN_PROJECT_ROOT");
+            bail!("JaCoCo report escaped project_path");
         }
         reports.push(canonical);
     }
@@ -2535,6 +2781,7 @@ mod tests {
             max_output_bytes: 4096,
             max_results: 100,
             network_enabled: false,
+            java_environment: JavaEnvironment::Inherit,
         };
         (root, config)
     }
@@ -2577,6 +2824,7 @@ mod tests {
             max_output_bytes: 1024,
             max_results: 100,
             network_enabled: false,
+            java_environment: JavaEnvironment::Inherit,
         };
 
         let runner = MavenRunner::discover(&config).unwrap();
@@ -2606,6 +2854,7 @@ mod tests {
             max_output_bytes: 1024,
             max_results: 100,
             network_enabled: false,
+            java_environment: JavaEnvironment::Inherit,
         };
 
         assert!(MavenRunner::discover(&config).is_err());
@@ -2650,6 +2899,120 @@ mod tests {
                 .contains(root.path().to_string_lossy().as_ref())
         );
         assert!(result.redaction_count >= 3);
+    }
+
+    #[tokio::test]
+    async fn applies_jenv_selected_java_only_to_the_maven_child() {
+        let jenv_root = TempDir::new().unwrap();
+        let java_home = jenv_root.path().join("jdks/selected");
+        write_executable(&java_home.join("bin/java"), "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &jenv_root.path().join("bin/jenv"),
+            "#!/bin/sh\nversion=$(sed -n '1p' .java-version)\nprintf '%s\\n' \"$JENV_ROOT/jdks/$version\"\n",
+        );
+        let wrapper = format!(
+            "#!/bin/sh\n[ \"$JAVA_HOME\" = '{}' ] || exit 8\ncase \"$PATH\" in \"$JAVA_HOME/bin:\"*) exit 0 ;; *) exit 9 ;; esac\n",
+            java_home.display()
+        );
+        let (project, mut config) = wrapper_project(&wrapper);
+        fs::write(project.path().join(".java-version"), "selected\n").unwrap();
+        config.java_environment = JavaEnvironment::Jenv {
+            root: jenv_root.path().to_owned(),
+        };
+
+        let result = MavenRunner::discover(&config)
+            .unwrap()
+            .run(&MavenInvocation {
+                phase: LifecyclePhase::Compile,
+                module: None,
+                also_make: false,
+            })
+            .await;
+
+        assert_eq!(result.status, MavenRunStatus::Success, "{result:#?}");
+    }
+
+    #[tokio::test]
+    async fn reports_jenv_resolution_failure_without_starting_maven() {
+        let jenv_root = TempDir::new().unwrap();
+        write_executable(&jenv_root.path().join("bin/jenv"), "#!/bin/sh\nexit 1\n");
+        let marker = jenv_root.path().join("maven-started");
+        let wrapper = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        let (project, mut config) = wrapper_project(&wrapper);
+        fs::write(project.path().join(".java-version"), "missing\n").unwrap();
+        config.java_environment = JavaEnvironment::Jenv {
+            root: jenv_root.path().to_owned(),
+        };
+
+        let result = MavenRunner::discover(&config)
+            .unwrap()
+            .run(&MavenInvocation {
+                phase: LifecyclePhase::Compile,
+                module: None,
+                also_make: false,
+            })
+            .await;
+
+        assert_eq!(result.status, MavenRunStatus::RunnerError);
+        assert!(result.stderr.contains("verify .java-version"));
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn reports_missing_jenv_without_starting_maven() {
+        let jenv_root = TempDir::new().unwrap();
+        let marker = jenv_root.path().join("maven-started");
+        let wrapper = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        let (_project, mut config) = wrapper_project(&wrapper);
+        config.java_environment = JavaEnvironment::Jenv {
+            root: jenv_root.path().to_owned(),
+        };
+
+        let result = MavenRunner::discover(&config)
+            .unwrap()
+            .run(&MavenInvocation {
+                phase: LifecyclePhase::Compile,
+                module: None,
+                also_make: false,
+            })
+            .await;
+
+        assert_eq!(result.status, MavenRunStatus::RunnerError);
+        assert!(result.stderr.contains("jenv executable is missing"));
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_jenv_home_without_executable_java() {
+        let jenv_root = TempDir::new().unwrap();
+        let invalid_java_home = jenv_root.path().join("invalid-java");
+        fs::create_dir(&invalid_java_home).unwrap();
+        write_executable(
+            &jenv_root.path().join("bin/jenv"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                invalid_java_home.display()
+            ),
+        );
+        let marker = jenv_root.path().join("maven-started");
+        let wrapper = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        let (_project, mut config) = wrapper_project(&wrapper);
+        config.java_environment = JavaEnvironment::Jenv {
+            root: jenv_root.path().to_owned(),
+        };
+
+        let result = MavenRunner::discover(&config)
+            .unwrap()
+            .run(&MavenInvocation {
+                phase: LifecyclePhase::Compile,
+                module: None,
+                also_make: false,
+            })
+            .await;
+
+        assert_eq!(result.status, MavenRunStatus::RunnerError);
+        assert!(result.stderr.contains("executable bin/java"));
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
@@ -2703,6 +3066,8 @@ mod tests {
         assert_eq!(limited.exit_code, Some(1));
         assert_eq!(limited.stdout.len(), 8);
         assert_eq!(limited.stderr.len(), 8);
+        assert_eq!(limited.stdout, "stuvwxyz");
+        assert_eq!(limited.stderr, "STUVWXYZ");
         assert!(limited.stdout_truncated);
         assert!(limited.stderr_truncated);
     }
@@ -2739,6 +3104,54 @@ mod tests {
                 .await,
         );
         assert_eq!(verify.outcome, MavenBuildOutcome::TestFailure);
+    }
+
+    #[test]
+    fn explains_offline_artifact_resolution_without_misclassifying_other_runs() {
+        let offline_failure = MavenBuildResult::from_run(MavenRunResult {
+            status: MavenRunStatus::BuildFailure,
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            stdout: "[ERROR] Cannot access central in offline mode and the artifact org.example:demo:jar:1.0 has not been downloaded from it before."
+                .to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            redaction_count: 0,
+        });
+        let notice = offline_failure
+            .policy_notice
+            .expect("offline repository resolution should explain the server policy");
+        assert!(notice.contains("MAVEN_EXECUTION_NETWORK=true"));
+        assert!(notice.contains("intentional security policy"));
+        assert!(notice.contains("not necessarily a project error"));
+
+        let unrelated_failure = MavenBuildResult::from_run(MavenRunResult {
+            status: MavenRunStatus::BuildFailure,
+            exit_code: Some(1),
+            duration_ms: 1,
+            timed_out: false,
+            stdout: "[ERROR] Failed to execute goal: invalid configuration".to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            redaction_count: 0,
+        });
+        assert_eq!(unrelated_failure.policy_notice, None);
+
+        let successful_run = MavenBuildResult::from_run(MavenRunResult {
+            status: MavenRunStatus::Success,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            stdout: "Cannot access central in offline mode".to_owned(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            redaction_count: 0,
+        });
+        assert_eq!(successful_run.policy_notice, None);
     }
 
     #[tokio::test]
@@ -2897,7 +3310,7 @@ mod tests {
 
         let repository = config.execution_repository.as_ref().unwrap();
         let classpath_script = format!(
-            "#!/bin/sh\nprintf 'Dependencies classpath:\\n{}/org/libs/first/2.0/first-2.0.jar:{}/org/libs/native/3.0/native-3.0-linux.jar\\n'\n",
+            "#!/bin/sh\nprintf 'Dependencies classpath:\\n\\nDependencies classpath:\\n{}/org/libs/first/2.0/first-2.0.jar:{}/org/libs/native/3.0/native-3.0-linux.jar\\nDependencies classpath:\\n\\n'\n",
             repository.display(),
             repository.display()
         );

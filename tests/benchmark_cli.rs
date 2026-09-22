@@ -6,7 +6,8 @@ use support::TestServer;
 
 #[tokio::test]
 async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Result<()> {
-    let server = TestServer::start().await?;
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
     let directory = tempfile::tempdir()?;
     let spec_path = directory.path().join("benchmark.json");
     let output_path = directory.path().join("results.json");
@@ -18,11 +19,11 @@ async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Re
             "cases": [
                 {
                     "id": "class-search",
-                    "description": "Find an indexed class",
+                    "description": "Inspect a request-scoped Maven project",
                     "shell": { "command": "printf fixture-benchmark" },
                     "mcp": {
-                        "tool": "search_classes",
-                        "arguments": { "query": "Foo" }
+                        "tool": "inspect_maven_project",
+                        "arguments": { "project_path": project_path }
                     }
                 },
                 {
@@ -45,7 +46,10 @@ async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Re
         .arg("2")
         .arg("--warmup")
         .arg("1")
-        .env("MAVEN_REPO_PATH", server.repository_path())
+        .env(
+            "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+            server.trusted_project_directory().unwrap(),
+        )
         .output()
         .await?;
     assert!(
