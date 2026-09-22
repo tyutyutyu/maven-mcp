@@ -35,27 +35,10 @@ tasks:
     preconditions:
       - sh: command -v cargo
         msg: cargo is required
-      - sh: command -v npx
-        msg: npx is required for MCP conformance
-      - sh: command -v curl
-        msg: curl is required for MCP conformance
       - sh: test -x scripts/test-pyramid.sh
         msg: scripts/test-pyramid.sh must be executable
     cmds:
       - scripts/test-pyramid.sh
-
-  conformance:
-    preconditions:
-      - sh: command -v cargo
-        msg: cargo is required
-      - sh: command -v npx
-        msg: npx is required for MCP conformance
-      - sh: command -v curl
-        msg: curl is required for MCP conformance
-      - sh: test -x scripts/run-conformance.sh
-        msg: scripts/run-conformance.sh must be executable
-    cmds:
-      - scripts/run-conformance.sh {{.CLI_ARGS}}
 
   inspector:
     preconditions:
@@ -63,8 +46,6 @@ tasks:
         msg: cargo is required
       - sh: command -v npx
         msg: npx is required for MCP Inspector
-      - sh: command -v curl
-        msg: curl is required for MCP Inspector
       - sh: test -x scripts/run-inspector.sh
         msg: scripts/run-inspector.sh must be executable
     cmds:
@@ -78,8 +59,6 @@ tasks:
         msg: cargo is required
       - sh: command -v npx
         msg: npx is required for Promptfoo
-      - sh: command -v curl
-        msg: curl is required for the fixture MCP server
       - sh: test -x scripts/run-agent-eval.sh
         msg: scripts/run-agent-eval.sh must be executable
     cmds:

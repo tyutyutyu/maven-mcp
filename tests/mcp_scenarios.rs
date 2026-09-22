@@ -3,7 +3,7 @@ mod support;
 use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use rmcp::{ServiceExt, model::CallToolRequestParams, transport::StreamableHttpClientTransport};
+use rmcp::model::CallToolRequestParams;
 use serde::Deserialize;
 use serde_json::Value;
 use support::TestServer;
@@ -44,12 +44,13 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     ensure!(!catalog.scenarios.is_empty(), "scenario catalog is empty");
     ensure_unique_ids(&catalog.scenarios)?;
 
-    let server = TestServer::start().await?;
-    let client = ()
-        .serve(StreamableHttpClientTransport::from_uri(
-            server.endpoint().to_owned(),
-        ))
-        .await?;
+    let server = TestServer::start_with_project().await?;
+    let project_path = server
+        .project_path()
+        .context("scenario fixture must include a Maven project")?
+        .display()
+        .to_string();
+    let client = server.connect().await?;
     let mut executions = Vec::with_capacity(catalog.scenarios.len());
 
     for scenario in catalog.scenarios {
@@ -58,6 +59,11 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
             .as_object()
             .with_context(|| format!("scenario '{}' arguments must be an object", scenario.id))?
             .clone();
+        let mut arguments = arguments;
+        arguments.insert(
+            "project_path".to_owned(),
+            Value::String(project_path.clone()),
+        );
         let result = client
             .call_tool(CallToolRequestParams::new(scenario.tool.clone()).with_arguments(arguments))
             .await
@@ -80,7 +86,6 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     }
 
     client.cancel().await?;
-    server.stop().await?;
     write_markdown_report(&executions)?;
 
     let semantic_failures = executions
@@ -204,7 +209,7 @@ fn write_markdown_report(executions: &[Execution]) -> Result<()> {
     fs::create_dir_all(&report_dir)?;
     let mut report = String::from(
         "# Maven MCP keresési riport\n\n\
-         A riport a `tests/scenarios/maven_search.yaml` scenario-k valódi Streamable HTTP MCP-hívásaiból készült.\n\n",
+         A riport a `tests/scenarios/maven_search.yaml` scenario-k valódi child-process STDIO MCP-hívásaiból készült.\n\n",
     );
     let passed = executions
         .iter()

@@ -8,7 +8,7 @@ tasks:
     vars:
       SPEC: '{{.SPEC | default "benchmark.json"}}'
       OUTPUT: '{{.OUTPUT | default "target/benchmark-results.json"}}'
-      MCP_URL: '{{.MCP_URL | default "http://127.0.0.1:8080/mcp"}}'
+      MCP_COMMAND: '{{.MCP_COMMAND | default "target/debug/maven-mcp"}}'
       ITERATIONS: '{{.ITERATIONS | default "5"}}'
       WARMUP: '{{.WARMUP | default "1"}}'
       TIMEOUT_SECONDS: '{{.TIMEOUT_SECONDS | default "300"}}'
@@ -19,10 +19,11 @@ tasks:
       - sh: test -f "{{.SPEC}}"
         msg: SPEC must point to an existing benchmark JSON file
     cmds:
+      - cargo build --locked --quiet --bin maven-mcp
       - >-
         cargo run --locked --bin maven-benchmark --
         --spec "{{.SPEC}}"
-        --mcp-url "{{.MCP_URL}}"
+        --mcp-command "{{.MCP_COMMAND}}"
         --output "{{.OUTPUT}}"
         --iterations "{{.ITERATIONS}}"
         --warmup "{{.WARMUP}}"

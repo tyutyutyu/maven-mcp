@@ -13,9 +13,9 @@ struct Cli {
     /// JSON benchmark specification containing paired shell and MCP cases.
     #[arg(long)]
     spec: PathBuf,
-    /// Streamable HTTP endpoint of a running Maven MCP server.
-    #[arg(long, default_value = "http://127.0.0.1:8080/mcp")]
-    mcp_url: String,
+    /// Maven MCP executable to start as a child-process STDIO server.
+    #[arg(long, default_value = "maven-mcp")]
+    mcp_command: PathBuf,
     /// JSON report destination.
     #[arg(long)]
     output: PathBuf,
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let report = run_benchmark(
         spec,
         &BenchmarkOptions {
-            mcp_url: cli.mcp_url,
+            mcp_command: cli.mcp_command,
             iterations: cli.iterations,
             warmup: cli.warmup,
             timeout: Duration::from_secs(cli.timeout_seconds),

@@ -3,8 +3,7 @@ source: tests/mcp_scenarios.rs
 expression: execution.response
 ---
 {
-  "org.example:demo": [
-    "1.0",
+  "org.libs:helper": [
     "2.0"
   ]
 }

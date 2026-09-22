@@ -2,50 +2,49 @@
 
 ## Project Overview
 
-`maven-mcp` is a Docker-ready MCP server written in Rust 2024. At startup, it
-reads the local Maven repository under `MAVEN_REPO_PATH`, builds an in-memory
-index of JARs, classes, sources, and artifact versions, and exposes them through
-searchable Streamable HTTP MCP tools.
+`maven-mcp` is a native STDIO MCP server written in Rust 2024. The MCP host owns
+the child-process lifecycle. Startup must not scan a local Maven repository or
+bind the process to one project; repository- or project-dependent tool requests
+must carry an explicit absolute `project_path`.
 
-The primary user documentation is `README.md`, the testing strategy is in
-`docs/testing.md`, and architectural decisions are recorded under
-`docs/decisions/`. This file is the source of agent-specific development rules.
+The primary user documentation is `README.md`. This file is the source of
+agent-specific development rules.
 
 ## Technology and Prerequisites
 
 - Rust `1.89` or later, using the 2024 edition.
 - Cargo; always use the versioned `Cargo.lock` file and the `--locked` flag for
   reproducible commands.
-- The full conformance layer requires `node`, `npx`, and `curl`.
-- Container validation requires Docker, and Compose workflows require Docker
-  Compose.
+- Inspector and agent evaluation require `node` and `npx`.
 - The project has no database and no separate build-time code generation step.
 
 ## Repository Map
 
-- `src/config.rs`: environment configuration and validation.
+- `src/config.rs`: environment configuration and request-independent limits.
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
   index, and all search operations.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
-- `src/main.rs`: startup indexing, the Axum router, `/mcp`, `/healthz`, shutdown,
-  and the container-internal health check.
+- `src/main.rs`: STDIO transport, EOF, SIGINT, and SIGTERM
+  lifecycle.
 - `tests/support/mod.rs`: deterministic temporary Maven fixture repository and a
-  real Streamable HTTP test server bound to a random port.
+  real child-process STDIO test server.
 - `tests/mcp_interface.rs`: integration contract for the public MCP tool catalog
   and error semantics.
 - `tests/scenarios/maven_search.yaml`: human-readable search examples.
 - `tests/mcp_scenarios.rs`: scenario interpretation, semantic validation,
   snapshots, and Markdown report generation.
 - `tests/snapshots/`: reviewable public MCP response contracts.
-- `scripts/`: full verification, MCP conformance, and Inspector entry points.
+- `scripts/`: full verification, Inspector, and agent-evaluation entry points.
 
 ## Important Architectural Contracts
 
-- The complete repository index must be built before the MCP endpoint becomes
-  available. Do not expose a partially built index or turn it into background-
-  mutable state without a separately approved architectural decision.
-- The completed `MavenIndex` is shared through `Arc`. Queries must remain
-  read-only operations.
+- Do not build a complete local repository index at startup. Project-scoped
+  repository indexes are created from explicit request context only.
+- Request project identity is explicit: every repository- or project-dependent
+  MCP request requires an absolute `project_path`, which must canonicalize to a
+  directory containing `pom.xml`.
+- Multiple project contexts may be interleaved in one STDIO process. Cache,
+  runner, and last-test state must be keyed by canonical project root.
 - Maven coordinates use the format
   `groupId:artifactId:version[:classifier]`.
 - Treat `-sources.jar` artifacts as source archives, not binary class JARs.
@@ -64,23 +63,45 @@ The primary user documentation is `README.md`, the testing strategy is in
 
 ## Configuration and Local Execution
 
-`MAVEN_REPO_PATH` is required and must point to an existing directory. Other
-variables are:
+No startup project or repository path is required. Variables and the optional
+Java-selection flag are:
 
-- `BIND_ADDRESS`, default: `0.0.0.0:8080`.
 - `MAX_RESULTS`, default: `100`; must be a positive integer.
 - `MAX_SOURCE_BYTES`, default: `1048576`; must be a positive integer.
+- `MAX_PROJECT_INDEXES`, default: `4`; must be a positive integer.
+- `MAVEN_TRUSTED_PROJECT_DIRECTORIES`, optional platform path-list of existing
+  absolute directory trees. Maven-backed project operations are disabled when
+  unset; a canonical `project_path` must be equal to or below one configured
+  directory.
+- `MAVEN_MCP_RUNTIME_DIR`, optional user-private directory for `maven-mcp stats`
+  runtime status files.
+- `--jenv`, optional STDIO-server flag that resolves Java per canonical request
+  project through `JENV_ROOT/bin/jenv`; `JENV_ROOT` defaults to `$HOME/.jenv` and
+  must be absolute when set explicitly.
 - `RUST_LOG`, recommended default: `maven_mcp=info`.
 
 Run locally:
 
 ```bash
-MAVEN_REPO_PATH="$HOME/.m2/repository" cargo run --locked
+cargo run --locked
 ```
 
-The MCP endpoint is `http://localhost:8080/mcp`, and the liveness endpoint is
-`http://localhost:8080/healthz`. The index is rebuilt only at startup; restart
-the server after changing a fixture or repository.
+The binary speaks MCP JSON-RPC on stdout and writes diagnostics to stderr. There
+is no port or health endpoint. The process becomes ready without a Maven scan;
+requests select trusted Maven projects through `project_path`.
+
+When `--jenv` is enabled, resolve Java before every Maven child from that
+request's canonical project root. Ignore inherited `JENV_VERSION` and `JENV_DIR`,
+validate the absolute selected home and executable `bin/java`, and modify
+`JAVA_HOME`/`PATH` only on the Maven child. When disabled, preserve inherited
+Java environment behavior.
+
+Inspect live host-managed instances without starting MCP transport:
+
+```bash
+cargo run --locked -- stats
+cargo run --locked -- stats --json
+```
 
 ## Development Rules
 
@@ -121,10 +142,10 @@ following together:
 4. At least one relevant YAML scenario when the behavior can be expressed as a
    user-facing search example.
 5. Snapshots, but only after manually reviewing the diff.
-6. The tool list in `README.md` and, when necessary, `docs/testing.md`.
+6. The tool list and relevant usage guidance in `README.md`.
 
-A change to a public response shape is an API change. Document it, and add or
-update an ADR when the decision has lasting architectural consequences.
+A change to a public response shape is an API change. Document it in
+`README.md`.
 
 ## Testing
 
@@ -142,18 +163,17 @@ The complete pre-handoff verification gate is:
 scripts/test-pyramid.sh
 ```
 
-It runs formatting, warning-as-error Clippy, every Cargo test target, and the
-pinned MCP conformance scenarios applicable to the production capabilities.
-The npm-based steps may require network access on their first run.
+It runs formatting, warning-as-error Clippy, and every Cargo test target. The
+integration, lifecycle, scenario, and snapshot targets all start the production
+binary through a real child-process STDIO MCP client.
 
 Test modification rules:
 
 - Cover algorithmic edge cases in the unit tests in `src/index.rs`.
-- Always validate the public protocol through a real Streamable HTTP MCP client;
-  do not rely only on direct Rust method calls.
-- Integration tests must use a temporary fixture repository and
-  `127.0.0.1:0`. They must not depend on the developer's `~/.m2` contents or a
-  fixed port.
+- Always validate the public protocol through a real child-process STDIO MCP
+  client; do not rely only on direct Rust method calls.
+- Integration tests must use a temporary fixture repository. They must not
+  depend on the developer's `~/.m2` contents or a network port.
 - YAML scenario `id` values must be unique and stable because they also become
   snapshot names.
 - Scenario expectations must target public results through `result_count`,
@@ -171,41 +191,32 @@ scripts/run-inspector.sh
 scripts/run-inspector.sh --cli --method tools/list
 ```
 
-## Docker and Runtime Security
+## Native Runtime Security
 
-Build and start with Compose:
-
-```bash
-docker build -t maven-mcp .
-MAVEN_REPO_PATH="$HOME/.m2/repository" docker compose up --build
-```
-
-Docker runtime invariants:
-
-- multi-stage release build;
-- numeric non-root user `10001:10001`;
-- read-only bind mount for the Maven repository;
-- read-only root filesystem and a constrained `/tmp` tmpfs;
-- all capabilities dropped and `no-new-privileges` enabled;
-- a health check that uses the binary's own `--healthcheck` mode;
-- the MCP port published only on `127.0.0.1` by default.
-
-After changing the Dockerfile or Compose configuration, run at least:
-
-```bash
-MAVEN_REPO_PATH="$HOME/.m2/repository" docker compose config --quiet
-docker build -t maven-mcp .
-```
-
-Do not copy a Maven repository, credentials, or an `.env` file into the image.
+- STDIO is the only supported transport; do not add a listening socket or
+  daemon lifecycle without a separately approved ADR.
+- stdout is protocol-only. Logging and diagnostics must remain on stderr.
+- Project execution is selected per request through explicit `project_path`, but
+  authorization is granted only by `MAVEN_TRUSTED_PROJECT_DIRECTORIES`. Never
+  infer trust from the client working directory or the requested path itself.
+- The canonical project root must be equal to or nested below a configured
+  trusted directory; use component-aware path containment after canonicalizing
+  both sides, so symlinks cannot escape the directory tree.
+- One Maven process may run at a time across the whole STDIO server, including
+  interleaved trusted project contexts.
+- Native Maven execution is not a sandbox; plugins and tests run with the local
+  user's permissions.
+- EOF, SIGINT, and SIGTERM must stop the server and every active Maven process
+  group without leaving an orphan.
 
 ## Documentation and Handoff
 
 - Update `README.md` when user-visible behavior, tools, configuration, or run
   commands change.
-- Update `docs/testing.md` when the testing workflow changes.
-- Record significant architectural or public API decisions in an ADR under
-  `docs/decisions/`.
 - Before handoff, run checks proportionate to the change risk. The mandatory
   final gate for public MCP or broad changes is `scripts/test-pyramid.sh`.
+- At the end of every task, after the required verification and before handoff,
+  rebuild the release executable with `cargo build --release --locked`. This is
+  mandatory even when an earlier command already built or tested another Cargo
+  profile.
 - Do not commit, push, or accept snapshots without a specific user request.

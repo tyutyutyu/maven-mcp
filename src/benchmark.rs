@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, bail};
 use rmcp::{
     RoleClient, ServiceExt, model::CallToolRequestParams, service::RunningService,
-    transport::StreamableHttpClientTransport,
+    transport::TokioChildProcess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -101,7 +101,7 @@ impl BenchmarkSpec {
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkOptions {
-    pub mcp_url: String,
+    pub mcp_command: PathBuf,
     pub iterations: u32,
     pub warmup: u32,
     pub timeout: Duration,
@@ -207,15 +207,18 @@ pub async fn run_benchmark(
     options: &BenchmarkOptions,
 ) -> Result<BenchmarkReport> {
     options.validate()?;
-    let client_result = ().serve(StreamableHttpClientTransport::from_uri(
-        options.mcp_url.clone(),
-    ));
-    let client = match tokio::time::timeout(options.timeout, client_result).await {
-        Ok(Ok(client)) => Ok(client),
-        Ok(Err(error)) => Err(format!("MCP client initialization failed: {error}")),
-        Err(_) => Err(format!(
-            "MCP client initialization timed out after {} ms",
-            options.timeout.as_millis()
+    let client = match TokioChildProcess::new(Command::new(&options.mcp_command)) {
+        Ok(transport) => match tokio::time::timeout(options.timeout, ().serve(transport)).await {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(error)) => Err(format!("MCP client initialization failed: {error}")),
+            Err(_) => Err(format!(
+                "MCP client initialization timed out after {} ms",
+                options.timeout.as_millis()
+            )),
+        },
+        Err(error) => Err(format!(
+            "cannot start MCP command {}: {error}",
+            options.mcp_command.display()
         )),
     };
 

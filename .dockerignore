@@ -1,9 +1,0 @@
-target
-.git
-.gitignore
-.idea
-.vscode
-*.code-workspace
-README.md
-.backlog
-.brv

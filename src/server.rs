@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use rmcp::{
     ErrorData, ServerHandler,
@@ -10,7 +14,9 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
+use crate::config::Config;
 use crate::index::{
     ArtifactApiDiff, ArtifactHealth, ClassDescription, ClassList, ClassLocation, ClassMemberMatch,
     ClassReference, ClassReferenceKind, DeclarationSourceLookup, EntryMatch, IndexStats,
@@ -21,8 +27,12 @@ use crate::index::{
 use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
     DependencyResolutionStatus, DependencyScope, DependencyTreeResult, EffectivePomResult,
-    FocusedTestInvocation, FocusedTestResult, LastTestFailures, LifecyclePhase, MavenBuildResult,
-    MavenClasspathResult, MavenInvocation, MavenProject, MavenRunner,
+    FocusedTestInvocation, FocusedTestResult, LastTestFailures, LifecyclePhase, MavenBuildOutcome,
+    MavenBuildResult, MavenClasspathResult, MavenInvocation, MavenProject, MavenRunner,
+    canonical_project_root,
+};
+use crate::runtime_stats::{
+    ProjectIndexStatus, RuntimeCacheStatus, RuntimeStatusPublisher, unix_ms,
 };
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -37,7 +47,15 @@ impl<T> From<Vec<T>> for Results<T> {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ProjectPathRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Case-insensitive substring to search for")]
     query: String,
     #[schemars(description = "Maximum result count; capped by MAX_RESULTS")]
@@ -46,6 +64,8 @@ pub struct SearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntrySearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Case-insensitive substring matched against JAR entry paths")]
     query: String,
     #[schemars(
@@ -58,6 +78,8 @@ pub struct EntrySearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassListRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Exact coordinate, repository-relative path, or JAR filename")]
     jar: String,
     #[schemars(description = "Zero-based result offset")]
@@ -68,6 +90,8 @@ pub struct ClassListRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
     #[schemars(
@@ -80,6 +104,8 @@ pub struct SourceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JarEntryRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Exact coordinate, repository-relative path, or JAR filename")]
     jar: String,
     #[schemars(description = "Exact case-sensitive path of the entry inside the selected JAR")]
@@ -88,18 +114,24 @@ pub struct JarEntryRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PomDescriptorRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Exact Maven coordinate in groupId:artifactId:version form")]
     coordinate: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArtifactHealthRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Exact Maven coordinate in groupId:artifactId:version form")]
     coordinate: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassMemberSearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(
         description = "Case-insensitive substring matched against member or annotation names"
     )]
@@ -114,6 +146,8 @@ pub struct ClassMemberSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArtifactApiDiffRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Exact Maven groupId")]
     group_id: String,
     #[schemars(description = "Exact Maven artifactId")]
@@ -126,6 +160,8 @@ pub struct ArtifactApiDiffRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JarContentSearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Case-insensitive substring matched inside supported text resources")]
     query: String,
     #[schemars(
@@ -138,6 +174,8 @@ pub struct JarContentSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeHierarchyRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified interface or base class name")]
     type_name: String,
     #[schemars(description = "Include indirect implementations and subclasses")]
@@ -153,6 +191,8 @@ pub struct TypeHierarchyRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceSearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Substring or regular expression matched in Java/Kotlin sources")]
     query: String,
     #[schemars(description = "Interpret query as a Rust regular expression")]
@@ -171,6 +211,8 @@ pub struct SourceSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeclarationSourceRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
     #[schemars(
@@ -189,6 +231,8 @@ pub struct DeclarationSourceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassReferenceRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified class name used as source or target owner")]
     class_name: String,
     #[schemars(description = "Inbound or outbound reference direction")]
@@ -209,6 +253,8 @@ pub struct ClassReferenceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProviderSearchRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Optional case-insensitive service or extension-point filter")]
     service: Option<String>,
     #[schemars(description = "Optional case-insensitive provider implementation filter")]
@@ -225,6 +271,8 @@ pub struct ProviderSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MavenLifecycleRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Allowed lifecycle phase: compile, test_compile, or verify")]
     phase: LifecyclePhase,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
@@ -236,6 +284,8 @@ pub struct MavenLifecycleRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FocusedTestRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified test class name")]
     test_class: String,
     #[schemars(description = "Optional exact test method name")]
@@ -249,12 +299,16 @@ pub struct FocusedTestRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectModuleRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DependencyTreeRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
     #[schemars(description = "Optional Maven dependency scope")]
@@ -267,6 +321,8 @@ pub struct DependencyTreeRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DependencyResolutionRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
     #[schemars(description = "Optional Maven dependency scope")]
@@ -279,6 +335,8 @@ pub struct DependencyResolutionRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MavenClasspathRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
     #[schemars(description = "Build or test classpath")]
@@ -287,6 +345,8 @@ pub struct MavenClasspathRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CoverageGapRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Maximum result count; capped by MAX_RESULTS")]
     limit: Option<usize>,
 }
@@ -300,6 +360,8 @@ pub enum ClassVisibility {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassDescriptionRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
     #[schemars(
@@ -314,6 +376,8 @@ pub struct ClassDescriptionRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct VersionsRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
     #[schemars(description = "Maven artifactId")]
     artifact_id: String,
     #[schemars(description = "Optional groupId used to disambiguate artifacts")]
@@ -322,100 +386,333 @@ pub struct VersionsRequest {
 
 #[derive(Debug, Clone)]
 pub struct MavenMcpServer {
-    index: Arc<MavenIndex>,
-    runner: Option<Arc<MavenRunner>>,
+    config: Config,
+    runners: Arc<Mutex<HashMap<PathBuf, Arc<MavenRunner>>>>,
+    execution_permit: Arc<Semaphore>,
+    indexes: Arc<Mutex<ProjectIndexCache>>,
+    runtime_status: Arc<RuntimeStatusPublisher>,
     tool_router: ToolRouter<Self>,
 }
 
 impl MavenMcpServer {
-    pub fn new(index: Arc<MavenIndex>) -> Self {
-        Self::with_runner(index, None)
+    pub fn new(config: Config) -> Self {
+        let runtime_status = RuntimeStatusPublisher::register(&config)
+            .expect("runtime status registration must be writable");
+        Self {
+            config,
+            runners: Arc::new(Mutex::new(HashMap::new())),
+            execution_permit: Arc::new(Semaphore::new(1)),
+            indexes: Arc::new(Mutex::new(ProjectIndexCache::default())),
+            runtime_status: Arc::new(runtime_status),
+            tool_router: Self::tool_router(),
+        }
     }
 
-    pub fn with_runner(index: Arc<MavenIndex>, runner: Option<Arc<MavenRunner>>) -> Self {
-        let mut tool_router = Self::tool_router();
-        if runner.is_none() {
-            tool_router.disable_route("inspect_maven_project");
-            tool_router.disable_route("run_maven_lifecycle");
-            tool_router.disable_route("list_maven_test_classes");
-            tool_router.disable_route("run_maven_test");
-            tool_router.disable_route("get_last_maven_test_failures");
-            tool_router.disable_route("get_effective_pom");
-            tool_router.disable_route("get_dependency_tree");
-            tool_router.disable_route("explain_dependency_resolution");
-            tool_router.disable_route("get_maven_classpath");
-            tool_router.disable_route("get_jacoco_coverage");
-            tool_router.disable_route("get_jacoco_coverage_gaps");
+    fn validate_project_path(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
+        canonical_project_root(&PathBuf::from(project_path))
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
+    }
+
+    fn runner_for(&self, project_path: &str) -> Result<Arc<MavenRunner>, ErrorData> {
+        let root = self.validate_project_path(project_path)?;
+        if !self
+            .config
+            .execution
+            .trusted_project_directories
+            .iter()
+            .any(|directory| root.starts_with(directory))
+        {
+            return Err(ErrorData::invalid_params(
+                "project_path is not inside a directory configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+                None,
+            ));
         }
-        Self {
-            index,
-            runner,
-            tool_router,
+        let mut runners = self
+            .runners
+            .lock()
+            .map_err(|_| ErrorData::internal_error("project runner cache is poisoned", None))?;
+        if let Some(runner) = runners.get(&root) {
+            return Ok(Arc::clone(runner));
+        }
+        let runner = Arc::new(
+            MavenRunner::discover_canonical_with_permit(
+                root.clone(),
+                &self.config.execution,
+                Arc::clone(&self.execution_permit),
+            )
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?,
+        );
+        runners.insert(root, Arc::clone(&runner));
+        Ok(runner)
+    }
+
+    async fn index_for(&self, project_path: &str) -> Result<Arc<MavenIndex>, ErrorData> {
+        let root = self.validate_project_path(project_path)?;
+        if let Some(index) = self.cached_index(&root)? {
+            return Ok(index);
+        }
+
+        let runner = self.runner_for(project_path)?;
+        let classpath = runner
+            .build_classpath_paths(None, ClasspathKind::Test)
+            .await;
+        if classpath.build.outcome != MavenBuildOutcome::Success {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "cannot build Maven classpath for project index: {}",
+                    maven_failure_detail(&classpath.build)
+                ),
+                None,
+            ));
+        }
+        let Some(repository_root) = repository_root_for(&classpath.paths, &self.config) else {
+            return Err(ErrorData::invalid_params(
+                "Maven classpath did not contain indexable local repository JARs",
+                None,
+            ));
+        };
+        let index = Arc::new(
+            MavenIndex::build_scoped(
+                &repository_root,
+                &classpath.paths,
+                self.config.max_results,
+                self.config.max_source_bytes,
+            )
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?,
+        );
+        self.store_index(root, Arc::clone(&index))?;
+        Ok(index)
+    }
+
+    fn cached_index(&self, root: &PathBuf) -> Result<Option<Arc<MavenIndex>>, ErrorData> {
+        let result = self
+            .indexes
+            .lock()
+            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))
+            .map(|mut cache| cache.get(root));
+        self.publish_runtime_status();
+        result
+    }
+
+    fn store_index(&self, root: PathBuf, index: Arc<MavenIndex>) -> Result<(), ErrorData> {
+        self.indexes
+            .lock()
+            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))?
+            .insert(root, index, self.config.max_project_indexes);
+        self.publish_runtime_status();
+        Ok(())
+    }
+
+    fn publish_runtime_status(&self) {
+        let Ok(cache) = self.indexes.lock() else {
+            return;
+        };
+        let _ = self
+            .runtime_status
+            .update_cache(cache.runtime_cache(), cache.runtime_projects());
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProjectIndexCache {
+    indexes: HashMap<PathBuf, Arc<MavenIndex>>,
+    order: VecDeque<PathBuf>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    last_used: HashMap<PathBuf, u128>,
+}
+
+impl ProjectIndexCache {
+    fn get(&mut self, root: &PathBuf) -> Option<Arc<MavenIndex>> {
+        let Some(index) = self.indexes.get(root).cloned() else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
+        self.touch(root);
+        Some(index)
+    }
+
+    fn insert(&mut self, root: PathBuf, index: Arc<MavenIndex>, limit: usize) {
+        self.indexes.insert(root.clone(), index);
+        self.touch(&root);
+        while self.indexes.len() > limit {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if evicted != root && self.indexes.remove(&evicted).is_some() {
+                self.evictions += 1;
+                self.last_used.remove(&evicted);
+            }
         }
     }
+
+    fn touch(&mut self, root: &PathBuf) {
+        self.order.retain(|candidate| candidate != root);
+        self.order.push_back(root.clone());
+        self.last_used.insert(root.clone(), unix_ms());
+    }
+
+    fn runtime_cache(&self) -> RuntimeCacheStatus {
+        RuntimeCacheStatus {
+            entries: self.indexes.len(),
+            hits: self.hits,
+            misses: self.misses,
+            evictions: self.evictions,
+        }
+    }
+
+    fn runtime_projects(&self) -> Vec<ProjectIndexStatus> {
+        let mut projects = self
+            .indexes
+            .iter()
+            .map(|(root, index)| ProjectIndexStatus {
+                project_path: root.display().to_string(),
+                last_used_unix_ms: self.last_used.get(root).copied().unwrap_or_default(),
+                index: index.stats(),
+            })
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.project_path.cmp(&right.project_path));
+        projects
+    }
+}
+
+const MAX_MAVEN_FAILURE_DETAIL_CHARS: usize = 2_048;
+
+fn maven_failure_detail(build: &MavenBuildResult) -> String {
+    let error_lines = [&build.run.stderr, &build.run.stdout]
+        .into_iter()
+        .flat_map(|output| output.lines())
+        .map(str::trim)
+        .filter(|line| line.contains("[ERROR]") && *line != "[ERROR]")
+        .collect::<Vec<_>>();
+    let fallback_lines = [&build.run.stderr, &build.run.stdout]
+        .into_iter()
+        .flat_map(|output| output.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let detail = if error_lines.is_empty() {
+        fallback_lines.collect::<Vec<_>>().join("\n")
+    } else {
+        error_lines.join("\n")
+    };
+    if detail.is_empty() {
+        return build.run.exit_code.map_or_else(
+            || {
+                format!(
+                    "Maven failed with outcome {:?} without diagnostic output",
+                    build.outcome
+                )
+            },
+            |code| format!("Maven exited with status {code} without diagnostic output"),
+        );
+    }
+    let mut bounded = detail
+        .chars()
+        .take(MAX_MAVEN_FAILURE_DETAIL_CHARS + 1)
+        .collect::<String>();
+    if bounded.chars().count() > MAX_MAVEN_FAILURE_DETAIL_CHARS {
+        bounded = bounded
+            .chars()
+            .take(MAX_MAVEN_FAILURE_DETAIL_CHARS - 1)
+            .collect();
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn repository_root_for(paths: &[PathBuf], config: &Config) -> Option<PathBuf> {
+    if let Some(repository) = config.execution.execution_repository.as_ref()
+        && paths.iter().any(|path| path.starts_with(repository))
+    {
+        return Some(repository.clone());
+    }
+    paths.iter().find_map(|path| {
+        let mut root = PathBuf::new();
+        for component in path.components() {
+            root.push(component.as_os_str());
+            if component.as_os_str() == "repository" {
+                return Some(root);
+            }
+        }
+        None
+    })
 }
 
 #[tool_router(router = tool_router)]
 impl MavenMcpServer {
     #[tool(description = "Return startup index statistics")]
-    fn index_stats(&self) -> Json<IndexStats> {
-        Json(self.index.stats())
+    async fn index_stats(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<IndexStats>, ErrorData> {
+        Ok(Json(self.index_for(&request.project_path).await?.stats()))
     }
 
     #[tool(
         description = "Find classes by partial or fully-qualified class name and return every containing JAR"
     )]
-    fn search_classes(
+    async fn search_classes(
         &self,
         Parameters(request): Parameters<SearchRequest>,
-    ) -> Json<Results<ClassLocation>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<ClassLocation>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_classes(&request.query, request.limit)
                 .into(),
-        )
+        ))
     }
 
     #[tool(
         description = "Find Maven JARs by coordinate, artifact name, version, filename, or repository path"
     )]
-    fn search_jars(
+    async fn search_jars(
         &self,
         Parameters(request): Parameters<SearchRequest>,
-    ) -> Json<Results<JarSummary>> {
-        Json(self.index.search_jars(&request.query, request.limit).into())
+    ) -> Result<Json<Results<JarSummary>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
+                .search_jars(&request.query, request.limit)
+                .into(),
+        ))
     }
 
     #[tool(description = "Search file and class entry paths inside all JARs or one selected JAR")]
-    fn search_jar_entries(
+    async fn search_jar_entries(
         &self,
         Parameters(request): Parameters<EntrySearchRequest>,
-    ) -> Json<Results<EntryMatch>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<EntryMatch>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_entries(&request.query, request.jar.as_deref(), request.limit)
                 .into(),
-        )
+        ))
     }
 
     #[tool(description = "List the classes in a selected JAR with pagination")]
-    fn list_jar_classes(
+    async fn list_jar_classes(
         &self,
         Parameters(request): Parameters<ClassListRequest>,
-    ) -> Json<Results<ClassList>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<ClassList>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .list_classes(&request.jar, request.offset.unwrap_or(0), request.limit)
                 .into(),
-        )
+        ))
     }
 
     #[tool(description = "Return Java or Kotlin source for a class from the matching -sources.jar")]
-    fn get_class_source(
+    async fn get_class_source(
         &self,
         Parameters(request): Parameters<SourceRequest>,
     ) -> Result<Json<Results<SourceResult>>, ErrorData> {
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .class_source(
                 &request.class_name,
                 request.jar.as_deref(),
@@ -429,7 +726,7 @@ impl MavenMcpServer {
     #[tool(
         description = "Read one exact entry from a selected JAR without extracting it; text and binary content are size-limited"
     )]
-    fn get_jar_entry(
+    async fn get_jar_entry(
         &self,
         Parameters(request): Parameters<JarEntryRequest>,
     ) -> Result<Json<Results<JarEntryContent>>, ErrorData> {
@@ -439,7 +736,8 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .jar_entry(&request.jar, &request.entry)
             .map(Results::from)
             .map(Json)
@@ -449,13 +747,14 @@ impl MavenMcpServer {
     #[tool(
         description = "Read a local artifact POM as a structured descriptor with declared dependencies, dependency management, BOM imports, and properties"
     )]
-    fn get_artifact_pom(
+    async fn get_artifact_pom(
         &self,
         Parameters(request): Parameters<PomDescriptorRequest>,
     ) -> Result<Json<PomDescriptorLookup>, ErrorData> {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .pom_descriptor(&request.coordinate)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -464,11 +763,12 @@ impl MavenMcpServer {
     #[tool(
         description = "Describe classfile API metadata without requiring a sources JAR, including hierarchy, members, generic signatures, and annotations"
     )]
-    fn describe_class(
+    async fn describe_class(
         &self,
         Parameters(request): Parameters<ClassDescriptionRequest>,
     ) -> Result<Json<Results<ClassDescription>>, ErrorData> {
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .describe_class(
                 &request.class_name,
                 request.jar.as_deref(),
@@ -483,13 +783,14 @@ impl MavenMcpServer {
     #[tool(
         description = "Diagnose the read-only local state of one Maven artifact without exposing absolute paths or credentials"
     )]
-    fn diagnose_artifact(
+    async fn diagnose_artifact(
         &self,
         Parameters(request): Parameters<ArtifactHealthRequest>,
     ) -> Result<Json<ArtifactHealth>, ErrorData> {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .artifact_health(&request.coordinate)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -498,21 +799,22 @@ impl MavenMcpServer {
     #[tool(
         description = "Search method names, field names, and annotation types across indexed classfiles"
     )]
-    fn search_class_members(
+    async fn search_class_members(
         &self,
         Parameters(request): Parameters<ClassMemberSearchRequest>,
-    ) -> Json<Results<ClassMemberMatch>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<ClassMemberMatch>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_class_members(&request.query, request.jar.as_deref(), request.limit)
                 .into(),
-        )
+        ))
     }
 
     #[tool(
         description = "Compare the public and protected class API of two locally available versions of one Maven artifact"
     )]
-    fn compare_artifact_api(
+    async fn compare_artifact_api(
         &self,
         Parameters(request): Parameters<ArtifactApiDiffRequest>,
     ) -> Result<Json<ArtifactApiDiff>, ErrorData> {
@@ -529,7 +831,8 @@ impl MavenMcpServer {
             validate_exact_coordinate(&coordinate)
                 .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .compare_artifact_api(
                 &request.group_id,
                 &request.artifact_id,
@@ -543,11 +846,12 @@ impl MavenMcpServer {
     #[tool(
         description = "Search supported UTF-8 text resources inside indexed JARs with entry, total-byte, context, and result limits"
     )]
-    fn search_jar_content(
+    async fn search_jar_content(
         &self,
         Parameters(request): Parameters<JarContentSearchRequest>,
     ) -> Result<Json<JarContentSearch>, ErrorData> {
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .search_jar_content(&request.query, request.jar.as_deref(), request.limit)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -556,12 +860,13 @@ impl MavenMcpServer {
     #[tool(
         description = "Find direct or transitive implementations and subclasses of a class or interface across indexed artifacts"
     )]
-    fn search_type_hierarchy(
+    async fn search_type_hierarchy(
         &self,
         Parameters(request): Parameters<TypeHierarchyRequest>,
-    ) -> Json<Results<TypeHierarchyMatch>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<TypeHierarchyMatch>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_type_hierarchy(
                     &request.type_name,
                     request.transitive,
@@ -569,13 +874,13 @@ impl MavenMcpServer {
                     request.limit,
                 )
                 .into(),
-        )
+        ))
     }
 
     #[tool(
         description = "Search Java and Kotlin sources in local sources artifacts with bounded line context"
     )]
-    fn search_source(
+    async fn search_source(
         &self,
         Parameters(request): Parameters<SourceSearchRequest>,
     ) -> Result<Json<SourceSearch>, ErrorData> {
@@ -589,7 +894,8 @@ impl MavenMcpServer {
             regex::Regex::new(&request.query)
                 .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .search_source(
                 &request.query,
                 request.regex,
@@ -604,7 +910,7 @@ impl MavenMcpServer {
     #[tool(
         description = "Return the bounded source slice for one Java or Kotlin class, field, or method declaration"
     )]
-    fn get_declaration_source(
+    async fn get_declaration_source(
         &self,
         Parameters(request): Parameters<DeclarationSourceRequest>,
     ) -> Result<Json<DeclarationSourceLookup>, ErrorData> {
@@ -614,7 +920,8 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        self.index
+        self.index_for(&request.project_path)
+            .await?
             .get_declaration_source(
                 &request.class_name,
                 request.member_name.as_deref(),
@@ -629,12 +936,13 @@ impl MavenMcpServer {
     #[tool(
         description = "Search inbound or outbound classfile references to classes, fields, and methods"
     )]
-    fn search_class_references(
+    async fn search_class_references(
         &self,
         Parameters(request): Parameters<ClassReferenceRequest>,
-    ) -> Json<Results<ClassReference>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<ClassReference>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_class_references(
                     &request.class_name,
                     request.direction,
@@ -645,18 +953,19 @@ impl MavenMcpServer {
                     request.limit,
                 )
                 .into(),
-        )
+        ))
     }
 
     #[tool(
         description = "Find structured Java ServiceLoader, JPMS, and supported Spring provider declarations"
     )]
-    fn search_providers(
+    async fn search_providers(
         &self,
         Parameters(request): Parameters<ProviderSearchRequest>,
-    ) -> Json<Results<ProviderFact>> {
-        Json(
-            self.index
+    ) -> Result<Json<Results<ProviderFact>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .search_providers(
                     request.service.as_deref(),
                     request.provider.as_deref(),
@@ -665,17 +974,19 @@ impl MavenMcpServer {
                     request.limit,
                 )
                 .into(),
-        )
+        ))
     }
 
     #[tool(
         description = "Return the validated root POM, packaging, Maven Wrapper, and reactor module model for the opt-in project"
     )]
-    fn inspect_maven_project(&self) -> Result<Json<MavenProject>, ErrorData> {
-        self.runner
-            .as_ref()
-            .map(|runner| Json(runner.project().clone()))
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))
+    fn inspect_maven_project(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<MavenProject>, ErrorData> {
+        Ok(Json(
+            self.runner_for(&request.project_path)?.project().clone(),
+        ))
     }
 
     #[tool(
@@ -685,10 +996,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<MavenLifecycleRequest>,
     ) -> Result<Json<MavenBuildResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         let run = runner
             .run(&MavenInvocation {
                 phase: request.phase,
@@ -702,10 +1010,11 @@ impl MavenMcpServer {
     #[tool(
         description = "List Java and Kotlin test classes under the validated Maven reactor root"
     )]
-    fn list_maven_test_classes(&self) -> Result<Json<Results<String>>, ErrorData> {
-        self.runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?
+    fn list_maven_test_classes(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<Results<String>>, ErrorData> {
+        self.runner_for(&request.project_path)?
             .test_classes()
             .map(Results::from)
             .map(Json)
@@ -719,10 +1028,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<FocusedTestRequest>,
     ) -> Result<Json<FocusedTestResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(
             runner
                 .run_focused_test(&FocusedTestInvocation {
@@ -736,11 +1042,11 @@ impl MavenMcpServer {
     }
 
     #[tool(description = "Return failures from the last focused Maven test run in this process")]
-    async fn get_last_maven_test_failures(&self) -> Result<Json<LastTestFailures>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+    async fn get_last_maven_test_failures(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<LastTestFailures>, ErrorData> {
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(runner.last_test_failures().await))
     }
 
@@ -751,10 +1057,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<ProjectModuleRequest>,
     ) -> Result<Json<EffectivePomResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(runner.effective_pom(request.module.as_deref()).await))
     }
 
@@ -765,10 +1068,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<DependencyTreeRequest>,
     ) -> Result<Json<DependencyTreeResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(
             runner
                 .dependency_tree(
@@ -787,10 +1087,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<DependencyResolutionRequest>,
     ) -> Result<Json<DependencyResolutionResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         let result = runner
             .explain_dependency_resolution(
                 request.module.as_deref(),
@@ -817,10 +1114,7 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<MavenClasspathRequest>,
     ) -> Result<Json<MavenClasspathResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(
             runner
                 .build_classpath(request.module.as_deref(), request.kind)
@@ -831,11 +1125,11 @@ impl MavenMcpServer {
     #[tool(
         description = "Read existing JaCoCo XML reports without running Maven and return per-module counters with missing and stale state"
     )]
-    fn get_jacoco_coverage(&self) -> Result<Json<CoverageSummaryResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+    fn get_jacoco_coverage(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<CoverageSummaryResult>, ErrorData> {
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(runner.jacoco_coverage()))
     }
 
@@ -846,22 +1140,20 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<CoverageGapRequest>,
     ) -> Result<Json<CoverageGapResult>, ErrorData> {
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| ErrorData::invalid_params("project execution is disabled", None))?;
+        let runner = self.runner_for(&request.project_path)?;
         Ok(Json(runner.jacoco_coverage_gaps(request.limit)))
     }
 
     #[tool(description = "List all locally available versions of a Maven artifact")]
-    fn list_artifact_versions(
+    async fn list_artifact_versions(
         &self,
         Parameters(request): Parameters<VersionsRequest>,
-    ) -> Json<BTreeMap<String, Vec<String>>> {
-        Json(
-            self.index
+    ) -> Result<Json<BTreeMap<String, Vec<String>>>, ErrorData> {
+        Ok(Json(
+            self.index_for(&request.project_path)
+                .await?
                 .artifact_versions(&request.artifact_id, request.group_id.as_deref()),
-        )
+        ))
     }
 }
 

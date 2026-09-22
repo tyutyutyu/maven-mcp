@@ -6,21 +6,21 @@ expression: execution.response
   "incomplete": false,
   "results": [
     {
-      "context": "package org.example; public class Foo { int version = 2; }",
+      "context": "package org.example; public class Foo { int scoped = 2; }",
       "entry": "org/example/Foo.java",
       "line": 1,
       "source_jar": {
-        "artifact_id": "demo",
+        "artifact_id": "helper",
         "class_count": 0,
         "classifier": "sources",
-        "coordinate": "org.example:demo:2.0:sources",
+        "coordinate": "org.libs:helper:2.0:sources",
         "entry_count": 1,
-        "group_id": "org.example",
-        "path": "org/example/demo/2.0/demo-2.0-sources.jar",
+        "group_id": "org.libs",
+        "path": "org/libs/helper/2.0/helper-2.0-sources.jar",
         "version": "2.0"
       },
       "truncated": false
     }
   ],
-  "scanned_bytes": 58
+  "scanned_bytes": 57
 }

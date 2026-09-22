@@ -8,7 +8,5 @@ cd "${PROJECT_ROOT}"
 cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --locked
-"${SCRIPT_DIR}/run-conformance.sh"
 
 echo "MCP keresési riport: ${PROJECT_ROOT}/target/mcp-test-report/report.md"
-
