@@ -498,3 +498,7 @@ Start MCP Inspector with the fixture repository:
 ```bash
 scripts/run-inspector.sh
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
