@@ -1,0 +1,23 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "descriptor_kind": "service_loader",
+      "entry": "META-INF/services/org.example.Service",
+      "jar": {
+        "artifact_id": "resource-fixture",
+        "class_count": 0,
+        "coordinate": "org.libs:resource-fixture:1.0",
+        "entry_count": 3,
+        "group_id": "org.libs",
+        "path": "org/libs/resource-fixture/1.0/resource-fixture-1.0.jar",
+        "version": "1.0"
+      },
+      "provider": "org.example.Provider",
+      "service": "org.example.Service"
+    }
+  ]
+}

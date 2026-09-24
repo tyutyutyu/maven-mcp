@@ -1,0 +1,17 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "added_classes": [
+    "org.example.api.CurrentApi"
+  ],
+  "artifact_id": "api-fixture",
+  "changed_classes": [],
+  "current_version": "2.0",
+  "group_id": "org.libs",
+  "previous_version": "1.0",
+  "removed_classes": [
+    "org.example.api.LegacyApi"
+  ]
+}

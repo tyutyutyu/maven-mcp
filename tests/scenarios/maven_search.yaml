@@ -127,3 +127,142 @@ scenarios:
         - entry: org/example/Foo.java
           line: 1
           truncated: false
+
+  - id: scoped-classfile-description-without-sources
+    title: Osztályleírás sources JAR nélkül
+    description: A classfile-ból a bináris artifact forráscsomag nélkül is vizsgálható.
+    tool: describe_class
+    arguments:
+      class_name: org.libs.ScopedOnly
+      jar: helper-2.0.jar
+      visibility: public
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.libs.ScopedOnly
+          visibility: public
+          jar:
+            coordinate: org.libs:helper:2.0
+
+  - id: scoped-exact-service-entry
+    title: Pontos service entry kiolvasása
+    description: Egy kiválasztott JAR service descriptorja szöveges tartalomként olvasható.
+    tool: get_jar_entry
+    arguments:
+      jar: resource-fixture-1.0.jar
+      entry: META-INF/services/org.example.Service
+    expect:
+      result_count: 1
+      contains:
+        - entry: META-INF/services/org.example.Service
+          content_kind: text
+          text: "org.example.Provider\n"
+          truncated: false
+
+  - id: scoped-artifact-health-diagnostics
+    title: Artifact állapotának diagnosztikája
+    description: A helyi artifact checksum és repository jelölői írás nélkül láthatók.
+    tool: diagnose_artifact
+    arguments:
+      coordinate: org.libs:resource-fixture:1.0
+    expect:
+      matches:
+        coordinate: org.libs:resource-fixture:1.0
+        found: true
+        snapshot: false
+
+  - id: scoped-class-member-search
+    title: Osztálytag keresése
+    description: A classfile mezőnév keresése JAR-szűréssel és eredménykorláttal működik.
+    tool: search_class_members
+    arguments:
+      query: value
+      jar: helper-2.0.jar
+      limit: 1
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+          kind: field
+          name: value
+          signature: I
+          jar:
+            coordinate: org.libs:helper:2.0
+
+  - id: scoped-artifact-api-comparison
+    title: Két helyi artifactverzió API diffje
+    description: A lokális verziók közti hozzáadott és eltávolított osztályok strukturáltan jelennek meg.
+    tool: compare_artifact_api
+    arguments:
+      group_id: org.libs
+      artifact_id: api-fixture
+      previous_version: "1.0"
+      current_version: "2.0"
+    expect:
+      matches:
+        group_id: org.libs
+        artifact_id: api-fixture
+        previous_version: "1.0"
+        current_version: "2.0"
+        added_classes:
+          - org.example.api.CurrentApi
+        removed_classes:
+          - org.example.api.LegacyApi
+
+  - id: scoped-jar-resource-content-search
+    title: Tartalmi keresés JAR-erőforrásban
+    description: A támogatott szöveges properties entry korlátozott kontextussal kereshető.
+    tool: search_jar_content
+    arguments:
+      query: feature.provider
+      jar: resource-fixture-1.0.jar
+    expect:
+      result_count: 1
+      contains:
+        - entry: config/inspection.properties
+          line: 1
+          jar:
+            coordinate: org.libs:resource-fixture:1.0
+
+  - id: scoped-outbound-class-reference-search
+    title: Kimenő classfile hivatkozás keresése
+    description: A classfile superclass hivatkozása a célosztály alapján megtalálható.
+    tool: search_class_references
+    arguments:
+      class_name: org.example.Foo
+      direction: outbound
+      kind: class
+      jar: helper-2.0.jar
+    expect:
+      contains:
+        - target_owner: java.lang.Object
+          kind: class
+
+  - id: scoped-service-provider-search
+    title: ServiceLoader provider feltárása
+    description: A META-INF/services deklarációból a service és provider külön mezőként jelenik meg.
+    tool: search_providers
+    arguments:
+      service: org.example.Service
+      provider: org.example.Provider
+      jar: resource-fixture-1.0.jar
+    expect:
+      result_count: 1
+      contains:
+        - service: org.example.Service
+          provider: org.example.Provider
+          entry: META-INF/services/org.example.Service
+
+  - id: scoped-source-declaration-lookup
+    title: Forrásosztály deklarációjának lekérdezése
+    description: Egy forrásosztály publikus deklarációja rövid forrásrészletként kérhető le.
+    tool: get_declaration_source
+    arguments:
+      class_name: org.example.Foo
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+          kind: class
+          name: org.example.Foo
+          entry: org/example/Foo.java

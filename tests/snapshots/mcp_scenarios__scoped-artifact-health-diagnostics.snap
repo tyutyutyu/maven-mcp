@@ -1,0 +1,29 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "checksums": [
+    "resource-fixture-1.0.jar.sha1"
+  ],
+  "coordinate": "org.libs:resource-fixture:1.0",
+  "files": [
+    {
+      "file_name": "resource-fixture-1.0.jar",
+      "kind": "jar",
+      "readable": true
+    },
+    {
+      "file_name": "resource-fixture-1.0.pom",
+      "kind": "pom"
+    }
+  ],
+  "found": true,
+  "last_updated_markers": [
+    "resource-fixture-1.0.jar.lastUpdated"
+  ],
+  "repository_ids": [
+    "central"
+  ],
+  "snapshot": false
+}
