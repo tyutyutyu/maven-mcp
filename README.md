@@ -460,11 +460,17 @@ target/mcp-test-report/report.md
 ### Hosted CI
 
 GitHub Actions runs the same verification gate from
-`.github/workflows/ci.yml` for every push and for pull requests targeting
+`.github/workflows/ci.yml` for pushes to `main` and pull requests targeting
 `main`. The workflow installs Rust `1.89.0`, uses the committed `Cargo.lock`,
-and runs `scripts/test-pyramid.sh` on Ubuntu. Its job and status-check context
-are both named `CI`, so a repository ruleset can require the successful `CI`
-check before merging.
+and runs `scripts/test-pyramid.sh` on Ubuntu. It has read-only repository
+permissions, does not persist checkout credentials, and uses no dependency
+cache. Its job and status-check context are both named `CI`.
+
+The active default-branch ruleset requires a pull request and a successful,
+up-to-date `CI` check before merging. It requires zero approving reviews for
+the single-maintainer workflow, blocks deletion and force pushes, and requires
+linear history. Use a short-lived branch, open a pull request to `main`, wait
+for `CI`, then squash merge. The repository deletes the branch after merging.
 
 ### Agent and LLM Evaluation
 
