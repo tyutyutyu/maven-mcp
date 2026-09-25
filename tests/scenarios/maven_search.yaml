@@ -84,7 +84,7 @@ scenarios:
 
   - id: scoped-pom-descriptor
     title: Scoped artifact POM descriptor
-    description: A classpath artifact POM-ja a scoped repository root alatt olvasható.
+    description: A pontos koordinátájú helyi artifact POM-ja classpath index nélkül olvasható.
     tool: get_artifact_pom
     arguments:
       coordinate: org.libs:helper:2.0
