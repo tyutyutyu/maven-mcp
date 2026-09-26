@@ -47,9 +47,11 @@ The server exposes the following MCP tools:
 - `compare_artifact_api` – compares the public/protected API of two local
   versions of the same artifact at class, member, superclass, and interface
   levels.
-- `search_jar_content` – searches supported UTF-8 JAR resources with bounded
-  context; binary, oversized, and unsupported entries are not interpreted as
-  text.
+- `search_jar_content` – searches manifests, `META-INF/services/*`, and UTF-8
+  entries ending in `.conf`, `.config`, `.factories`, `.imports`, `.json`,
+  `.list`, `.properties`, `.txt`, `.xml`, `.yaml`, or `.yml`. Each entry is
+  capped at `MAX_SOURCE_BYTES`, and the aggregate scan at
+  `MAX_SOURCE_BYTES × MAX_RESULTS`; binary and unsupported entries are skipped.
 - `search_source` – searches Java/Kotlin sources from local source artifacts by
   substring or regular expression, with line numbers and bounded context.
 - `get_declaration_source` – returns a focused source excerpt for a class, field,
