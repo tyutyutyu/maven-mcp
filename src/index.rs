@@ -2879,7 +2879,7 @@ mod tests {
         let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 61);
-        push_u16(&mut bytes, 19);
+        push_u16(&mut bytes, 20);
         push_utf8(&mut bytes, class_name); // #1
         push_class(&mut bytes, 1); // #2
         push_utf8(&mut bytes, "java/lang/Object"); // #3
@@ -2898,6 +2898,7 @@ mod tests {
         push_utf8(&mut bytes, "RuntimeVisibleAnnotations"); // #16
         push_utf8(&mut bytes, "Ljava/lang/Deprecated;"); // #17
         push_utf8(&mut bytes, "secret"); // #18
+        push_utf8(&mut bytes, "(I)Ljava/lang/String;"); // #19
 
         push_u16(&mut bytes, 0x0421); // public, super, abstract
         push_u16(&mut bytes, 2);
@@ -2920,7 +2921,7 @@ mod tests {
         push_u16(&mut bytes, 12);
         push_u16(&mut bytes, 0);
 
-        push_u16(&mut bytes, 3); // methods
+        push_u16(&mut bytes, 4); // methods
         push_u16(&mut bytes, 0x0001); // public constructor
         push_u16(&mut bytes, 7);
         push_u16(&mut bytes, 8);
@@ -2936,6 +2937,10 @@ mod tests {
         push_u32(&mut bytes, 6);
         push_u16(&mut bytes, 1);
         push_u16(&mut bytes, 17);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0x0401); // overloaded public abstract method
+        push_u16(&mut bytes, 9);
+        push_u16(&mut bytes, 19);
         push_u16(&mut bytes, 0);
         push_u16(&mut bytes, 0x0002); // private method
         push_u16(&mut bytes, 18);
@@ -3282,10 +3287,15 @@ mod tests {
         );
         assert_eq!(public[0].annotations, vec!["java.lang.Deprecated"]);
         assert_eq!(public[0].constructors.len(), 1);
-        assert_eq!(public[0].methods.len(), 1);
-        assert_eq!(public[0].methods[0].name, "greet");
+        assert_eq!(public[0].methods.len(), 2);
+        let generic_method = public[0]
+            .methods
+            .iter()
+            .find(|method| method.generic_signature.is_some())
+            .unwrap();
+        assert_eq!(generic_method.name, "greet");
         assert_eq!(
-            public[0].methods[0].generic_signature.as_deref(),
+            generic_method.generic_signature.as_deref(),
             Some("(TT;)TT;")
         );
         assert_eq!(public[0].fields.len(), 1);
@@ -3302,7 +3312,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(all[0].methods.len(), 2);
+        assert_eq!(all[0].methods.len(), 3);
         assert_eq!(all[0].fields.len(), 2);
         assert!(
             index
@@ -3413,10 +3423,22 @@ mod tests {
         let index = build_index(&root, 10, 64 * 1024);
 
         let methods = index.search_class_members("GREET", None, None);
-        assert_eq!(methods.len(), 2);
+        assert_eq!(methods.len(), 4);
         assert_eq!(methods[0].kind, ClassMemberMatchKind::Method);
         assert_eq!(methods[0].jar.artifact_id, "first");
-        assert_eq!(methods[1].jar.artifact_id, "second");
+        assert_eq!(methods[1].jar.artifact_id, "first");
+        assert_eq!(methods[2].jar.artifact_id, "second");
+        assert_eq!(methods[3].jar.artifact_id, "second");
+        assert_eq!(
+            methods
+                .iter()
+                .map(|method| method.signature.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "(I)Ljava/lang/String;",
+                "(Ljava/lang/String;)Ljava/lang/String;"
+            ])
+        );
         let fields = index.search_class_members("value", Some("first-1.0.jar"), None);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].kind, ClassMemberMatchKind::Field);
@@ -3428,6 +3450,44 @@ mod tests {
                 .all(|item| item.kind == ClassMemberMatchKind::Annotation)
         );
         assert!(index.search_class_members("missing", None, None).is_empty());
+    }
+
+    #[test]
+    fn searches_members_with_inherited_name_collisions() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("org/example/base/1.0/base-1.0.jar");
+        let child = root.path().join("org/example/child/1.0/child-1.0.jar");
+        let base_class = inspection_class("org/example/Base");
+        let mut child_class = inspection_class("org/example/Child");
+        replace_ascii(&mut child_class, b"java/lang/Object", b"org/example/Base");
+        write_jar(&base, &[("org/example/Base.class", &base_class)]);
+        write_jar(&child, &[("org/example/Child.class", &child_class)]);
+        let index = build_index(&root, 10, 64 * 1024);
+
+        let child_description = index
+            .describe_class("org.example.Child", Some("child-1.0.jar"), None, true)
+            .unwrap();
+        assert_eq!(
+            child_description[0].super_class.as_deref(),
+            Some("org.example.Base")
+        );
+
+        let matches = index.search_class_members("greet", None, None);
+        assert_eq!(matches.len(), 4);
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|item| item.class_name == "org.example.Base")
+                .count(),
+            2
+        );
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|item| item.class_name == "org.example.Child")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -3451,6 +3511,7 @@ mod tests {
             b"java/io/Serializable",
             b"java/lang/Comparable",
         );
+        replace_ascii(&mut common_v2, b"greet", b"other");
         replace_ascii(&mut common_v2, b"value", b"other");
         let new_only = inspection_class("org/example/NewOnly");
         write_jar(
@@ -3472,11 +3533,19 @@ mod tests {
         assert_eq!(changed.class_name, "org.example.Common");
         assert_eq!(
             changed.added_members,
-            vec!["field:other:Ljava/lang/String;"]
+            vec![
+                "field:other:Ljava/lang/String;",
+                "method:other(I)Ljava/lang/String;",
+                "method:other(Ljava/lang/String;)Ljava/lang/String;"
+            ]
         );
         assert_eq!(
             changed.removed_members,
-            vec!["field:value:Ljava/lang/String;"]
+            vec![
+                "field:value:Ljava/lang/String;",
+                "method:greet(I)Ljava/lang/String;",
+                "method:greet(Ljava/lang/String;)Ljava/lang/String;"
+            ]
         );
         assert_eq!(
             changed.previous_super_class.as_deref(),
@@ -3549,6 +3618,38 @@ mod tests {
                 .results
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn searches_spring_auto_configuration_descriptors_as_text_resources() {
+        let root = TempDir::new().unwrap();
+        let jar = root.path().join("org/example/demo/1.0/demo-1.0.jar");
+        write_jar(
+            &jar,
+            &[
+                (
+                    "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports",
+                    b"org.example.AutoConfiguration\n",
+                ),
+                (
+                    "META-INF/spring.factories",
+                    b"org.springframework.boot.autoconfigure.EnableAutoConfiguration=org.example.LegacyFactory\n",
+                ),
+            ],
+        );
+        let index = build_index(&root, 10, 4096);
+
+        let imports = index
+            .search_jar_content("org.example.AutoConfiguration", None, None)
+            .unwrap();
+        assert_eq!(imports.results.len(), 1);
+        assert!(imports.results[0].entry.ends_with(".imports"));
+
+        let factories = index
+            .search_jar_content("org.example.LegacyFactory", None, None)
+            .unwrap();
+        assert_eq!(factories.results.len(), 1);
+        assert_eq!(factories.results[0].entry, "META-INF/spring.factories");
     }
 
     #[test]
