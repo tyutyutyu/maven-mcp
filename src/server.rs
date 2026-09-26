@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    env,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -484,6 +485,32 @@ impl MavenMcpServer {
         Ok(index)
     }
 
+    fn artifact_repository_for(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
+        self.runner_for(project_path)?;
+        let repository = match &self.config.execution.execution_repository {
+            Some(repository) => repository.clone(),
+            None => PathBuf::from(env::var_os("HOME").ok_or_else(|| {
+                ErrorData::invalid_params("HOME is required to locate the Maven repository", None)
+            })?)
+            .join(".m2/repository"),
+        };
+        if repository.exists() {
+            repository.canonicalize().map_err(|error| {
+                ErrorData::invalid_params(
+                    format!("cannot access local Maven repository: {error}"),
+                    None,
+                )
+            })
+        } else if self.config.execution.execution_repository.is_some() {
+            Err(ErrorData::invalid_params(
+                "MAVEN_EXECUTION_REPO_PATH must name an existing directory",
+                None,
+            ))
+        } else {
+            Ok(repository)
+        }
+    }
+
     fn cached_index(&self, root: &PathBuf) -> Result<Option<Arc<MavenIndex>>, ErrorData> {
         let result = self
             .indexes
@@ -753,9 +780,8 @@ impl MavenMcpServer {
     ) -> Result<Json<PomDescriptorLookup>, ErrorData> {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        self.index_for(&request.project_path)
-            .await?
-            .pom_descriptor(&request.coordinate)
+        let repository = self.artifact_repository_for(&request.project_path)?;
+        MavenIndex::pom_descriptor_at(&repository, &request.coordinate)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
@@ -789,9 +815,8 @@ impl MavenMcpServer {
     ) -> Result<Json<ArtifactHealth>, ErrorData> {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
-        self.index_for(&request.project_path)
-            .await?
-            .artifact_health(&request.coordinate)
+        let repository = self.artifact_repository_for(&request.project_path)?;
+        MavenIndex::artifact_health_at(&repository, &request.coordinate)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }

@@ -783,10 +783,13 @@ impl MavenIndex {
     }
 
     pub fn pom_descriptor(&self, coordinate: &str) -> Result<PomDescriptorLookup> {
+        Self::pom_descriptor_at(&self.root, coordinate)
+    }
+
+    pub fn pom_descriptor_at(root: &Path, coordinate: &str) -> Result<PomDescriptorLookup> {
         let key = parse_exact_coordinate(coordinate)?;
         let coordinate = format!("{}:{}:{}", key.group_id, key.artifact_id, key.version);
-        let path = self
-            .root
+        let path = root
             .join(key.group_id.replace('.', "/"))
             .join(&key.artifact_id)
             .join(&key.version)
@@ -844,10 +847,13 @@ impl MavenIndex {
     }
 
     pub fn artifact_health(&self, coordinate: &str) -> Result<ArtifactHealth> {
+        Self::artifact_health_at(&self.root, coordinate)
+    }
+
+    pub fn artifact_health_at(root: &Path, coordinate: &str) -> Result<ArtifactHealth> {
         let key = parse_exact_coordinate(coordinate)?;
         let coordinate = format!("{}:{}:{}", key.group_id, key.artifact_id, key.version);
-        let directory = self
-            .root
+        let directory = root
             .join(key.group_id.replace('.', "/"))
             .join(&key.artifact_id)
             .join(&key.version);

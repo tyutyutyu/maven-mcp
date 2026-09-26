@@ -177,6 +177,112 @@ printf '%s\n' 'Dependencies classpath:' "$PWD/execution-repository/org/libs/help
 }
 
 #[tokio::test]
+async fn exact_artifact_lookups_work_when_reactor_classpath_fails() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap();
+    let wrapper = project_path.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' '[ERROR] missing reactor sibling'\nexit 1\n",
+    )?;
+    let mut permissions = wrapper.metadata()?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)?;
+
+    let client = server.connect().await?;
+    let project_path = project_path.display().to_string();
+    let pom = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_artifact_pom").with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:helper:2.0"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(pom["found"], true);
+    assert_eq!(pom["descriptor"]["packaging"], "jar");
+
+    let health = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("diagnose_artifact").with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:helper:2.0"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(health["found"], true);
+    assert!(
+        health["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    );
+
+    let missing = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("diagnose_artifact").with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:absent:2.0"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(missing["found"], false);
+
+    let missing_pom = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_artifact_pom").with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:absent:2.0"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(missing_pom["found"], false);
+
+    for tool in ["get_artifact_pom", "diagnose_artifact"] {
+        client
+            .call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:../helper:2.0"
+                }))),
+            )
+            .await
+            .expect_err("invalid coordinate must be rejected");
+    }
+
+    let untrusted_project = tempfile::TempDir::new()?;
+    std::fs::write(untrusted_project.path().join("pom.xml"), "<project/>")?;
+    for tool in ["get_artifact_pom", "diagnose_artifact"] {
+        let error = client
+            .call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments(json!({
+                    "project_path": untrusted_project.path().display().to_string(),
+                    "coordinate": "org.libs:helper:2.0"
+                }))),
+            )
+            .await
+            .expect_err("untrusted project must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+        );
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_index_aggregates_classpaths_from_later_reactor_modules() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
