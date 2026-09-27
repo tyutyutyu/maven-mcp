@@ -1,0 +1,37 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "annotations": [],
+      "class_file_version": 61,
+      "class_name": "org.libs.ScopedOnly",
+      "constructors": [],
+      "fields": [
+        {
+          "annotations": [],
+          "descriptor": "I",
+          "modifiers": [],
+          "name": "value",
+          "visibility": "public"
+        }
+      ],
+      "interfaces": [],
+      "jar": {
+        "artifact_id": "helper",
+        "class_count": 2,
+        "coordinate": "org.libs:helper:2.0",
+        "entry_count": 2,
+        "group_id": "org.libs",
+        "path": "org/libs/helper/2.0/helper-2.0.jar",
+        "version": "2.0"
+      },
+      "methods": [],
+      "modifiers": [],
+      "super_class": "java.lang.Object",
+      "visibility": "public"
+    }
+  ]
+}

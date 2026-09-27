@@ -1,6 +1,11 @@
 mod support;
 
-use std::{fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use rmcp::model::CallToolRequestParams;
@@ -44,13 +49,17 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     ensure!(!catalog.scenarios.is_empty(), "scenario catalog is empty");
     ensure_unique_ids(&catalog.scenarios)?;
 
-    let server = TestServer::start_with_project().await?;
+    let server = TestServer::start_with_repository_inspection_project().await?;
     let project_path = server
         .project_path()
         .context("scenario fixture must include a Maven project")?
         .display()
         .to_string();
     let client = server.connect().await?;
+    let project_root = server
+        .project_path()
+        .context("scenario fixture must include a Maven project")?;
+    let project_files_before = snapshot_file_tree(project_root)?;
     let mut executions = Vec::with_capacity(catalog.scenarios.len());
 
     for scenario in catalog.scenarios {
@@ -86,6 +95,11 @@ async fn documented_mcp_search_scenarios_match_snapshots() -> Result<()> {
     }
 
     client.cancel().await?;
+    let project_files_after = snapshot_file_tree(project_root)?;
+    ensure!(
+        project_files_before == project_files_after,
+        "repository inspection changed a project or Maven repository file"
+    );
     write_markdown_report(&executions)?;
 
     let semantic_failures = executions
@@ -127,6 +141,70 @@ fn ensure_unique_ids(scenarios: &[Scenario]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TreeEntry {
+    Directory(TreeMetadata),
+    File {
+        metadata: TreeMetadata,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeMetadata {
+    mode: u32,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn tree_metadata(metadata: &fs::Metadata) -> TreeMetadata {
+    TreeMetadata {
+        mode: metadata.mode(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+fn snapshot_file_tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        entries: &mut BTreeMap<PathBuf, TreeEntry>,
+    ) -> Result<()> {
+        let mut children = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let relative = path
+                .strip_prefix(root)
+                .context("project file must remain beneath the project root")?
+                .to_owned();
+            let metadata = child.metadata()?;
+            if metadata.is_dir() {
+                entries.insert(relative, TreeEntry::Directory(tree_metadata(&metadata)));
+                visit(root, &path, entries)?;
+            } else if metadata.is_file() {
+                entries.insert(
+                    relative,
+                    TreeEntry::File {
+                        metadata: tree_metadata(&metadata),
+                        bytes: fs::read(path)?,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        PathBuf::new(),
+        TreeEntry::Directory(tree_metadata(&fs::metadata(root)?)),
+    );
+    visit(root, root, &mut entries)?;
+    Ok(entries)
 }
 
 fn validate_expectations(expect: &Expectations, actual: &Value) -> Vec<String> {

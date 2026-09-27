@@ -31,11 +31,11 @@ The server exposes the following MCP tools:
 - `get_jar_entry` – reads one exact entry from one exactly selected JAR;
   distinguishes UTF-8 text from binary bytes and reports size and truncation.
 - `get_artifact_pom` – returns parent, packaging, properties, dependencies,
-  dependency management, and BOM imports from the POM of an exact Maven
-  coordinate.
+  dependency management, and BOM imports from the local POM of an exact Maven
+  coordinate, without resolving the project classpath.
 - `diagnose_artifact` – summarizes the POM, binary, classifier, checksum,
   `.lastUpdated`, repository, and corrupt-JAR state of a local artifact without
-  exposing absolute paths.
+  resolving the project classpath or exposing absolute paths.
 - `search_class_members` – searches classfile metadata by method, field, or
   annotation name, with an optional JAR filter.
 - `search_type_hierarchy` – finds direct or transitive implementations and
@@ -47,9 +47,11 @@ The server exposes the following MCP tools:
 - `compare_artifact_api` – compares the public/protected API of two local
   versions of the same artifact at class, member, superclass, and interface
   levels.
-- `search_jar_content` – searches supported UTF-8 JAR resources with bounded
-  context; binary, oversized, and unsupported entries are not interpreted as
-  text.
+- `search_jar_content` – searches manifests, `META-INF/services/*`, and UTF-8
+  entries ending in `.conf`, `.config`, `.factories`, `.imports`, `.json`,
+  `.list`, `.properties`, `.txt`, `.xml`, `.yaml`, or `.yml`. Each entry is
+  capped at `MAX_SOURCE_BYTES`, and the aggregate scan at
+  `MAX_SOURCE_BYTES × MAX_RESULTS`; binary and unsupported entries are skipped.
 - `search_source` – searches Java/Kotlin sources from local source artifacts by
   substring or regular expression, with line numbers and bounded context.
 - `get_declaration_source` – returns a focused source excerpt for a class, field,
@@ -82,9 +84,14 @@ List-like tools use an MCP-compatible structured root object:
 `{ "results": [...] }`.
 
 Repository inspection tools are read-only: they do not extract files or modify
-Maven metadata. The first repository-search request for a project asks Maven for
-the effective test classpath, builds a lazy index only from those local JARs and
-their sibling `-sources.jar` files, and caches that index by canonical
+Maven metadata. `get_artifact_pom` and `diagnose_artifact` read an exact coordinate
+directly from the local Maven repository and work even when another reactor
+module's dependency cannot be resolved. They use `MAVEN_EXECUTION_REPO_PATH` when
+set, otherwise `$HOME/.m2/repository`. Set `MAVEN_EXECUTION_REPO_PATH` to the
+same local repository configured in Maven settings when it differs from the
+default. Other repository-search tools ask Maven for
+the effective test classpath, build a lazy index only from those local JARs and
+their sibling `-sources.jar` files, and cache that index by canonical
 `project_path`. For a multi-module reactor, classpath sections from every module
 are aggregated; empty parent or aggregator POM sections do not hide dependencies
 reported by later modules. Artifacts present elsewhere in the same local Maven
@@ -245,7 +252,7 @@ existing inherited `JAVA_HOME` and `PATH` behavior is unchanged.
 | `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots retained in the in-process project-index cache. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
-| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for request-scoped Maven execution. |
+| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for request-scoped Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. |
 | `MAVEN_EXECUTION_NETWORK` | `false` | When `true`, `--offline` is not added to Maven commands. |
 | `MAVEN_TIMEOUT_SECONDS` | `300` | Maximum runtime of one Maven child process. |
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |

@@ -1,0 +1,24 @@
+---
+source: tests/mcp_scenarios.rs
+expression: execution.response
+---
+{
+  "results": [
+    {
+      "content_kind": "text",
+      "entry": "META-INF/services/org.example.Service",
+      "jar": {
+        "artifact_id": "resource-fixture",
+        "class_count": 0,
+        "coordinate": "org.libs:resource-fixture:1.0",
+        "entry_count": 3,
+        "group_id": "org.libs",
+        "path": "org/libs/resource-fixture/1.0/resource-fixture-1.0.jar",
+        "version": "1.0"
+      },
+      "original_size": 21,
+      "text": "org.example.Provider\n",
+      "truncated": false
+    }
+  ]
+}

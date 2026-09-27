@@ -38,15 +38,23 @@ impl TestServer {
 
     #[allow(dead_code)]
     pub async fn start_with_project() -> Result<Self> {
+        Self::start_with_project_fixture(false).await
+    }
+
+    pub async fn start_with_repository_inspection_project() -> Result<Self> {
+        Self::start_with_project_fixture(true).await
+    }
+
+    async fn start_with_project_fixture(include_inspection_fixtures: bool) -> Result<Self> {
         let repository = fixture_repository()?;
         let trusted_project_directory = TempDir::new()?;
         let project_path = trusted_project_directory
             .path()
             .join("nested/projects/fixture-project");
-        fixture_project(&project_path)?;
+        fixture_project(&project_path, include_inspection_fixtures)?;
         let execution_repository = project_path.join("execution-repository");
         std::fs::create_dir(&execution_repository)?;
-        fixture_execution_repository(&execution_repository)?;
+        fixture_execution_repository(&execution_repository, include_inspection_fixtures)?;
         Ok(Self {
             repository,
             trusted_project_directory: Some(trusted_project_directory),
@@ -150,9 +158,9 @@ impl TestServer {
             .as_ref()
             .context("test server has no trusted project directory")?;
         let project_path = trusted_directory.path().join("additional").join(name);
-        fixture_project(&project_path)?;
+        fixture_project(&project_path, false)?;
         std::fs::create_dir(project_path.join("execution-repository"))?;
-        fixture_execution_repository(&project_path.join("execution-repository"))?;
+        fixture_execution_repository(&project_path.join("execution-repository"), false)?;
         Ok(project_path)
     }
 
@@ -211,7 +219,7 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
 }
 
 #[allow(dead_code)]
-fn fixture_project(root: &Path) -> Result<()> {
+fn fixture_project(root: &Path, include_inspection_fixtures: bool) -> Result<()> {
     std::fs::create_dir_all(root)?;
     std::fs::write(
         root.join("pom.xml"),
@@ -238,11 +246,20 @@ done
 case " $* " in
   *" help:effective-pom "*) printf '%s' '<project><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>jar</packaging></project>' > "$output" ;;
   *" dependency:tree "*) printf '%s\n' '[INFO] org.example:fixture-project:jar:1.0' '[INFO] \- org.libs:helper:jar:compile:2.0' ;;
-  *" dependency:build-classpath "*) printf '%s\n' 'Dependencies classpath:' "$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar" ;;
+  *" dependency:build-classpath "*)
+    classpath="$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar"
+    if [ -f .repository-inspection-fixture ]; then
+      classpath="$classpath:$PWD/execution-repository/org/libs/api-fixture/1.0/api-fixture-1.0.jar:$PWD/execution-repository/org/libs/api-fixture/2.0/api-fixture-2.0.jar:$PWD/execution-repository/org/libs/resource-fixture/1.0/resource-fixture-1.0.jar"
+    fi
+    printf '%s\n' 'Dependencies classpath:' "$classpath"
+    ;;
   *) printf '%s\n' '[INFO] BUILD SUCCESS' ;;
 esac
 "#,
     )?;
+    if include_inspection_fixtures {
+        std::fs::write(root.join(".repository-inspection-fixture"), "enabled\n")?;
+    }
     let mut permissions = wrapper.metadata()?.permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions)?;
@@ -330,7 +347,7 @@ fn fixture_repository() -> Result<TempDir> {
     Ok(root)
 }
 
-fn fixture_execution_repository(root: &Path) -> Result<()> {
+fn fixture_execution_repository(root: &Path, include_inspection_fixtures: bool) -> Result<()> {
     let version = root.join("org/libs/helper/2.0");
     let fixture_class = minimal_class("org/example/Foo");
     let scoped_only = minimal_class("org/libs/ScopedOnly");
@@ -355,6 +372,62 @@ fn fixture_execution_repository(root: &Path) -> Result<()> {
             <groupId>org.libs</groupId><artifactId>helper</artifactId><version>2.0</version>
         </project>"#,
     )?;
+    if !include_inspection_fixtures {
+        return Ok(());
+    }
+
+    let resource_version = root.join("org/libs/resource-fixture/1.0");
+    write_jar(
+        &resource_version.join("resource-fixture-1.0.jar"),
+        &[
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\nImplementation-Title: resource-fixture\n",
+            ),
+            (
+                "META-INF/services/org.example.Service",
+                b"org.example.Provider\n",
+            ),
+            (
+                "config/inspection.properties",
+                b"feature.provider=org.example.Provider\n",
+            ),
+        ],
+    )?;
+    std::fs::write(
+        resource_version.join("resource-fixture-1.0.pom"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.libs</groupId><artifactId>resource-fixture</artifactId><version>1.0</version><packaging>jar</packaging></project>",
+    )?;
+    std::fs::write(
+        resource_version.join("resource-fixture-1.0.jar.sha1"),
+        "fixture-checksum",
+    )?;
+    std::fs::write(
+        resource_version.join("resource-fixture-1.0.jar.lastUpdated"),
+        "lookup=fixture\n",
+    )?;
+    std::fs::write(
+        resource_version.join("_remote.repositories"),
+        "resource-fixture-1.0.jar>central=\n",
+    )?;
+
+    for (artifact_version, class_path, class_name) in [
+        ("1.0", "org/example/api/LegacyApi.class", "LegacyApi"),
+        ("2.0", "org/example/api/CurrentApi.class", "CurrentApi"),
+    ] {
+        let artifact_directory = root.join(format!("org/libs/api-fixture/{artifact_version}"));
+        let class_file = minimal_class(&format!("org/example/api/{class_name}"));
+        write_jar(
+            &artifact_directory.join(format!("api-fixture-{artifact_version}.jar")),
+            &[(class_path, &class_file)],
+        )?;
+        std::fs::write(
+            artifact_directory.join(format!("api-fixture-{artifact_version}.pom")),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>org.libs</groupId><artifactId>api-fixture</artifactId><version>{artifact_version}</version><packaging>jar</packaging></project>"
+            ),
+        )?;
+    }
     Ok(())
 }
 
