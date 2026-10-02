@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use maven_mcp::log_analysis::{
-    CommandCategory, CommandEvent, EventFilter, LogSource, discover_default_sources, filter_events,
-    read_events, redact_events,
+    CommandCategory, CommandEvent, EventFilter, LogSource, deduplicate_events,
+    discover_default_sources, filter_events, normalize_timestamp, read_event_log, redact_events,
+    sort_events, source_paths,
 };
 use serde::Serialize;
-use walkdir::WalkDir;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,7 +21,10 @@ struct Cli {
     /// Discover common VS Code, Codex, Kilo Code, and IntelliJ storage roots.
     #[arg(long)]
     discover: bool,
-    /// Explicit source format; auto infers it from each filename.
+    /// Keep mirrored/progressive records instead of deduplicating call identities.
+    #[arg(long)]
+    keep_duplicates: bool,
+    /// Explicit source format; auto infers it from the file and parent directory.
     #[arg(long, value_enum, default_value_t = SourceArg::Auto)]
     source: SourceArg,
     /// Output format.
@@ -115,6 +118,8 @@ impl From<CategoryArg> for CommandCategory {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum GroupBy {
+    Day,
+    Month,
     Ide,
     Agent,
     Project,
@@ -131,35 +136,53 @@ struct GroupCount {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = collect_paths(&cli)?;
+    if cli
+        .output
+        .as_ref()
+        .and_then(|p| p.canonicalize().ok())
+        .is_some_and(|p| paths.contains(&p))
+    {
+        bail!("output must not overwrite an input log");
+    }
     let mut events = Vec::new();
-    let explicit_source = LogSource::from(cli.source);
+    let mut failed_files = 0;
+    let mut skipped_records = 0;
     for path in paths {
-        match read_events(&path, explicit_source) {
-            Ok(mut parsed) => events.append(&mut parsed),
-            Err(error) if matches!(cli.source, SourceArg::Auto) => {
-                eprintln!("skipping {}: {error}", path.display());
+        match read_event_log(&path, cli.source.into()) {
+            Ok(mut parsed) => {
+                events.append(&mut parsed.events);
+                skipped_records += parsed.skipped_records;
             }
-            Err(error) => return Err(error).with_context(|| path.display().to_string()),
+            Err(_) => {
+                failed_files += 1;
+            }
         }
     }
-    events.sort_by(|left, right| {
-        (&left.timestamp, &left.ide, &left.session, &left.command).cmp(&(
-            &right.timestamp,
-            &right.ide,
-            &right.session,
-            &right.command,
-        ))
-    });
-    events.dedup_by(|left, right| {
-        left.ide == right.ide
-            && left.session == right.session
-            && left.tool == right.tool
-            && left.cwd == right.cwd
-            && left.command == right.command
-    });
+    if failed_files > 0 || skipped_records > 0 {
+        eprintln!(
+            "Skipped {failed_files} unreadable/unsupported files and {skipped_records} malformed/incomplete records; report may be partial."
+        );
+        if events.is_empty() {
+            bail!("no command records could be recovered from the incomplete input");
+        }
+    }
+    if cli.keep_duplicates {
+        sort_events(&mut events);
+    } else {
+        events = deduplicate_events(events);
+    }
+    let since = time_bound(cli.since.as_deref(), false)?;
+    let until = time_bound(cli.until.as_deref(), true)?;
+    if since
+        .as_ref()
+        .zip(until.as_ref())
+        .is_some_and(|(s, u)| s > u)
+    {
+        bail!("--since must not be later than --until");
+    }
     let filter = EventFilter {
-        since: cli.since,
-        until: cli.until,
+        since,
+        until,
         ide: cli.ide,
         agent: cli.agent,
         project: cli.project,
@@ -167,17 +190,18 @@ fn main() -> Result<()> {
         category: cli.category.map(Into::into),
     };
     let mut events = filter_events(events, &filter);
+    let raw_events = events.clone();
     if !cli.unsafe_no_redact {
         redact_events(&mut events, cli.workspace.as_deref(), &cli.redact_patterns);
     }
     let report = if let Some(group_by) = cli.group_by {
-        render_groups(&group_events(&events, group_by), cli.format)?
+        render_groups(&group_events(&raw_events, &events, group_by), cli.format)?
     } else {
         render_events(&events, cli.format)?
     };
     if let Some(output) = cli.output {
         std::fs::write(&output, report)
-            .with_context(|| format!("cannot write {}", output.display()))?;
+            .map_err(|_| anyhow::anyhow!("cannot write output report"))?;
     } else {
         print!("{report}");
     }
@@ -189,61 +213,77 @@ fn collect_paths(cli: &Cli) -> Result<Vec<PathBuf>> {
     if cli.discover {
         roots.extend(discover_default_sources());
     }
-    if roots.is_empty() {
-        bail!("provide at least one PATH or use --discover")
+    if roots.is_empty() && !cli.discover {
+        bail!("provide at least one PATH or use --discover");
     }
-    let mut paths = Vec::new();
-    for root in roots {
-        if root.is_file() {
-            paths.push(root);
-        } else if root.is_dir() {
-            for entry in WalkDir::new(root).follow_links(false) {
-                let entry = entry?;
-                if entry.file_type().is_file() && supported_file(entry.path()) {
-                    paths.push(entry.into_path());
-                }
-            }
-        } else {
-            bail!("input path does not exist: {}", root.display())
+    source_paths(&roots).map_err(|_| anyhow::anyhow!("cannot read input path or directory"))
+}
+
+fn time_bound(value: Option<&str>, upper: bool) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            let value = if upper && value.len() == 10 {
+                format!("{value}T23:59:59.999Z")
+            } else {
+                value.to_owned()
+            };
+            normalize_timestamp(&value).ok_or_else(|| {
+                anyhow::anyhow!("time filters require YYYY-MM-DD or an ISO 8601 timestamp")
+            })
+        })
+        .transpose()
+}
+
+fn group_key(event: &CommandEvent, group_by: GroupBy) -> String {
+    match group_by {
+        GroupBy::Day => event
+            .timestamp
+            .as_ref()
+            .and_then(|s| s.get(..10))
+            .map(str::to_owned),
+        GroupBy::Month => event
+            .timestamp
+            .as_ref()
+            .and_then(|s| s.get(..7))
+            .map(str::to_owned),
+        GroupBy::Ide => Some(event.ide.clone()),
+        GroupBy::Agent => event.agent.clone(),
+        GroupBy::Project => event.project.clone(),
+        GroupBy::Session => event.session.clone(),
+        GroupBy::Category => Some(event.category.as_str().to_owned()),
+    }
+    .unwrap_or_else(|| "<unknown>".to_owned())
+}
+
+fn group_events(
+    raw: &[CommandEvent],
+    redacted: &[CommandEvent],
+    group_by: GroupBy,
+) -> Vec<GroupCount> {
+    let mut counts = BTreeMap::new();
+    for (original, event) in raw.iter().zip(redacted) {
+        let group = counts
+            .entry(group_key(original, group_by))
+            .or_insert_with(|| GroupCount {
+                group: group_key(event, group_by),
+                count: 0,
+            });
+        group.count += 1;
+    }
+    let mut groups: Vec<GroupCount> = counts.into_values().collect();
+    let mut occurrences = BTreeMap::new();
+    for group in &groups {
+        *occurrences.entry(group.group.clone()).or_insert(0) += 1;
+    }
+    let mut seen = BTreeMap::new();
+    for group in &mut groups {
+        if occurrences[&group.group] > 1 {
+            let index = seen.entry(group.group.clone()).or_insert(0);
+            *index += 1;
+            group.group = format!("{} [{}]", group.group, index);
         }
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-fn supported_file(path: &std::path::Path) -> bool {
-    matches!(
-        path.extension().and_then(|value| value.to_str()),
-        Some("json" | "jsonl" | "db" | "sqlite" | "sqlite3" | "log" | "txt")
-    )
-}
-
-fn group_events(events: &[CommandEvent], group_by: GroupBy) -> Vec<GroupCount> {
-    let mut counts = BTreeMap::new();
-    for event in events {
-        let group = match group_by {
-            GroupBy::Ide => event.ide.clone(),
-            GroupBy::Agent => event
-                .agent
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_owned()),
-            GroupBy::Project => event
-                .project
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_owned()),
-            GroupBy::Session => event
-                .session
-                .clone()
-                .unwrap_or_else(|| "<unknown>".to_owned()),
-            GroupBy::Category => format!("{:?}", event.category).to_ascii_lowercase(),
-        };
-        *counts.entry(group).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .map(|(group, count)| GroupCount { group, count })
-        .collect()
+    groups
 }
 
 fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String> {
@@ -254,7 +294,7 @@ fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String
                 format!(
                     "{} {:<17} {:<20} {}\n",
                     event.timestamp.as_deref().unwrap_or("-"),
-                    format!("{:?}", event.category).to_ascii_lowercase(),
+                    event.category.as_str(),
                     event.ide,
                     event.command
                 )
@@ -271,7 +311,8 @@ fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String
         }
         OutputFormat::Csv => {
             let mut output =
-                "timestamp,ide,agent,project,session,tool,cwd,category,command\n".to_owned();
+                "timestamp,ide,agent,project,session,tool,cwd,category,command,call_id,maven\n"
+                    .to_owned();
             for event in events {
                 output.push_str(
                     &[
@@ -282,8 +323,15 @@ fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String
                         event.session.as_deref().unwrap_or(""),
                         &event.tool,
                         event.cwd.as_deref().unwrap_or(""),
-                        &format!("{:?}", event.category).to_ascii_lowercase(),
+                        event.category.as_str(),
                         &event.command,
+                        event.call_id.as_deref().unwrap_or(""),
+                        &event
+                            .maven
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?
+                            .unwrap_or_default(),
                     ]
                     .into_iter()
                     .map(csv_field)
@@ -299,10 +347,10 @@ fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String
                 "| Time | IDE | Category | Command |\n| --- | --- | --- | --- |\n".to_owned();
             for event in events {
                 output.push_str(&format!(
-                    "| {} | {} | {:?} | `{}` |\n",
+                    "| {} | {} | {} | {} |\n",
                     markdown(event.timestamp.as_deref().unwrap_or("-")),
                     markdown(&event.ide),
-                    event.category,
+                    event.category.as_str(),
                     markdown(&event.command)
                 ));
             }
@@ -353,7 +401,10 @@ fn csv_field(value: &str) -> String {
 
 fn markdown(value: &str) -> String {
     value
-        .replace('|', "\\|")
-        .replace('\n', " ")
-        .replace('`', "\\`")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('|', "&#124;")
+        .replace(['\n', '\r'], " ")
+        .replace('`', "&#96;")
 }

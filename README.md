@@ -282,34 +282,102 @@ cargo run --locked --bin maven-agent-log -- --discover --format terminal
 ```
 
 Supported explicit `--source` values are `vs-code`, `vs-code-insiders`, `codex`,
-`kilo`, `intelli-j`, and `auto`. `auto` treats `.json` as a VS Code/Copilot chat
-session, `.jsonl` as a Codex session, `.db`/`.sqlite` as a Kilo Code database,
-and `.log`/`.txt` as an IntelliJ log. Kilo databases are opened only through a
-read-only SQLite connection; tables from different Kilo versions are inspected
-schema-tolerantly through textual payload columns. The IntelliJ parser accepts
-only explicit `Executing command:`, `Terminal command:`, and `Shell command:` log
-events.
+`kilo`, `intelli-j`, and `auto`. Files and directories can be mixed; directories
+are searched recursively without following symlinks. Inputs are read locally;
+the analyzer never executes an extracted command or sends logs to a service.
 
-A normalized event contains the timestamp, IDE, agent, project, session, tool
-name, working directory, command, category, and—for Maven—structured goal,
-module, reactor, test, profile, and property data. It recognizes `mvn`, `mvnw`,
-`mvnw.cmd`, and `mvnd`, as well as repository inspection based on `find`, `jar`,
-`unzip`, `javap`, `grep`, and `rg`. Repeated progressive log entries with the
-same session/tool/cwd/command are deduplicated.
+| Source | Recognized records and discovery roots |
+| --- | --- |
+| VS Code / Insiders / GitHub Copilot | JSON chat sessions with `requests[].response[]` terminal tool invocations, `toolSpecificData.commandLine`, or tool input arguments. Parent session/request metadata and adjacent `workspace.json` provide context. Discovery checks `Code` and `Code - Insiders` under Linux configuration, macOS Application Support, and Windows APPDATA, including workspace storage and empty-window chat sessions. |
+| Codex | JSONL `session_meta`, `turn_context`, and `response_item` function calls; direct function calls and assistant tool-call arrays are also recognized. Discovery checks `$CODEX_HOME/sessions`, defaulting to `~/.codex/sessions`. |
+| Kilo Code | SQLite tool parts (`type: tool`, `tool`, `state.input`, `callID`), assistant tool-use payloads, and explicit shell-call records in JSON payload columns. Session/message rows supply project/session/agent metadata where available. Discovery checks `$XDG_DATA_HOME/kilo` (default `~/.local/share/kilo`) and the VS Code Kilo global-storage directory. Connections are read-only with SQLite `query_only` enabled; a bare database `command` column is never treated as execution evidence. |
+| IntelliJ | Timestamped INFO/DEBUG/TRACE lines whose message starts with `Executing command:`, `Terminal command:`, or `Shell command:`; the usual logger prefix is accepted. Plain `idea.log` and uncompressed rotations such as `idea.log.1` are supported. Discovery checks JetBrains cache/log roots under Linux XDG cache, macOS Library/Logs, and Windows LOCALAPPDATA. |
 
-Filters: `--since`, `--until`, `--ide`, `--agent`, `--project`, `--session`, and
-`--category`. Grouping: `--group-by ide|agent|project|session|category`. Output
-formats: `terminal`, `json`, `jsonl`, `csv`, and `markdown`; `--output` writes to
-a file.
+`auto` uses `.json` for VS Code (the parent path identifies Insiders), `.jsonl`
+for Codex, `.db`/`.sqlite`/`.sqlite3`/`.vscdb` for Kilo, and `.log`, `.txt`, or
+`.log.N` for IntelliJ. Use `--source` for a differently named file. Discovery is
+opt-in with `--discover`; custom/portable locations require explicit paths.
+Linux discovery honors `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME`.
 
-By default, the home directory, `--workspace`, the user-home pattern, URL
-credentials, password/token/secret/authorization/API-key values, and every
-repeated `--redact-pattern` are redacted. The CLI never copies the complete raw
-log into the report. Use `--unsafe-no-redact` only for deliberate local
-debugging. Automatic discovery locations depend on platform and IDE version; if
-a client uses a new or custom storage format, provide the file and source
-directly. Optional LLM summarization is intentionally disabled so extraction,
-classification, statistics, and reporting remain fully deterministic.
+A normalized event contains `timestamp`, `ide`, `agent`, `project`, `session`,
+`tool`, `cwd`, `command`, `category`, and an optional `call_id` and `maven` object.
+Unknown metadata is `null`; it is never inferred from the analyzer's current
+project. Timestamps are normalized to UTC with millisecond precision. Epoch
+seconds/milliseconds and ISO timestamps with offsets are supported; timezone-free
+IDE timestamps are interpreted as UTC. IntelliJ metadata is optional; a prefix
+such as `[agent=copilot project=/work/demo session=s1 cwd=/work/demo]` supplies it.
+
+Maven classification recognizes `mvn`, `mvnw`, `mvnd`, and their `.cmd` variants
+at shell command positions, including assignments, `env`, quoted arguments,
+command lists, descriptor/file redirections (such as `2>&1`), and pipelines. The first Maven invocation in each recorded call
+supplies lifecycle/plugin goals, `-pl`/`--projects`, `-am`, `-amd`, `-rf`, `-f`,
+`-P`/`--activate-profiles`, `-D`/`--define`, and `test`/`it.test` filters. Long,
+separate, and attached option values are supported. Repository classification
+recognizes `find`, `jar`, `unzip`, `javap`, `grep`, and `rg` with JAR, class, POM,
+or resource arguments. A plain source-code grep remains `shell`. Each call has
+one category, with Maven taking precedence.
+
+Deduplication spans all input files. Within an IDE/agent/project/session/tool,
+a call ID identifies progressive or mirrored records; the longest command and
+earliest known timestamp are retained. Without a call ID, only records with an
+identical timestamp, command, and working directory are merged. Without a
+session, identity is scoped to the input file, except that IntelliJ numeric
+rotations (`idea.log`, `idea.log.1`, etc.) in the same directory share an identity.
+Different directories, log basenames, and nonnumeric suffixes remain separate.
+Untimed calls without IDs remain separate. `--keep-duplicates` disables merging. Output order is deterministic.
+
+Filters are exact, case-insensitive matches for `--ide`, `--agent`, `--project`,
+and `--session`, plus `--category` and inclusive `--since`/`--until` time bounds.
+Filter values refer to original metadata, before redaction. Dates use
+`YYYY-MM-DD`; a date-only `--until` includes the entire day. A timestamp requires
+ISO 8601 syntax. Unknown timestamps are excluded when a time filter is active.
+Categories are `maven`, `jar-inspection`, `class-inspection`, `pom-inspection`,
+`resource-inspection`, and `shell` (serialized category names use underscores).
+
+```bash
+cargo run --locked --bin maven-agent-log -- logs/ --source codex \
+  --since 2026-08-01 --until 2026-08-31 --agent codex --format csv --output report.csv
+cargo run --locked --bin maven-agent-log -- logs/ \
+  --category maven --group-by day --format markdown
+```
+
+`--group-by day|month|ide|agent|project|session|category` produces counts instead
+of individual events. Grouping uses original identities; redaction cannot merge
+different projects or sessions. Identical redacted labels receive numeric
+suffixes. Formats are `terminal`, `json` (array), `jsonl` (one object per line),
+`csv`, and `markdown`. JSON and CSV include Maven details. `--output` writes a
+report; it cannot overwrite a selected input log.
+
+Default privacy redaction covers home paths (including foreign Linux/macOS and
+Windows usernames), the current username, event workspace/working directories,
+`--workspace`, URL credentials, common token formats, and password/token/secret/
+credential/authorization/API-key assignments and flags, including `-u`/`--user`
+and `-U`/`--proxy-user` credentials. Sensitive shell argument values are consumed
+with quoting, escapes, and adjacent quoted fragments preserved as one value;
+an incomplete sensitive argument is redacted through the end of the text.
+Redaction applies to every exported string, including identifiers and structured Maven fields. Repeat
+`--redact-pattern VALUE` for additional sensitive **literal** values. Terminal
+control characters and line breaks are escaped. Neither reports nor diagnostics
+copy raw logs; diagnostics report only counts of skipped files/records. Use
+`--unsafe-no-redact` only when an unredacted local report is intended.
+
+Support limits: formats vary by client version. Unknown record containers,
+compressed logs, shell scripts embedded in JavaScript orchestration calls,
+heredocs, command substitutions, shell aliases/functions, and PowerShell/cmd.exe
+syntax are not interpreted. Incomplete shell quoting retains the recorded call
+as `shell`. The analyzer identifies recorded invocations, not proof that a child
+process succeeded; explicitly canceled/pending calls are excluded when marked.
+Only recognized IntelliJ execution messages are accepted, not arbitrary command
+text. Missing IntelliJ metadata stays unknown. Valid JSONL records can be
+recovered around malformed lines; truncated JSON documents cannot. Malformed
+SQLite JSON payloads are skipped. The CLI reports partial input on stderr and
+fails if damaged inputs yield no commands. Unsupported but valid documents may
+yield an empty report. Redaction is pattern-based: domain-specific sensitive
+values require `--redact-pattern`. No LLM integration is enabled or required;
+extraction, classification, counts, and every report format operate offline.
+
+Adapter references: [VS Code terminal invocation data](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/tools/runInTerminalTool.ts),
+[Kilo shell tool documentation](https://github.com/Kilo-Org/kilocode-legacy/blob/main/docs/legacy-ides/automate/tools/execute-command.md).
 
 ## Shell–MCP Benchmark CLI
 
