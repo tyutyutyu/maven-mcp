@@ -1,0 +1,14 @@
+{
+  "sessionId": "copilot-session",
+  "workspaceFolder": "/work/synthetic-project",
+  "requests": [{
+    "timestamp": 1767225600000,
+    "agent": {"id": "github.copilot"},
+    "message": {"text": "Documentation example: mvn deploy"},
+    "response": [
+      {"kind":"markdownContent","content":{"toolId":"run_in_terminal","input":{"command":"mvn deploy"}}},
+      {"kind":"toolInvocationSerialized","toolId":"run_in_terminal","toolCallId":"terminal-1","toolSpecificData":{"kind":"terminal","commandLine":{"original":"jar tf demo.jar | rg META-INF","forDisplay":"short display"},"cwd":"/work/synthetic-project"},"toolResultDetails":{"output":{"toolId":"run_in_terminal","input":{"command":"mvn deploy"}}}},
+      {"kind":"toolInvocationSerialized","toolId":"run_in_terminal","toolCallId":"terminal-2","isCanceled":true,"input":{"command":"mvn deploy"}}
+    ]
+  }]
+}
