@@ -1,0 +1,11 @@
+{"type":"session_meta","payload":{"id":"codex-session","cwd":"/work/synthetic-project","timestamp":"2026-01-01T00:00:00Z"}}
+{"type":"turn_context","payload":{"cwd":"/work/synthetic-project/core","model":"synthetic-model"}}
+{"timestamp":"2026-01-01T11:00:00+01:00","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"./mvnw -pl core -am -Pci verify -Dtest='FooTest#works'\",\"workdir\":\"/work/synthetic-project\"}"}}
+{"timestamp":"2026-01-01T10:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"./mvnw -pl core -am -Pci verify -Dtest='FooTest#works'\",\"workdir\":\"/work/synthetic-project\"}"}}
+{"timestamp":"2026-01-01T10:01:00Z","type":"response_item","payload":{"type":"function_call","call_id":"call-2","name":"exec_command","arguments":"{\"cmd\":\"./mvnw -pl core -am -Pci verify -Dtest='FooTest#works'\",\"workdir\":\"/work/synthetic-project\"}"}}
+{"timestamp":"2026-01-01T10:02:00Z","type":"response_item","payload":{"type":"function_call_output","output":{"type":"function_call","name":"exec_command","arguments":{"cmd":"mvn deploy"}}}}
+{"type":"message","role":"user","content":[{"type":"tool_use","name":"exec_command","input":{"cmd":"mvn deploy"}}]}
+{"type":"message","role":"assistant","content":[{"type":"text","text":"Example: mvn deploy"}]}
+{"type":"function_call","name":"apply_patch","arguments":{"content":[{"type":"tool_use","name":"exec_command","input":{"cmd":"mvn deploy"}}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{incomplete"}}
+{incomplete
