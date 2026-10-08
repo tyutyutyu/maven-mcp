@@ -16,7 +16,7 @@ fn cli_emits_deterministic_redacted_reports_in_every_supported_format() -> Resul
     std::fs::write(
         &log,
         format!(
-            r#"{{"tool":"run_in_terminal","timestamp":"2026-01-01T00:00:00Z","cwd":"{}","command":"./mvnw test -Dtoken=hunter2"}}"#,
+            r#"{{"requests":[{{"timestamp":"2026-01-01T00:00:00Z","response":[{{"kind":"toolInvocationSerialized","toolId":"run_in_terminal","input":{{"command":"./mvnw test -Dtoken=hunter2","cwd":"{}"}}}}]}}]}}"#,
             root.path().display()
         ),
     )?;
@@ -38,7 +38,12 @@ fn cli_emits_deterministic_redacted_reports_in_every_supported_format() -> Resul
         );
         let report = String::from_utf8(output.stdout)?;
         assert!(report.contains("mvnw"));
-        assert!(report.contains("<REDACTED>"));
+        let redacted = if format == "markdown" {
+            "&lt;REDACTED&gt;"
+        } else {
+            "<REDACTED>"
+        };
+        assert!(report.contains(redacted), "{format}: {report}");
         assert!(!report.contains("hunter2"));
         assert!(!report.contains(root.path().to_string_lossy().as_ref()));
     }
