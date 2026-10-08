@@ -122,6 +122,14 @@ provider descriptors and therefore are not included in this structured view.
 cargo build --release --locked --bin maven-mcp
 ```
 
+Alternatively, run the release build through Task from the repository root:
+
+```bash
+task dev:build-release
+```
+
+`task dev:build` creates a debug binary under `target/debug/` instead.
+
 Configure the MCP host to run the resulting `target/release/maven-mcp` binary and
 pass request `project_path` values in tool calls. The host owns process startup,
 shutdown, and STDIO; there is no port, URL, daemon, health endpoint, Docker

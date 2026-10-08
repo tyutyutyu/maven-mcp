@@ -10,6 +10,13 @@ tasks:
     cmds:
       - cargo build --locked
 
+  build-release:
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+    cmds:
+      - cargo build --release --locked --bin maven-mcp
+
   format:
     preconditions:
       - sh: command -v cargo
