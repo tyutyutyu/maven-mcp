@@ -1,25 +1,22 @@
-name: CI
+name: Dependency policy
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: deps-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  verify:
-    name: CI
+  cargo-deny:
+    name: Dependency policy
     runs-on: ubuntu-26.04
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -29,14 +26,11 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
-          rustup default 1.89.0
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.18.9 --locked
 
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check advisories licenses bans sources
-
-      - name: Run verification gate
-        run: scripts/test-pyramid.sh

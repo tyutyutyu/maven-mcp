@@ -606,6 +606,14 @@ the single-maintainer workflow, blocks deletion and force pushes, and requires
 linear history. Use a short-lived branch, open a pull request to `main`, wait
 for `CI`, then squash merge. The repository deletes the branch after merging.
 
+### Dependency Maintenance
+
+Renovate opens grouped update pull requests. The required `CI` job runs
+`cargo deny` for advisories, licenses and sources on every pull request and push
+to `main`; the `Dependency policy` workflow also scans daily. See
+[docs/dependency-maintenance.md](docs/dependency-maintenance.md) for the policy,
+exception register and alert handling.
+
 ### Agent and LLM Evaluation
 
 Above the deterministic Rust test pyramid, a separate Promptfoo evaluation

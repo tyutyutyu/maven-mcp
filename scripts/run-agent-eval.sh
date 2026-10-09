@@ -14,7 +14,7 @@ REPORT_HTML="$EVAL_ROOT/report.html"
 REPORT_JSON="$EVAL_ROOT/results.json"
 
 if ! command -v npx >/dev/null 2>&1; then
-  echo "npx is required (Promptfoo 0.121.19 requires a supported Node.js runtime)" >&2
+  echo "npx is required (Promptfoo $PROMPTFOO_VERSION requires a supported Node.js runtime)" >&2
   exit 2
 fi
 if [[ -z "${PROMPTFOO_PROVIDER:-}" ]]; then

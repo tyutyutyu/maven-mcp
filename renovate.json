@@ -1,6 +1,69 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "schedule": ["before 6am on monday"],
+  "timezone": "Europe/Budapest",
+  "prConcurrentLimit": 5,
+  "enabledManagers": ["cargo", "github-actions", "npm", "dockerfile", "custom.regex"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "labels": ["security"]
+  },
+  "packageRules": [
+    {
+      "description": "Group non-major Cargo updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo non-major"
+    },
+    {
+      "description": "Group GitHub Actions and cargo-deny updates",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Group pinned npx tool versions used by scripts",
+      "matchManagers": ["custom.regex"],
+      "groupName": "npx tools",
+      "matchDatasources": ["npm"]
+    },
+    {
+      "description": "Group cargo-deny with GitHub Actions updates",
+      "matchManagers": ["custom.regex"],
+      "matchDatasources": ["crate"],
+      "matchPackageNames": ["cargo-deny"],
+      "groupName": "github actions"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned npx tools and Promptfoo script, test and documentation versions",
+      "managerFilePatterns": ["/^scripts/.+\\.sh$/", "/^tests/promptfoo_config\\.rs$/", "/^README\\.md$/"],
+      "matchStrings": [
+        "npx --yes (?<depName>@?[a-z0-9./-]+)@(?<currentValue>[0-9][^\\s\"\\\\]*)",
+        "PROMPTFOO_VERSION=\"?(?<currentValue>[0-9][^\\s\"]*)\"?",
+        "PROMPTFOO_VERSION=\\\\\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)",
+        "The script pins Promptfoo `(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)`"
+      ],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "{{#if depName}}{{{depName}}}{{else}}promptfoo{{/if}}"
+    },
+    {
+      "customType": "regex",
+      "description": "cargo-deny pinned in CI workflows",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["cargo install cargo-deny --version (?<currentValue>[0-9][^\\s]*)"],
+      "depNameTemplate": "cargo-deny",
+      "datasourceTemplate": "crate"
+    }
   ]
 }
