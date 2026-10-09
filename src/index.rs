@@ -2148,7 +2148,7 @@ fn read_jar_index(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name();
+        let name = entry.name().context("cannot decode JAR entry name")?;
         let name = name.replace('\\', "/");
         if let Some(class_name) = class_name_from_entry(&name) {
             classes.insert(class_name);
@@ -2210,7 +2210,9 @@ fn read_source(
                 continue;
             }
         };
-        let name = entry.name();
+        let name = entry
+            .name()
+            .context("cannot decode source JAR entry name")?;
         let name = name.replace('\\', "/");
         if name == expected_java || name == expected_kotlin {
             selected = Some(index);
@@ -2226,7 +2228,10 @@ fn read_source(
         };
     };
     let mut entry = archive.by_index(index)?;
-    let name = entry.name().to_owned();
+    let name = entry
+        .name()
+        .context("cannot decode source JAR entry name")?
+        .into_owned();
     let declared_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
     let mut bytes = Vec::with_capacity(declared_size.min(max_bytes));
     entry
