@@ -27,7 +27,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
-zip = { version = "8.1", default-features = false, features = ["deflate"] }
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 insta = { version = "1.48", features = ["json"] }
