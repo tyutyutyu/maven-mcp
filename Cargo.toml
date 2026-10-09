@@ -6,6 +6,8 @@ rust-version = "1.89"
 default-run = "maven-mcp"
 description = "MCP server for indexing and querying a local Maven repository"
 license = "MIT"
+repository = "https://github.com/tyutyutyu/maven-mcp"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"

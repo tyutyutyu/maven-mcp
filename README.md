@@ -588,6 +588,19 @@ Start MCP Inspector with the fixture repository:
 scripts/run-inspector.sh
 ```
 
+## Repository, Copyright and Contributions
+
+The public repository is <https://github.com/tyutyutyu/maven-mcp>; its default
+branch is `main`.
+
+Copyright (c) 2026 István Földházi. The project is licensed under the
+[MIT License](LICENSE).
+
+Contributions are accepted under the same MIT License: by submitting a pull
+request you confirm that you have the right to contribute the code and license
+it under those terms. No CLA or DCO sign-off is required, and signed commits or
+tags are not required.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
