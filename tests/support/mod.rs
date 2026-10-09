@@ -93,6 +93,13 @@ impl TestServer {
     }
 
     pub async fn connect_with_pid(&self) -> Result<(RunningService<RoleClient, ()>, u32)> {
+        self.connect_with_limits(&[]).await
+    }
+
+    pub async fn connect_with_limits(
+        &self,
+        limits: &[(&str, &str)],
+    ) -> Result<(RunningService<RoleClient, ()>, u32)> {
         let command =
             tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp")).configure(|command| {
                 command
@@ -113,6 +120,9 @@ impl TestServer {
                         )
                         .env("MAVEN_TIMEOUT_SECONDS", "2")
                         .env("MAX_MAVEN_OUTPUT_BYTES", "16384");
+                }
+                for (name, value) in limits {
+                    command.env(name, value);
                 }
                 if let Some(jenv_root) = &self.jenv_root {
                     command

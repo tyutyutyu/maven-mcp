@@ -1178,3 +1178,45 @@ async fn offline_resolution_failure_returns_a_policy_notice() -> Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn resource_limits_are_visible_to_stdio_clients() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
+    for (name, value) in [
+        ("MAX_JAR_ENTRIES", "1"),
+        ("MAX_INDEX_ENTRIES", "1"),
+        ("MAX_INDEX_NAME_BYTES", "1"),
+    ] {
+        let (client, _) = server.connect_with_limits(&[(name, value)]).await?;
+        let error = client
+            .call_tool(
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(
+                    json!({"project_path": project_path, "query": "Foo"}),
+                )),
+            )
+            .await
+            .expect_err("a limit must fail the tool rather than return partial results");
+        assert!(error.to_string().contains(name), "{error}");
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resource_limit_configuration_rejects_unbounded_values() {
+    for name in [
+        "MAX_XML_BYTES",
+        "MAX_JAR_ENTRIES",
+        "MAX_INDEX_ENTRIES",
+        "MAX_INDEX_NAME_BYTES",
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+            .env(name, usize::MAX.to_string())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(name));
+    }
+}

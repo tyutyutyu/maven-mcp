@@ -995,6 +995,7 @@ impl MavenRunner {
         let paths = discover_jacoco_reports(&self.root)?;
         let mut reports = Vec::new();
         let mut found = BTreeSet::new();
+        let mut xml_budget = crate::config::XmlBudget::default();
         for path in paths {
             let (module, module_root) = expected
                 .iter()
@@ -1002,13 +1003,12 @@ impl MavenRunner {
                 .max_by_key(|(_, root)| root.components().count())
                 .map(|(module, root)| (module.clone(), root.clone()))
                 .unwrap_or_else(|| (".".to_owned(), self.root.clone()));
-            let xml = std::fs::read_to_string(&path).with_context(|| {
-                format!(
-                    "cannot read JaCoCo report {}",
-                    path.file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("jacoco.xml")
-                )
+            let xml = xml_budget.read(&path).map_err(|error| {
+                if error.is::<quick_xml::Error>() {
+                    anyhow::anyhow!("invalid JaCoCo XML report: {error:#}")
+                } else {
+                    anyhow::anyhow!("cannot read JaCoCo report: {error:#}")
+                }
             })?;
             let parsed: RawJacocoReport = quick_xml::de::from_str(&xml)
                 .with_context(|| format!("invalid JaCoCo XML report for module {module}"))?;
@@ -1391,7 +1391,15 @@ struct RawModules {
 
 fn discover_project(root: &Path, wrapper: bool) -> Result<MavenProject> {
     let mut discovered = BTreeMap::new();
-    discover_module(root, root, ".", &mut discovered, &mut BTreeSet::new())?;
+    discover_module(
+        root,
+        root,
+        ".",
+        &mut discovered,
+        &mut BTreeSet::new(),
+        &mut crate::config::XmlBudget::default(),
+        0,
+    )?;
     let root_module = discovered
         .remove(".")
         .context("root project was not discovered")?;
@@ -1409,7 +1417,12 @@ fn discover_module(
     selector: &str,
     discovered: &mut BTreeMap<String, MavenModule>,
     visited: &mut BTreeSet<PathBuf>,
+    xml_budget: &mut crate::config::XmlBudget,
+    depth: usize,
 ) -> Result<()> {
+    if depth > crate::config::MAX_XML_DEPTH {
+        bail!("module discovery exceeds MAX_XML_DEPTH");
+    }
     let directory = directory.canonicalize()?;
     if !directory.starts_with(root) {
         bail!("module path escapes project_path");
@@ -1417,8 +1430,9 @@ fn discover_module(
     if !visited.insert(directory.clone()) {
         return Ok(());
     }
-    let xml = std::fs::read_to_string(directory.join("pom.xml"))
-        .with_context(|| format!("module {selector} has no readable pom.xml"))?;
+    let xml = xml_budget
+        .read(&directory.join("pom.xml"))
+        .map_err(|error| anyhow::anyhow!("module {selector} has no readable pom.xml: {error:#}"))?;
     let raw: RawProject = quick_xml::de::from_str(&xml)
         .with_context(|| format!("cannot parse module POM for {selector}"))?;
     let child_selectors = raw
@@ -1444,7 +1458,15 @@ fn discover_module(
         if !child.starts_with(root) {
             bail!("module path escapes project_path");
         }
-        discover_module(root, &child, &child_selector, discovered, visited)?;
+        discover_module(
+            root,
+            &child,
+            &child_selector,
+            discovered,
+            visited,
+            xml_budget,
+            depth + 1,
+        )?;
     }
     Ok(())
 }
@@ -1739,6 +1761,9 @@ fn discover_report_files(root: &Path) -> Result<Vec<PathBuf>> {
         if !canonical.starts_with(root) {
             bail!("Surefire report escaped project_path");
         }
+        if reports.len() >= crate::config::MAX_XML_FILES {
+            bail!("XML report discovery exceeds MAX_XML_FILES limit");
+        }
         reports.push(canonical);
     }
     reports.sort();
@@ -1780,8 +1805,9 @@ struct RawTestProblem {
 fn parse_test_reports(paths: &[PathBuf]) -> Result<(TestSummary, Vec<TestFailureDetail>)> {
     let mut summary = TestSummary::default();
     let mut failures = Vec::new();
+    let mut xml_budget = crate::config::XmlBudget::default();
     for path in paths {
-        let xml = std::fs::read_to_string(path)?;
+        let xml = xml_budget.read(path)?;
         let suite: RawTestSuite = quick_xml::de::from_str(&xml).with_context(|| {
             format!(
                 "invalid Surefire XML report {}",
@@ -1952,7 +1978,7 @@ struct RawEffectivePlugin {
 }
 
 fn parse_effective_pom(path: &Path) -> Result<Vec<EffectiveProject>> {
-    let xml = std::fs::read_to_string(path)?;
+    let xml = crate::config::read_bounded_xml(path)?;
     let mut raw_projects = if xml.trim_start().starts_with("<projects") {
         quick_xml::de::from_str::<RawEffectiveProjects>(&xml)?.projects
     } else {
@@ -2552,6 +2578,9 @@ fn discover_jacoco_reports(root: &Path) -> Result<Vec<PathBuf>> {
         if !canonical.starts_with(root) {
             bail!("JaCoCo report escaped project_path");
         }
+        if reports.len() >= crate::config::MAX_XML_FILES {
+            bail!("XML report discovery exceeds MAX_XML_FILES limit");
+        }
         reports.push(canonical);
     }
     reports.sort();
@@ -2733,6 +2762,93 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn report_discovery_enforces_aggregate_file_boundaries() {
+        let root = TempDir::new().unwrap();
+        let surefire = root.path().join("target/surefire-reports");
+        fs::create_dir_all(&surefire).unwrap();
+        for i in 0..crate::config::MAX_XML_FILES {
+            let directory = root.path().join(format!("target/report-{i}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("jacoco.xml"), "<report/>").unwrap();
+            fs::write(surefire.join(format!("TEST-{i}.xml")), "<testsuite/>").unwrap();
+        }
+        assert_eq!(
+            discover_jacoco_reports(root.path()).unwrap().len(),
+            crate::config::MAX_XML_FILES
+        );
+        let paths = discover_report_files(root.path()).unwrap();
+        assert_eq!(paths.len(), crate::config::MAX_XML_FILES);
+        parse_test_reports(&paths).unwrap();
+        let mut too_many = paths;
+        too_many.push(too_many[0].clone());
+        assert!(
+            parse_test_reports(&too_many)
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_XML_FILES")
+        );
+        fs::write(root.path().join("target/jacoco.xml"), "<report/>").unwrap();
+        fs::write(surefire.join("TEST-over.xml"), "<testsuite/>").unwrap();
+        assert!(
+            discover_jacoco_reports(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_XML_FILES")
+        );
+        assert!(
+            discover_report_files(root.path())
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_XML_FILES")
+        );
+    }
+
+    #[test]
+    fn xml_limits_reach_pom_effective_pom_jacoco_and_surefire_parsers() {
+        let (root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
+        let runner = MavenRunner::discover(&config).unwrap();
+        let jacoco = root.path().join("core/target/site/jacoco/jacoco.xml");
+        fs::create_dir_all(jacoco.parent().unwrap()).unwrap();
+        let effective = root.path().join("effective.xml");
+        let surefire = root.path().join("TEST-limit.xml");
+        let inputs = [
+            (
+                " ".repeat(crate::config::DEFAULT_MAX_XML_BYTES + 1),
+                "MAX_XML_BYTES",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    "<a>".repeat(crate::config::MAX_XML_DEPTH + 1),
+                    "</a>".repeat(crate::config::MAX_XML_DEPTH + 1)
+                ),
+                "MAX_XML_DEPTH",
+            ),
+            (
+                format!("<a>{}</a>", "<b/>".repeat(crate::config::MAX_XML_ELEMENTS)),
+                "MAX_XML_ELEMENTS",
+            ),
+        ];
+        for (xml, limit) in inputs {
+            for path in [&root.path().join("pom.xml"), &effective, &jacoco, &surefire] {
+                fs::write(path, &xml).unwrap();
+            }
+            assert!(
+                format!("{:#}", discover_project(root.path(), true).unwrap_err()).contains(limit)
+            );
+            assert!(format!("{:#}", parse_effective_pom(&effective).unwrap_err()).contains(limit));
+            assert!(format!("{:#}", runner.read_jacoco_reports().err().unwrap()).contains(limit));
+            assert!(
+                format!(
+                    "{:#}",
+                    parse_test_reports(std::slice::from_ref(&surefire)).unwrap_err()
+                )
+                .contains(limit)
+            );
+        }
+    }
 
     fn write_pom(path: &Path, artifact_id: &str, packaging: &str, modules: &[&str]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
