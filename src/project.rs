@@ -599,6 +599,15 @@ impl MavenRunner {
         self.execute(arguments).await
     }
 
+    pub async fn run_arguments(&self, arguments: &[String]) -> Result<MavenRunResult> {
+        if arguments.iter().any(|argument| argument.contains('\0')) {
+            bail!("Maven arguments must not contain NUL bytes");
+        }
+        Ok(self
+            .execute(arguments.iter().map(OsString::from).collect())
+            .await)
+    }
+
     pub async fn run_focused_test(&self, invocation: &FocusedTestInvocation) -> FocusedTestResult {
         let started = Instant::now();
         let arguments = match self.focused_test_arguments(invocation) {
@@ -2858,6 +2867,18 @@ mod tests {
         };
 
         assert!(MavenRunner::discover(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn arbitrary_arguments_reject_nul_before_starting_maven() {
+        let (root, config) = wrapper_project("#!/bin/sh\ntouch child-started\n");
+        let runner = MavenRunner::discover(&config).unwrap();
+        let error = runner
+            .run_arguments(&["bad\0argument".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("NUL"));
+        assert!(!root.path().join("child-started").exists());
     }
 
     #[tokio::test]
