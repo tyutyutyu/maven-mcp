@@ -210,13 +210,13 @@ async fn sigterm_does_not_leave_an_active_maven_process_group() -> Result<()> {
     std::fs::set_permissions(&wrapper, permissions)?;
 
     let (client, server_process_id) = fixture.connect_with_pid().await?;
-    let request = CallToolRequestParams::new("run_maven_lifecycle").with_arguments(
+    let request = CallToolRequestParams::new("run_maven").with_arguments(
         json!({
             "project_path": project.display().to_string(),
-            "phase": "compile"
+            "arguments": ["custom:goal"]
         })
         .as_object()
-        .context("lifecycle arguments must be an object")?
+        .context("Maven arguments must be an object")?
         .clone(),
     );
     let call = tokio::spawn(async move { client.call_tool(request).await });

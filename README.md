@@ -66,6 +66,8 @@ Project inspection and execution use the same request `project_path`:
 
 - `inspect_maven_project` – models the root project, Maven Wrapper, and recursive
   reactor modules.
+- `run_maven` – runs any Maven phases, plugin goals and options from an exact
+  argument list, returning execution status and bounded, redacted output.
 - `run_maven_lifecycle` – runs the allowlisted `compile`, `test-compile`, or
   `verify` lifecycle.
 - `list_maven_test_classes`, `run_maven_test`,
@@ -220,16 +222,63 @@ Then the client may select a Maven project below either directory:
 
 The project is writable because Maven creates `target/` files. The execution
 repository, when configured, must be a separate, dedicated writable directory.
-Maven is offline by default (`--offline`); set `MAVEN_EXECUTION_NETWORK=true`
-only for trusted projects that may resolve dependencies and plugins. The server
-does not accept raw Maven goals or arguments, runs at most one Maven process at a
-time across the entire STDIO server, applies time and output limits, and redacts
-paths and common credential patterns. Native execution is not a sandbox: Maven
-plugins and tests run with the local user's permissions.
+Structured lifecycle, test and diagnostic tools run Maven offline by default
+(`--offline`); set `MAVEN_EXECUTION_NETWORK=true` to let those tools resolve
+dependencies and plugins. The general `run_maven` tool passes the requested
+argument list exactly, without adding offline, repository or batch-mode flags.
+All tools run at most one Maven process at a time across the entire STDIO server,
+apply time and output limits, and redact paths and common credential patterns.
+Native execution is not a sandbox: Maven plugins and tests run with the local
+user's permissions.
 
-When an offline Maven run fails because a required remote plugin or artifact is
-not cached locally, the returned `build.policy_notice` explains that the result
-may reflect an intentional security policy or missing MCP server configuration,
+### Arbitrary Maven goals and arguments
+
+Use `run_maven` for any lifecycle phase, plugin goal, profile, property or Maven
+option. Each `arguments` item is one argument, in order; do not include `mvn` or
+`mvnw`, and do not add shell quotes around items containing spaces. The server
+selects the project's Maven Wrapper or configured Maven executable and starts
+it from the canonical trusted `project_path`.
+
+```json
+{
+  "tool": "run_maven",
+  "arguments": {
+    "project_path": "/work/trusted-projects/team-a/service",
+    "arguments": ["--batch-mode", "clean", "install", "dependency:sources", "-Pdev", "-DskipTests", "-Dmessage=hello world"]
+  }
+}
+```
+
+Arguments are passed directly to the executable without shell interpretation.
+An empty list (for a POM's default goal), empty items and repeated options are
+accepted. NUL characters and non-string items are invalid MCP parameters. Maven
+itself validates its options; unsupported options or failed goals return a
+structured execution result rather than an MCP argument error.
+
+A `run_maven` call drops the cached project index, so index-backed tools such as
+`get_class_source` rebuild it on the next request. Those tools read
+`MAVEN_EXECUTION_REPO_PATH` when it is set (otherwise `$HOME/.m2/repository`), so
+when it is configured, pass the same directory as `-Dmaven.repo.local=...` in
+goals such as `dependency:sources`.
+
+This tool does not inject `--offline` from `MAVEN_EXECUTION_NETWORK` or
+`-Dmaven.repo.local` from `MAVEN_EXECUTION_REPO_PATH`. Pass `--offline` or
+`-Dmaven.repo.local=/absolute/cache/path` explicitly when needed. Maven's own
+environment, settings and `.mvn` configuration still apply. Options such as
+`-f` and `--settings` may point outside the selected project, and goals such as
+`deploy` may publish artifacts. The trusted-directory check authorizes the
+starting project; it does not confine Maven's filesystem or network access.
+
+The response is an object with `status` (`success`, `build_failure`, `timeout`
+or `runner_error`), optional `exit_code`, `duration_ms`, `timed_out`, `stdout`,
+`stderr`, `stdout_truncated`, `stderr_truncated` and `redaction_count`. It does
+not infer lifecycle-specific diagnostics or `policy_notice`. The existing
+`run_maven_lifecycle` and `run_maven_test` tools retain their structured results
+and automatic flags.
+
+For structured tools, when an offline Maven run fails because a required remote
+plugin or artifact is not cached locally, `build.policy_notice` explains that
+the result may reflect an intentional security policy or missing MCP server configuration,
 not necessarily a project error. It also names `MAVEN_EXECUTION_NETWORK=true` as
 the opt-in setting for trusted projects. The optional field is omitted from
 successful runs and failures unrelated to offline artifact resolution.
@@ -260,8 +309,8 @@ existing inherited `JAVA_HOME` and `PATH` behavior is unchanged.
 | `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots retained in the in-process project-index cache. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
-| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for request-scoped Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. |
-| `MAVEN_EXECUTION_NETWORK` | `false` | When `true`, `--offline` is not added to Maven commands. |
+| `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for structured Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. `run_maven` requires an explicit `-Dmaven.repo.local` argument to select this repository. |
+| `MAVEN_EXECUTION_NETWORK` | `false` | When `true`, structured lifecycle, test and diagnostic tools omit `--offline`. `run_maven` never injects this flag. |
 | `MAVEN_TIMEOUT_SECONDS` | `300` | Maximum runtime of one Maven child process. |
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |
 | `MAVEN_MCP_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime` | User-private directory for live runtime status files consumed by `maven-mcp stats`. |
@@ -270,7 +319,9 @@ existing inherited `JAVA_HOME` and `PATH` behavior is unchanged.
 
 `get_class_source` returns a result only when the corresponding sources artifact
 is present in the local repository. For Maven projects, these artifacts can be
-downloaded with commands such as `mvn dependency:sources`.
+downloaded with commands such as `mvn dependency:sources`. Missing source entries
+produce empty results; unreadable source archives or entries are reported as MCP
+errors.
 
 ## Agent Log Analyzer CLI
 

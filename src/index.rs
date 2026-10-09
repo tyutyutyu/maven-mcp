@@ -2148,7 +2148,8 @@ fn read_jar_index(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().replace('\\', "/");
+        let name = entry.name();
+        let name = name.replace('\\', "/");
         if let Some(class_name) = class_name_from_entry(&name) {
             classes.insert(class_name);
         }
@@ -2199,14 +2200,30 @@ fn read_source(
     let outer_class = class_name.split('$').next().unwrap_or(class_name);
     let expected_java = format!("{}.java", outer_class.replace('.', "/"));
     let expected_kotlin = format!("{}.kt", outer_class.replace('.', "/"));
-    let selected = (0..archive.len()).find(|index| {
-        archive
-            .by_index_raw(*index)
-            .map(|entry| entry.name() == expected_java || entry.name() == expected_kotlin)
-            .unwrap_or(false)
-    });
+    let mut selected = None;
+    let mut first_error = None;
+    for index in 0..archive.len() {
+        let entry = match archive.by_index_raw(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        let name = entry.name();
+        let name = name.replace('\\', "/");
+        if name == expected_java || name == expected_kotlin {
+            selected = Some(index);
+            break;
+        }
+    }
     let Some(index) = selected else {
-        return Ok(None);
+        // An unreadable entry may have been the requested source, so do not
+        // report it as a missing result.
+        return match first_error {
+            Some(error) => Err(error).context("cannot read source JAR entry"),
+            None => Ok(None),
+        };
     };
     let mut entry = archive.by_index(index)?;
     let name = entry.name().to_owned();
@@ -3757,6 +3774,79 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn jar_names_and_source_lookup_support_unicode_java_and_kotlin() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("org/example/demo/1.0");
+        write_jar(
+            &base.join("demo-1.0.jar"),
+            &[
+                ("org/example/Árvíz.class", b"java bytecode"),
+                ("org/example/Tükör.class", b"kotlin bytecode"),
+            ],
+        );
+        write_jar(
+            &base.join("demo-1.0-sources.jar"),
+            &[
+                ("org/example/Árvíz.java", b"// Java source"),
+                ("org/example/Tükör.kt", b"// Kotlin source"),
+            ],
+        );
+        let index = build_index(&root, 10, 1024);
+
+        assert_eq!(index.search_classes("Árvíz", None).len(), 1);
+        assert_eq!(index.search_classes("Tükör", None).len(), 1);
+        for (class_name, entry_path, source) in [
+            (
+                "org.example.Árvíz",
+                "org/example/Árvíz.java",
+                "// Java source",
+            ),
+            (
+                "org.example.Tükör",
+                "org/example/Tükör.kt",
+                "// Kotlin source",
+            ),
+        ] {
+            let sources = index.class_source(class_name, None, None).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].entry, entry_path);
+            assert_eq!(sources[0].source, source);
+            assert!(!sources[0].truncated);
+        }
+        assert!(
+            index
+                .class_source("org.example.Missing", None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_lookup_surfaces_corrupt_local_entry_headers_after_indexing() {
+        let root = TempDir::new().unwrap();
+        let base = root.path().join("org/example/demo/1.0");
+        let source_jar = base.join("demo-1.0-sources.jar");
+        write_jar(
+            &base.join("demo-1.0.jar"),
+            &[("org/example/Foo.class", b"bytecode")],
+        );
+        write_jar(&source_jar, &[("org/example/Foo.java", b"// source")]);
+        let index = build_index(&root, 10, 1024);
+
+        // Keep the central directory readable, but break the local entry header.
+        let mut bytes = std::fs::read(&source_jar).unwrap();
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+        bytes[..4].fill(0);
+        std::fs::write(&source_jar, bytes).unwrap();
+        assert!(ZipArchive::new(File::open(&source_jar).unwrap()).is_ok());
+
+        let error = index
+            .class_source("org.example.Foo", None, None)
+            .expect_err("an unreadable source entry must not become a missing result");
+        assert!(error.to_string().contains("cannot read source JAR entry"));
     }
 
     #[test]

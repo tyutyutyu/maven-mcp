@@ -52,6 +52,7 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "list_artifact_versions",
         "list_jar_classes",
         "list_maven_test_classes",
+        "run_maven",
         "run_maven_lifecycle",
         "run_maven_test",
         "search_classes",
@@ -65,6 +66,38 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "search_type_hierarchy",
     ]);
     assert_eq!(actual_names, expected_names);
+    let maven_tool = tools.iter().find(|tool| tool.name == "run_maven").unwrap();
+    assert_eq!(
+        maven_tool.input_schema["properties"]["arguments"]["type"],
+        "array"
+    );
+    assert_eq!(
+        maven_tool.input_schema["properties"]["arguments"]["items"]["type"],
+        "string"
+    );
+    assert!(
+        maven_tool.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("arguments"))
+    );
+    let maven_schema = maven_tool.output_schema.as_ref().unwrap();
+    for field in [
+        "status",
+        "exit_code",
+        "duration_ms",
+        "timed_out",
+        "stdout",
+        "stderr",
+        "stdout_truncated",
+        "stderr_truncated",
+        "redaction_count",
+    ] {
+        assert!(
+            maven_schema["properties"].get(field).is_some(),
+            "run_maven schema missing {field}"
+        );
+    }
     for tool in &tools {
         assert_eq!(
             tool.output_schema
@@ -437,6 +470,183 @@ exit 1
 }
 
 #[tokio::test]
+async fn arbitrary_maven_arguments_preserve_boundaries_and_do_not_inject_flags() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().unwrap();
+    std::fs::write(
+        project.join("mvnw"),
+        r#"#!/bin/sh
+: > argv.bin
+for arg do printf '%s\0' "$arg" >> argv.bin; done
+printf '%s\n' '[INFO] BUILD SUCCESS'
+"#,
+    )?;
+    let client = server.connect().await?;
+    let argv = vec![
+        "clean",
+        "install",
+        "deploy",
+        "org.example:custom-plugin:1.2:goal",
+        "-Pcustom,other",
+        "-Dmessage=hello world",
+        "-Dmessage=second",
+        "--settings",
+        "settings with spaces.xml",
+        "-f",
+        "../alternate/pom.xml",
+        "-pl",
+        "core",
+        "-am",
+        "-U",
+        "-X",
+        "-Dmaven.repo.local=custom-cache",
+        "$(touch shell-substitution)",
+        "; touch shell-semicolon",
+        "*.xml",
+        "",
+        "line\nbreak",
+        "árvíztűrő",
+    ];
+    for expected in [
+        argv,
+        vec!["--version"],
+        vec!["--offline", "package"],
+        vec![],
+    ] {
+        let result = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                        "project_path": project.display().to_string(),
+                        "arguments": expected
+                    }))),
+                )
+                .await?,
+        );
+        assert_eq!(result["status"], "success", "{result:#}");
+        assert_eq!(result["exit_code"], 0);
+        let expected_bytes: Vec<u8> = expected
+            .iter()
+            .flat_map(|arg| arg.bytes().chain(std::iter::once(0)))
+            .collect();
+        assert_eq!(std::fs::read(project.join("argv.bin"))?, expected_bytes);
+        assert!(!project.join("shell-substitution").exists());
+        assert!(!project.join("shell-semicolon").exists());
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arbitrary_maven_rejects_invalid_requests_and_untrusted_projects() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let other = TestServer::start_with_project().await?;
+    let project = server.project_path().unwrap();
+    std::fs::write(project.join("mvnw"), "#!/bin/sh\ntouch child-started\n")?;
+    let client = server.connect().await?;
+    let path = project.display().to_string();
+    for request in [
+        json!({"project_path": path}),
+        json!({"project_path": path, "arguments": "clean install"}),
+        json!({"project_path": path, "arguments": [7]}),
+        json!({"project_path": path, "arguments": ["bad\u{0}argument"]}),
+        json!({"arguments": ["clean"]}),
+        json!({"project_path": "relative", "arguments": ["clean"]}),
+    ] {
+        let response = client
+            .call_tool(CallToolRequestParams::new("run_maven").with_arguments(arguments(request)))
+            .await;
+        match response {
+            Ok(result) => assert_eq!(result.is_error, Some(true), "{result:?}"),
+            Err(error) => assert!(error.to_string().contains("-32602"), "{error}"),
+        }
+    }
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                "project_path": other.project_path().unwrap().display().to_string(),
+                "arguments": ["clean"]
+            }))),
+        )
+        .await
+        .expect_err("untrusted projects must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+    );
+    assert!(!project.join("child-started").exists());
+    client.cancel().await?;
+
+    let unconfigured = TestServer::start().await?;
+    let client = unconfigured.connect().await?;
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                "project_path": path, "arguments": ["clean"]
+            }))),
+        )
+        .await
+        .expect_err("unconfigured execution must be disabled");
+    assert!(
+        error
+            .to_string()
+            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+    );
+    assert!(!project.join("child-started").exists());
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arbitrary_maven_reports_failure_timeout_and_bounded_redacted_output() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().unwrap();
+    let client = server.connect().await?;
+    for (script, status, exit_code, truncated) in [
+        (
+            "#!/bin/sh\nprintf 'root=%s password=synthetic-value\\n' \"$PWD\" >&2\nexit 23\n",
+            "build_failure",
+            json!(23),
+            false,
+        ),
+        ("#!/bin/sh\nsleep 30\n", "timeout", Value::Null, false),
+        (
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 2000 ]; do printf '%s\\n' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; printf '%s\\n' 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2; i=$((i+1)); done\n",
+            "success",
+            json!(0),
+            true,
+        ),
+    ] {
+        std::fs::write(project.join("mvnw"), script)?;
+        let result = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                        "project_path": project.display().to_string(), "arguments": ["custom:goal"]
+                    }))),
+                )
+                .await?,
+        );
+        assert_eq!(result["status"], status, "{result:#}");
+        assert_eq!(result["exit_code"], exit_code);
+        assert_eq!(result["timed_out"], status == "timeout");
+        assert_eq!(result["stdout_truncated"], truncated);
+        assert_eq!(result["stderr_truncated"], truncated);
+        if status == "build_failure" {
+            let stderr = result["stderr"].as_str().unwrap();
+            assert!(stderr.contains("<PROJECT_ROOT>"));
+            assert!(!stderr.contains("synthetic-value"));
+            assert!(result["redaction_count"].as_u64().unwrap() >= 2);
+        }
+        assert!(result["stdout"].as_str().unwrap().len() <= 16384);
+        assert!(result["stderr"].as_str().unwrap().len() <= 16384);
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn trusted_directory_tree_serializes_maven_execution_across_projects() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -468,15 +678,15 @@ async fn trusted_directory_tree_serializes_maven_execution_across_projects() -> 
             "phase": "compile"
         }))),
     );
-    let second = client.call_tool(
-        CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(json!({
+    let second = client.call_tool(CallToolRequestParams::new("run_maven").with_arguments(
+        arguments(json!({
             "project_path": second_project.display().to_string(),
-            "phase": "compile"
-        }))),
-    );
+            "arguments": ["custom:goal", "-Pcustom"]
+        })),
+    ));
     let (first, second) = tokio::join!(first, second);
     assert_eq!(structured(first?)["outcome"], "success");
-    assert_eq!(structured(second?)["outcome"], "success");
+    assert_eq!(structured(second?)["status"], "success");
     assert!(
         !overlap.exists(),
         "Maven processes overlapped across trusted projects"
@@ -508,9 +718,31 @@ async fn jenv_java_selection_is_request_scoped_and_reports_resolution_errors() -
                 .await?,
         );
         assert_eq!(result["outcome"], "success", "{result:#}");
+        let arbitrary = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                        "project_path": project_path.display().to_string(),
+                        "arguments": ["custom:goal"]
+                    }))),
+                )
+                .await?,
+        );
+        assert_eq!(arbitrary["status"], "success", "{arbitrary:#}");
     }
 
     server.set_jenv_version(&first_project, "missing")?;
+    let arbitrary = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                    "project_path": first_project.display().to_string(),
+                    "arguments": ["custom:goal"]
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(arbitrary["status"], "runner_error", "{arbitrary:#}");
     let failure = structured(
         client
             .call_tool(
@@ -720,6 +952,7 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
         "get_maven_classpath",
         "inspect_maven_project",
         "list_maven_test_classes",
+        "run_maven",
         "run_maven_lifecycle",
         "run_maven_test",
     ] {

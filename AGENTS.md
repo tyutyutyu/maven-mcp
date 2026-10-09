@@ -206,6 +206,18 @@ scripts/run-inspector.sh --cli --method tools/list
   interleaved trusted project contexts.
 - Native Maven execution is not a sandbox; plugins and tests run with the local
   user's permissions.
+- `run_maven` accepts an exact ordered `arguments` array without a goal or option
+  allowlist. Pass each string directly to the shared runner without shell parsing
+  or injected flags; only NUL bytes are invalid OS arguments. Empty arrays and
+  empty strings are valid. Its response is `MavenRunResult`, not the
+  lifecycle-specific `MavenBuildResult`.
+- The general tool must retain trust authorization, shared serialization, Java
+  selection, timeout, output limits/redaction and process-group cleanup. Maven
+  options may select alternate POM/settings paths outside the trusted root;
+  directory trust authorizes startup and does not sandbox subsequent execution.
+- Offline, batch-mode and execution-repository defaults belong to the existing
+  structured tools. `run_maven` forwards only the supplied arguments; callers
+  explicitly select these options when needed.
 - EOF, SIGINT, and SIGTERM must stop the server and every active Maven process
   group without leaving an orphan.
 

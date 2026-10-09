@@ -29,8 +29,8 @@ use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
     DependencyResolutionStatus, DependencyScope, DependencyTreeResult, EffectivePomResult,
     FocusedTestInvocation, FocusedTestResult, LastTestFailures, LifecyclePhase, MavenBuildOutcome,
-    MavenBuildResult, MavenClasspathResult, MavenInvocation, MavenProject, MavenRunner,
-    canonical_project_root,
+    MavenBuildResult, MavenClasspathResult, MavenInvocation, MavenProject, MavenRunResult,
+    MavenRunner, canonical_project_root,
 };
 use crate::runtime_stats::{
     ProjectIndexStatus, RuntimeCacheStatus, RuntimeStatusPublisher, unix_ms,
@@ -268,6 +268,16 @@ pub struct ProviderSearchRequest {
     jar: Option<String>,
     #[schemars(description = "Maximum result count; capped by MAX_RESULTS")]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MavenArgumentsRequest {
+    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    project_path: String,
+    #[schemars(
+        description = "Exact ordered Maven argument list, including any lifecycle phases, plugin goals and options. Each item is one argument; no shell parsing or automatic flags. Use --offline explicitly if needed."
+    )]
+    arguments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -521,6 +531,15 @@ impl MavenMcpServer {
         result
     }
 
+    fn invalidate_index(&self, root: &PathBuf) -> Result<(), ErrorData> {
+        self.indexes
+            .lock()
+            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))?
+            .remove(root);
+        self.publish_runtime_status();
+        Ok(())
+    }
+
     fn store_index(&self, root: PathBuf, index: Arc<MavenIndex>) -> Result<(), ErrorData> {
         self.indexes
             .lock()
@@ -588,6 +607,12 @@ impl ProjectIndexCache {
             misses: self.misses,
             evictions: self.evictions,
         }
+    }
+
+    fn remove(&mut self, root: &PathBuf) {
+        self.indexes.remove(root);
+        self.order.retain(|candidate| candidate != root);
+        self.last_used.remove(root);
     }
 
     fn runtime_projects(&self) -> Vec<ProjectIndexStatus> {
@@ -1015,7 +1040,24 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Run an allowlisted Maven compile, test-compile, or verify phase in the configured project with optional validated reactor selection"
+        description = "Run any Maven goals and arguments in a host-trusted project without shell interpretation or injected flags. Maven options control network, settings, profiles, repository and alternate POM paths; execution is not a sandbox. Returns bounded, redacted stdout/stderr and execution status."
+    )]
+    async fn run_maven(
+        &self,
+        Parameters(request): Parameters<MavenArgumentsRequest>,
+    ) -> Result<Json<MavenRunResult>, ErrorData> {
+        let runner = self.runner_for(&request.project_path)?;
+        let result = runner
+            .run_arguments(&request.arguments)
+            .await
+            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
+        // Arbitrary goals may change dependencies, sources or classpath.
+        self.invalidate_index(&self.validate_project_path(&request.project_path)?)?;
+        Ok(Json(result))
+    }
+
+    #[tool(
+        description = "Run an allowlisted Maven compile, test-compile, or verify phase in the configured project with optional validated reactor selection; use run_maven for arbitrary goals and arguments"
     )]
     async fn run_maven_lifecycle(
         &self,
