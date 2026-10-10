@@ -600,10 +600,27 @@ report—with one command:
 scripts/test-pyramid.sh
 ```
 
-The human-readable report is written to:
+The gate also measures Rust line coverage of the production code and fails
+below 80%. The metric is covered lines divided by all measurable lines across
+`src/` (including the binaries under `src/bin/`), checked on the unrounded
+value. Every Cargo test target contributes, including the tests that start the
+production binaries as child processes; `cargo-llvm-cov` instruments those
+binaries. The gate clears previous coverage data before each test run so only
+the current run contributes to the result. Dependencies and files under `tests/`
+are not counted, and no production module is excluded. Prerequisites (no silent
+skip; the script stops with a message if they are missing):
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.8.5 --locked
+```
+
+`python3` is also required. The reports are written to:
 
 ```text
 target/mcp-test-report/report.md
+target/coverage/html/index.html
+target/coverage/summary.json
 ```
 
 ### Hosted CI
@@ -611,7 +628,9 @@ target/mcp-test-report/report.md
 GitHub Actions runs the same verification gate from
 `.github/workflows/ci.yml` for pushes to `main` and pull requests targeting
 `main`. The workflow installs Rust `1.89.0`, uses the committed `Cargo.lock`,
-and runs `scripts/test-pyramid.sh` on Ubuntu. It has read-only repository
+and runs `scripts/test-pyramid.sh` on Ubuntu, including the same 80% line
+coverage gate. The `target/coverage/` report is uploaded as the
+`rust-coverage-report` artifact even when the gate fails. It has read-only repository
 permissions, does not persist checkout credentials, and uses no dependency
 cache. Its job and status-check context are both named `CI`.
 
