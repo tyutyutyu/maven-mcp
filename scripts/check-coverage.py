@@ -25,7 +25,7 @@ def main(argv):
         count, covered = lines["count"], lines["covered"]
     except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
         fail(f"missing or unreadable coverage report {argv[1]}: {error!r}")
-    if not (isinstance(count, int) and isinstance(covered, int)) or not 0 <= covered <= count:
+    if type(count) is not int or type(covered) is not int or not 0 <= covered <= count:
         fail(f"invalid line counts in report: covered={covered!r}, count={count!r}")
     if count == 0:
         fail("the report contains zero measurable lines")

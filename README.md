@@ -607,7 +607,10 @@ value. Every Cargo test target contributes, including the tests that start the
 production binaries as child processes; `cargo-llvm-cov` instruments those
 binaries. The gate clears previous coverage data before each test run so only
 the current run contributes to the result. Dependencies and files under `tests/`
-are not counted, and no production module is excluded. Prerequisites (no silent
+are not counted, and no production module is excluded. Unit test modules live
+under `tests/unit/` and are included through `#[cfg(test)]` declarations in their
+production modules, so their test bodies also stay outside the denominator.
+Prerequisites (no silent
 skip; the script stops with a message if they are missing):
 
 ```bash
