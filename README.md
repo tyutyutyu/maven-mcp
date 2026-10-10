@@ -302,10 +302,25 @@ existing inherited `JAVA_HOME` and `PATH` behavior is unchanged.
 
 ## Environment Variables
 
+Archive limit violations fail the requesting tool call with an MCP error; no partial
+index is cached or returned. Malformed JARs may still be skipped with a diagnostic.
+Indexes are built on demand for explicit project requests, never at server startup.
+XML limit violations are errors, never truncated data: project/POM reads fail,
+effective-POM and coverage diagnostics report invalid status with an error, and
+Surefire failures follow the existing report-error contract.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MAX_RESULTS` | `100` | Maximum number of items in one tool response. |
 | `MAX_SOURCE_BYTES` | `1048576` | Maximum size of one source, exact JAR entry, or processed class/resource; returned content is truncated, while oversized inspection input is skipped or reported as an error. |
+| `MAX_XML_BYTES` | `16777216` | Range 1–67108864. Maximum size of one POM, effective POM, JaCoCo or Surefire XML file. Larger files fail the request with an explicit error; they are never truncated or partially parsed. |
+| `MAX_JAR_ENTRIES` | `200000` | Maximum entries in one archive. Range 1–1000000. Checked before ZIP metadata allocation; exceeding it fails the requesting tool call with an MCP error. |
+| `MAX_INDEX_ENTRIES` | `20000000` | Range 1–20000000. Counts every central-directory entry, including directories. Reserved before loading records; exceeding it fails the requesting tool call with an MCP error during project-index construction. |
+| `MAX_INDEX_NAME_BYTES` | `2147483648` | Range 1–2147483648. Counts names of files and directories before ZIP metadata allocation; exceeding it fails project-index construction with an MCP error. |
+| Entry name bytes | `4096` (fixed) | Maximum bytes in each archive entry name, including directories; checked before ZIP metadata allocation. |
+| Central directory bytes | `67108864` (fixed) | Maximum central-directory size per JAR, including extra fields and comments; checked before ZIP metadata allocation. |
+| XML nesting / elements | `128` / `200000` (fixed) | Structural preflight before XML deserialization. |
+| XML aggregate bytes / files | `67108864` / `4096` (fixed) | One shared budget per module-discovery, JaCoCo-report-set or Surefire-report-set operation. Module traversal also has a depth limit of 128. |
 | `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots retained in the in-process project-index cache. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |

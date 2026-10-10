@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
@@ -13,7 +13,6 @@ use cafebabe::{
     attributes::{Annotation, AttributeData, AttributeInfo},
     constant_pool::ConstantPoolItem,
 };
-use rayon::prelude::*;
 use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -539,10 +538,27 @@ impl MavenIndex {
             max_source_bytes,
         };
 
-        let mut records = jar_paths
-            .par_iter()
-            .filter_map(|path| load_jar_record(root, path, max_source_bytes))
-            .collect::<Vec<_>>();
+        // Preflight sequentially, before ZIP metadata or class facts are allocated.
+        let mut budget = ArchiveBudget::configured();
+        let mut paths = jar_paths.iter().collect::<Vec<_>>();
+        paths.sort();
+        let mut records = Vec::new();
+        for path in paths {
+            if parse_coordinate(root, path).is_none() {
+                continue;
+            }
+            match preflight_archive(path, &mut budget) {
+                Ok(()) => {}
+                Err(error) if error.is::<ArchiveLimit>() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, "skipping malformed jar");
+                    continue;
+                }
+            }
+            if let Some(record) = load_jar_record(root, path, max_source_bytes) {
+                records.push(record);
+            }
+        }
         records.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         for record in records {
@@ -802,8 +818,14 @@ impl MavenIndex {
             });
         }
 
-        let xml = std::fs::read_to_string(&path)
-            .with_context(|| format!("cannot read POM for {coordinate}"))?;
+        let xml = crate::config::read_bounded_xml(&path).map_err(|error| {
+            let operation = if error.is::<quick_xml::Error>() {
+                "parse"
+            } else {
+                "read"
+            };
+            anyhow::anyhow!("cannot {operation} POM for {coordinate}: {error:#}")
+        })?;
         let raw: RawPomProject = quick_xml::de::from_str(&xml)
             .with_context(|| format!("cannot parse POM for {coordinate}"))?;
         let descriptor = PomDescriptor::from_raw(coordinate.clone(), raw);
@@ -2137,6 +2159,139 @@ fn parse_coordinate(root: &Path, path: &Path) -> Option<(ArtifactKey, Option<Str
     ))
 }
 
+#[derive(Debug)]
+struct ArchiveLimit(&'static str);
+impl std::fmt::Display for ArchiveLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "archive/index resource limit exceeded: {}", self.0)
+    }
+}
+impl std::error::Error for ArchiveLimit {}
+
+struct ArchiveBudget {
+    entries: usize,
+    names: usize,
+    jar_entries: usize,
+}
+impl ArchiveBudget {
+    fn configured() -> Self {
+        Self {
+            entries: crate::config::max_index_entries(),
+            names: crate::config::max_index_name_bytes(),
+            jar_entries: crate::config::max_jar_entries(),
+        }
+    }
+    fn reserve(&mut self, name_bytes: usize) -> Result<()> {
+        self.entries = self
+            .entries
+            .checked_sub(1)
+            .ok_or(ArchiveLimit("MAX_INDEX_ENTRIES"))?;
+        self.names = self
+            .names
+            .checked_sub(name_bytes)
+            .ok_or(ArchiveLimit("MAX_INDEX_NAME_BYTES"))?;
+        Ok(())
+    }
+}
+
+const MAX_CENTRAL_DIRECTORY_BYTES: u64 = 67_108_864;
+
+// Only a 64 KiB tail and one fixed-size central header are held in memory.
+// Count actual headers too: a forged EOCD count cannot bypass the budget.
+fn preflight_archive(path: &Path, budget: &mut ArchiveBudget) -> Result<()> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let tail_size = length.min(65_557) as usize;
+    file.seek(SeekFrom::End(-(tail_size as i64)))?;
+    let mut tail = vec![0; tail_size];
+    file.read_exact(&mut tail)?;
+    let end = (0..tail.len().saturating_sub(21))
+        .rev()
+        .find(|&i| {
+            tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]
+                && i + 22 + usize::from(u16::from_le_bytes([tail[i + 20], tail[i + 21]]))
+                    == tail.len()
+        })
+        .context("ZIP end of central directory missing")?;
+    let u16_at = |i| u16::from_le_bytes([tail[i], tail[i + 1]]);
+    let u32_at = |i| u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]);
+    if u16_at(end + 4) != 0 || u16_at(end + 6) != 0 {
+        bail!("multi-disk ZIP is unsupported");
+    }
+    let mut count = u64::from(u16_at(end + 10));
+    let mut size = u64::from(u32_at(end + 12));
+    let mut central_end = length - tail_size as u64 + end as u64;
+    if count == 65_535 || size == u64::from(u32::MAX) || u32_at(end + 16) == u32::MAX {
+        let locator_pos = central_end
+            .checked_sub(20)
+            .context("ZIP64 locator missing")?;
+        file.seek(SeekFrom::Start(locator_pos))?;
+        let mut locator = [0; 20];
+        file.read_exact(&mut locator)?;
+        if locator[..4] != [0x50, 0x4b, 0x06, 0x07] {
+            bail!("invalid ZIP64 locator");
+        }
+        let zip64_offset = u64::from_le_bytes(locator[8..16].try_into()?);
+        file.seek(SeekFrom::Start(zip64_offset))?;
+        let mut header = [0; 56];
+        file.read_exact(&mut header)?;
+        if header[..4] != [0x50, 0x4b, 0x06, 0x06] {
+            bail!("invalid ZIP64 end record");
+        }
+        let record_bytes = u64::from_le_bytes(header[4..12].try_into()?);
+        if record_bytes > MAX_CENTRAL_DIRECTORY_BYTES {
+            return Err(ArchiveLimit("MAX_CENTRAL_DIRECTORY_BYTES").into());
+        }
+        count = u64::from_le_bytes(header[32..40].try_into()?);
+        size = u64::from_le_bytes(header[40..48].try_into()?);
+        central_end = zip64_offset;
+    }
+    if count > budget.jar_entries as u64 {
+        return Err(ArchiveLimit("MAX_JAR_ENTRIES").into());
+    }
+    if count > budget.entries as u64 {
+        return Err(ArchiveLimit("MAX_INDEX_ENTRIES").into());
+    }
+    if size > MAX_CENTRAL_DIRECTORY_BYTES {
+        return Err(ArchiveLimit("MAX_CENTRAL_DIRECTORY_BYTES").into());
+    }
+    let start = central_end
+        .checked_sub(size)
+        .context("invalid central directory size")?;
+    file.seek(SeekFrom::Start(start))?;
+    let (mut consumed, mut entries) = (0u64, 0usize);
+    while consumed < size {
+        if size - consumed < 46 {
+            bail!("truncated central directory");
+        }
+        let mut header = [0; 46];
+        file.read_exact(&mut header)?;
+        if header[..4] != [0x50, 0x4b, 0x01, 0x02] {
+            bail!("invalid central directory entry");
+        }
+        entries += 1;
+        if entries > budget.jar_entries {
+            return Err(ArchiveLimit("MAX_JAR_ENTRIES").into());
+        }
+        let field = |i| usize::from(u16::from_le_bytes([header[i], header[i + 1]]));
+        let names = field(28);
+        if names > crate::config::MAX_ENTRY_NAME_BYTES {
+            return Err(ArchiveLimit("MAX_ENTRY_NAME_BYTES").into());
+        }
+        budget.reserve(names)?;
+        let variable_bytes = names + field(30) + field(32);
+        consumed += 46 + variable_bytes as u64;
+        if consumed > size {
+            bail!("central entry exceeds directory size");
+        }
+        file.seek(SeekFrom::Current(variable_bytes as i64))?;
+    }
+    if entries as u64 != count {
+        bail!("central directory entry count mismatch");
+    }
+    Ok(())
+}
+
 fn read_jar_index(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut archive =
@@ -2876,6 +3031,214 @@ mod tests {
             writer.write_all(content).unwrap();
         }
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn artifact_pom_enforces_xml_byte_and_structure_limits() {
+        let root = TempDir::new().unwrap();
+        let jar = root.path().join("org/example/demo/1.0/demo-1.0.jar");
+        write_jar(&jar, &[("x", b"")]);
+        let index = build_index(&root, 10, 1024);
+        let pom = jar.with_extension("pom");
+        for (xml, limit) in [
+            (
+                " ".repeat(crate::config::DEFAULT_MAX_XML_BYTES + 1),
+                "MAX_XML_BYTES",
+            ),
+            (
+                format!(
+                    "{}{}",
+                    "<a>".repeat(crate::config::MAX_XML_DEPTH + 1),
+                    "</a>".repeat(crate::config::MAX_XML_DEPTH + 1)
+                ),
+                "MAX_XML_DEPTH",
+            ),
+        ] {
+            std::fs::write(&pom, xml).unwrap();
+            assert!(
+                index
+                    .pom_descriptor("org.example:demo:1.0")
+                    .unwrap_err()
+                    .to_string()
+                    .contains(limit)
+            );
+        }
+    }
+
+    #[test]
+    fn archive_preflight_enforces_entry_and_name_boundaries_including_directories() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("tiny.jar");
+        let mut writer = ZipWriter::new(File::create(&path).unwrap());
+        writer
+            .add_directory("dir/", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .start_file("x", SimpleFileOptions::default())
+            .unwrap();
+        writer.finish().unwrap();
+        let budget = || ArchiveBudget {
+            entries: 2,
+            names: 5,
+            jar_entries: 2,
+        };
+        let mut exact = budget();
+        preflight_archive(&path, &mut exact).unwrap();
+        assert_eq!((exact.entries, exact.names), (0, 0));
+        for (mut limited, expected) in [
+            (
+                ArchiveBudget {
+                    jar_entries: 1,
+                    ..budget()
+                },
+                "MAX_JAR_ENTRIES",
+            ),
+            (
+                ArchiveBudget {
+                    entries: 1,
+                    ..budget()
+                },
+                "MAX_INDEX_ENTRIES",
+            ),
+            (
+                ArchiveBudget {
+                    names: 4,
+                    ..budget()
+                },
+                "MAX_INDEX_NAME_BYTES",
+            ),
+        ] {
+            assert!(
+                preflight_archive(&path, &mut limited)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+        let mut total = ArchiveBudget {
+            entries: 4,
+            names: 10,
+            jar_entries: 2,
+        };
+        preflight_archive(&path, &mut total).unwrap();
+        preflight_archive(&path, &mut total).unwrap();
+        assert!(
+            preflight_archive(&path, &mut total)
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_INDEX_ENTRIES")
+        );
+        let mut total_names = ArchiveBudget {
+            entries: 10,
+            names: 9,
+            jar_entries: 2,
+        };
+        preflight_archive(&path, &mut total_names).unwrap();
+        assert!(
+            preflight_archive(&path, &mut total_names)
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_INDEX_NAME_BYTES")
+        );
+        for length in [
+            crate::config::MAX_ENTRY_NAME_BYTES,
+            crate::config::MAX_ENTRY_NAME_BYTES + 1,
+        ] {
+            write_jar(&path, &[(&"a".repeat(length), b"")]);
+            let result = preflight_archive(&path, &mut ArchiveBudget::configured());
+            assert_eq!(
+                result.is_ok(),
+                length == crate::config::MAX_ENTRY_NAME_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn archive_preflight_supports_zip64_and_bounds_central_directory_bytes() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("zip64.jar");
+        write_jar(&path, &[("a", b""), ("b", b"")]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut end = bytes.split_off(bytes.len() - 22);
+        let size = u32::from_le_bytes(end[12..16].try_into().unwrap()) as u64;
+        let offset = u32::from_le_bytes(end[16..20].try_into().unwrap()) as u64;
+        let zip64_offset = bytes.len() as u64;
+        let mut zip64 = vec![0; 56];
+        zip64[..4].copy_from_slice(b"PK\x06\x06");
+        zip64[4..12].copy_from_slice(&44u64.to_le_bytes());
+        zip64[12..14].copy_from_slice(&45u16.to_le_bytes());
+        zip64[14..16].copy_from_slice(&45u16.to_le_bytes());
+        zip64[24..32].copy_from_slice(&2u64.to_le_bytes());
+        zip64[32..40].copy_from_slice(&2u64.to_le_bytes());
+        zip64[40..48].copy_from_slice(&size.to_le_bytes());
+        zip64[48..56].copy_from_slice(&offset.to_le_bytes());
+        bytes.extend(zip64);
+        bytes.extend(b"PK\x06\x07");
+        bytes.extend(0u32.to_le_bytes());
+        bytes.extend(zip64_offset.to_le_bytes());
+        bytes.extend(1u32.to_le_bytes());
+        end[8..12].fill(255);
+        end[12..20].fill(255);
+        bytes.extend(end);
+        std::fs::write(&path, &bytes).unwrap();
+        preflight_archive(&path, &mut ArchiveBudget::configured()).unwrap();
+        assert_eq!(read_jar_index(&path).unwrap().1, ["a", "b"]);
+        let size_offset = zip64_offset as usize + 40;
+        bytes[size_offset..size_offset + 8]
+            .copy_from_slice(&(MAX_CENTRAL_DIRECTORY_BYTES + 1).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            preflight_archive(&path, &mut ArchiveBudget::configured())
+                .unwrap_err()
+                .to_string()
+                .contains("MAX_CENTRAL_DIRECTORY_BYTES")
+        );
+    }
+
+    #[test]
+    fn archive_preflight_rejects_many_tiny_entries_and_forged_counts() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("tiny.jar");
+        let mut writer = ZipWriter::new(File::create(&path).unwrap());
+        for i in 0..10_000 {
+            writer
+                .start_file(format!("{i}/"), SimpleFileOptions::default())
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let budget = || ArchiveBudget {
+            entries: 10_000,
+            names: 100_000,
+            jar_entries: 10_000,
+        };
+        preflight_archive(&path, &mut budget()).unwrap();
+        assert!(
+            preflight_archive(
+                &path,
+                &mut ArchiveBudget {
+                    jar_entries: 9999,
+                    ..budget()
+                }
+            )
+            .unwrap_err()
+            .is::<ArchiveLimit>()
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        let end = bytes.len() - 22;
+        bytes[end + 8..end + 12].fill(0);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            preflight_archive(
+                &path,
+                &mut ArchiveBudget {
+                    entries: 9999,
+                    ..budget()
+                }
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("MAX_INDEX_ENTRIES")
+        );
     }
 
     fn push_u16(bytes: &mut Vec<u8>, value: u16) {
