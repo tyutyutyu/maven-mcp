@@ -163,7 +163,13 @@ The complete pre-handoff verification gate is:
 scripts/test-pyramid.sh
 ```
 
-It runs formatting, warning-as-error Clippy, and every Cargo test target. The
+It runs formatting, warning-as-error Clippy, and every Cargo test target under
+`cargo llvm-cov`, then requires at least 80% aggregate Rust line coverage
+(unrounded covered/total lines of `src/`, child-process binaries included, no
+module exclusions; checked by `scripts/check-coverage.py`). Prerequisites:
+`rustup component add llvm-tools-preview`, `cargo install cargo-llvm-cov
+--version 0.8.5 --locked`, and `python3`; a missing tool fails the gate. Reports
+are in `target/coverage/` (`html/index.html`, `summary.json`). The
 integration, lifecycle, scenario, and snapshot targets all start the production
 binary through a real child-process STDIO MCP client.
 

@@ -29,14 +29,26 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt,llvm-tools-preview
           rustup default 1.89.0
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.18.9 --locked
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --version 0.8.5 --locked
 
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check advisories licenses bans sources
 
       - name: Run verification gate
         run: scripts/test-pyramid.sh
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-coverage-report
+          path: target/coverage/
+          if-no-files-found: warn
+          retention-days: 14
