@@ -28,6 +28,8 @@ agent-specific development rules.
   lifecycle.
 - `tests/support/mod.rs`: deterministic temporary Maven fixture repository and a
   real child-process STDIO test server.
+- `tests/unit/`: unit test modules loaded through `#[cfg(test)]` and `#[path]`
+  from their production modules; test bodies stay outside the coverage denominator.
 - `tests/mcp_interface.rs`: integration contract for the public MCP tool catalog
   and error semantics.
 - `tests/scenarios/maven_search.yaml`: human-readable search examples.
@@ -175,7 +177,9 @@ binary through a real child-process STDIO MCP client.
 
 Test modification rules:
 
-- Cover algorithmic edge cases in the unit tests in `src/index.rs`.
+- Keep unit test bodies under `tests/unit/`, including index cases in
+  `tests/unit/index.rs`; use a `#[cfg(test)]` path declaration in the production
+  module so test code is excluded from coverage without excluding production code.
 - Always validate the public protocol through a real child-process STDIO MCP
   client; do not rely only on direct Rust method calls.
 - Integration tests must use a temporary fixture repository. They must not
