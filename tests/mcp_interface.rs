@@ -930,6 +930,68 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
 }
 
 #[tokio::test]
+async fn effective_pom_validates_complete_xml_through_stdio() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let client = server.connect().await?;
+    let project = server.project_path().unwrap();
+    let fixture = project.join(".effective-pom-fixture.xml");
+    for (xml, expected_ids) in [
+        (
+            "<?xml version=\"1.0\"?>\n<!-- generated -->\n  <projects xmlns=\"http://maven.apache.org/POM/4.0.0\"><project><artifactId>a</artifactId></project><project><artifactId>b</artifactId></project></projects>\n",
+            vec!["a", "b"],
+        ),
+        (
+            "<?xml version=\"1.0\"?><!-- generated --><m:project xmlns:m=\"http://maven.apache.org/POM/4.0.0\"><m:artifactId>solo</m:artifactId></m:project>",
+            vec!["solo"],
+        ),
+    ] {
+        std::fs::write(&fixture, xml)?;
+        let result = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("get_effective_pom").with_arguments(arguments(
+                        json!({ "project_path": project.display().to_string() }),
+                    )),
+                )
+                .await?,
+        );
+        assert_eq!(result["status"], "available");
+        let ids: Vec<_> = result["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["coordinate"]["artifact_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected_ids);
+    }
+    for xml in [
+        "<other/>",
+        "<projects><project><artifactId>a</artifactId>",
+        "<project/><other>",
+        "<project><artifactId>a</artifactId></project><other>",
+        "<projects><project><artifactId>a</artifactId></project></projects><project/>",
+        "<project/>",
+        "<project><artifactId>a</artifactId></project>text",
+    ] {
+        std::fs::write(&fixture, xml)?;
+        let result = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("get_effective_pom").with_arguments(arguments(
+                        json!({ "project_path": project.display().to_string() }),
+                    )),
+                )
+                .await?,
+        );
+        assert_eq!(result["status"], "invalid", "{xml}");
+        assert_eq!(result["projects"], json!([]), "{xml}");
+        assert!(!result["error"].as_str().unwrap().is_empty(), "{xml}");
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> {
     let server = TestServer::start_with_project().await?;
     let other_server = TestServer::start_with_project().await?;

@@ -258,7 +258,13 @@ for arg in "$@"; do
   esac
 done
 case " $* " in
-  *" help:effective-pom "*) printf '%s' '<project><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>jar</packaging></project>' > "$output" ;;
+  *" help:effective-pom "*)
+    if [ -f .effective-pom-fixture.xml ]; then
+      cat .effective-pom-fixture.xml > "$output"
+    else
+      printf '%s' '<project><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>jar</packaging></project>' > "$output"
+    fi
+    ;;
   *" dependency:tree "*) printf '%s\n' '[INFO] --- dependency:3.8.1:tree (default-cli) @ fixture-project ---' '[INFO] org.example:fixture-project:jar:1.0' '[INFO] \- org.libs:helper:jar:2.0:compile' ;;
   *" dependency:build-classpath "*)
     classpath="$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar"

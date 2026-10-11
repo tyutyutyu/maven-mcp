@@ -2018,13 +2018,70 @@ struct RawEffectivePlugin {
     version: Option<String>,
 }
 
+fn effective_pom_root(xml: &str) -> Result<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut root = None;
+    let mut depth = 0usize;
+    loop {
+        let event = reader.read_event()?;
+        let empty = matches!(&event, Event::Empty(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                if depth == 0 {
+                    if root.is_some() {
+                        bail!("effective POM contains multiple root elements");
+                    }
+                    root = Some(element.local_name().into_inner().to_owned());
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .context("unexpected effective POM end tag")?;
+            }
+            Event::Text(text) if depth == 0 => {
+                if !text
+                    .as_ref()
+                    .bytes()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                {
+                    bail!("effective POM contains text outside the root element");
+                }
+            }
+            Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
+                bail!("effective POM contains content outside the root element");
+            }
+            Event::Eof => {
+                if depth != 0 {
+                    bail!("effective POM contains unclosed elements");
+                }
+                return root.context("effective POM contains no root element");
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_effective_pom(path: &Path) -> Result<Vec<EffectiveProject>> {
     let xml = crate::config::read_bounded_xml(path)?;
-    let mut raw_projects = if xml.trim_start().starts_with("<projects") {
-        quick_xml::de::from_str::<RawEffectiveProjects>(&xml)?.projects
-    } else {
-        vec![quick_xml::de::from_str::<RawEffectiveProject>(&xml)?]
+    let mut raw_projects = match effective_pom_root(&xml)?.as_str() {
+        "projects" => quick_xml::de::from_str::<RawEffectiveProjects>(&xml)?.projects,
+        "project" => vec![quick_xml::de::from_str::<RawEffectiveProject>(&xml)?],
+        other => bail!(
+            "unexpected effective POM root element `{}`; expected `project` or `projects`",
+            other
+        ),
     };
+    if raw_projects
+        .iter()
+        .any(|project| project.artifact_id.trim().is_empty())
+    {
+        bail!("effective POM project has an empty artifactId");
+    }
     let mut projects = raw_projects
         .drain(..)
         .map(|raw| {
