@@ -21,6 +21,269 @@ fn structured(result: rmcp::model::CallToolResult) -> Value {
         .expect("tool should return structured content")
 }
 
+async fn overlapping_report_calls(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    gate: &support::MavenReportGate,
+    first: CallToolRequestParams,
+    second: CallToolRequestParams,
+) -> Result<(Value, Value)> {
+    let first_call = client.call_tool(first);
+    let second_call = async {
+        gate.wait_started().await?;
+        let call = client.call_tool(second);
+        tokio::pin!(call);
+        // A round trip establishes that competing requests have been sent while
+        // the first child remains held at its marker. No elapsed delay releases it.
+        tokio::select! {
+            biased;
+            result = &mut call => panic!("second report request completed before release: {result:?}"),
+            result = client.list_all_tools() => { result?; }
+        }
+        gate.release()?;
+        call.await.map_err(anyhow::Error::from)
+    };
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(first_call, second_call)
+    })
+    .await?;
+    Ok((structured(first?), structured(second?)))
+}
+
+#[tokio::test]
+async fn parallel_focused_tests_keep_results_and_last_failures_request_scoped() -> Result<()> {
+    for failing in [false, true] {
+        let server = TestServer::start_with_project().await?;
+        let project = server.project_path().unwrap();
+        let body = r#"
+for arg in "$@"; do case "$arg" in -Dtest=*) test_class=${arg#-Dtest=} ;; esac; done
+mkdir -p target/surefire-reports
+failures=0
+failure=''
+if [ -e .fail-tests ]; then failures=1; failure='<failure message="fixture failure"/>'; fi
+printf '<testsuite tests="1" failures="%s" errors="0" skipped="0"><testcase classname="%s" name="runs">%s</testcase></testsuite>' "$failures" "$test_class" "$failure" > "target/surefire-reports/TEST-$test_class.xml"
+if [ "$failures" = 1 ]; then exit 1; fi
+"#;
+        let gate = support::MavenReportGate::new(project, body)?;
+        if failing {
+            std::fs::write(project.join(".fail-tests"), "fail")?;
+        }
+        let client = server.connect().await?;
+        let request = |test_class: &str| {
+            CallToolRequestParams::new("run_maven_test").with_arguments(arguments(
+                json!({"project_path": project, "test_class": test_class}),
+            ))
+        };
+        let (first, second) =
+            overlapping_report_calls(&client, &gate, request("FirstTest"), request("SecondTest"))
+                .await?;
+        for result in [&first, &second] {
+            assert_eq!(result["report_status"], "available", "{result}");
+            assert_eq!(
+                result["summary"],
+                json!({"passed": usize::from(!failing), "failed": usize::from(failing), "errors": 0, "skipped": 0})
+            );
+        }
+        if failing {
+            assert_eq!(first["failures"][0]["class_name"], "FirstTest");
+            assert_eq!(second["failures"][0]["class_name"], "SecondTest");
+        }
+        let last_request = |root: &std::path::Path| {
+            CallToolRequestParams::new("get_last_maven_test_failures")
+                .with_arguments(arguments(json!({"project_path": root})))
+        };
+        let last = structured(client.call_tool(last_request(project)).await?);
+        assert_eq!(last["available"], true);
+        assert_eq!(last["summary"], second["summary"]);
+        assert_eq!(last["failures"], second["failures"]);
+
+        let other = server.add_trusted_project("other-test-project")?;
+        assert_eq!(
+            structured(client.call_tool(last_request(&other)).await?)["available"],
+            false
+        );
+        let other_gate = support::MavenReportGate::new(&other, body)?;
+        other_gate.release()?;
+        std::fs::write(other.join(".fail-tests"), "fail")?;
+        let other_result =
+            structured(
+                client
+                    .call_tool(CallToolRequestParams::new("run_maven_test").with_arguments(
+                        arguments(json!({"project_path": other, "test_class": "OtherTest"})),
+                    ))
+                    .await?,
+            );
+        assert_eq!(other_result["failures"][0]["class_name"], "OtherTest");
+        let other_last = structured(client.call_tool(last_request(&other)).await?);
+        assert_eq!(other_last["failures"], other_result["failures"]);
+        assert_eq!(
+            structured(client.call_tool(last_request(project)).await?),
+            last
+        );
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_effective_pom_requests_keep_modules_and_projects_isolated() -> Result<()> {
+    for same_project in [true, false] {
+        let server = TestServer::start_with_project().await?;
+        let first_project = server.project_path().unwrap();
+        std::fs::write(first_project.join(".identity"), "first-project")?;
+        std::fs::write(
+            first_project.join("pom.xml"),
+            "<project><artifactId>first-project</artifactId><packaging>pom</packaging><modules><module>alpha</module></modules></project>",
+        )?;
+        std::fs::create_dir(first_project.join("alpha"))?;
+        std::fs::write(
+            first_project.join("alpha/pom.xml"),
+            "<project><artifactId>alpha</artifactId></project>",
+        )?;
+        let body = r#"
+identity=$(cat .identity)
+next_module=false
+for arg in "$@"; do
+  if [ "$next_module" = true ]; then identity=$arg; next_module=false; fi
+  case "$arg" in
+    -Doutput=*) output=${arg#-Doutput=} ;;
+    --projects) next_module=true ;;
+  esac
+done
+printf '<project><groupId>org.fixture</groupId><artifactId>%s</artifactId><version>1</version></project>' "$identity" > "$output"
+"#;
+        let gate = support::MavenReportGate::new(first_project, body)?;
+        let second_project = if same_project {
+            first_project.to_owned()
+        } else {
+            let other = server.add_trusted_project("second-pom-project")?;
+            std::fs::write(other.join(".identity"), "second-project")?;
+            support::MavenReportGate::new(&other, body)?.release()?;
+            other
+        };
+        let client = server.connect().await?;
+        let first = CallToolRequestParams::new("get_effective_pom")
+            .with_arguments(arguments(json!({"project_path": first_project})));
+        let second = CallToolRequestParams::new("get_effective_pom").with_arguments(arguments(json!({"project_path": second_project, "module": if same_project { Some("alpha") } else { None }})));
+        let (first, second) = overlapping_report_calls(&client, &gate, first, second).await?;
+        for result in [&first, &second] {
+            assert_eq!(result["status"], "available", "{result}");
+            assert_eq!(result["projects"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(
+            first["projects"][0]["coordinate"]["artifact_id"],
+            "first-project"
+        );
+        assert_eq!(
+            second["projects"][0]["coordinate"]["artifact_id"],
+            if same_project {
+                "alpha"
+            } else {
+                "second-project"
+            }
+        );
+        for project in [first_project, second_project.as_path()] {
+            assert!(!project.join("target/maven-mcp/effective-pom.xml").exists());
+        }
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_errors_and_timeouts_release_the_permit_and_clean_effective_pom() -> Result<()> {
+    for tool in ["run_maven_test", "get_effective_pom"] {
+        for mode in ["invalid", "failure", "timeout"] {
+            let server = TestServer::start_with_project().await?;
+            let project = server.project_path().unwrap();
+            let body = r#"
+output=''
+for arg in "$@"; do case "$arg" in -Doutput=*) output=${arg#-Doutput=} ;; -Dtest=*) test_class=${arg#-Dtest=} ;; esac; done
+if [ -z "$output" ]; then
+  mkdir -p target/surefire-reports
+  output="target/surefire-reports/TEST-$test_class.xml"
+  valid='<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="RecoveryTest" name="passes"/></testsuite>'
+else
+  valid='<project><artifactId>recovered</artifactId></project>'
+fi
+if [ -e .failure-mode ]; then
+  mode=$(cat .failure-mode)
+  if [ "$mode" = failure ]; then exit 1; fi
+  printf '%s' '<broken>' > "$output"
+  if [ "$mode" = timeout ]; then
+    touch .report-gate/partial
+    while [ ! -e .report-gate/finish ]; do sleep 0.01; done
+  fi
+  exit 0
+fi
+printf '%s' "$valid" > "$output"
+"#;
+            support::MavenReportGate::new(project, body)?.release()?;
+            std::fs::write(project.join(".failure-mode"), mode)?;
+            let (client, _) = server
+                .connect_with_limits(&[("MAVEN_TIMEOUT_SECONDS", "1")])
+                .await?;
+            let request = |test_class: &str| {
+                CallToolRequestParams::new(tool).with_arguments(arguments(
+                    if tool == "run_maven_test" {
+                        json!({"project_path": project, "test_class": test_class})
+                    } else {
+                        json!({"project_path": project})
+                    },
+                ))
+            };
+            let result = structured(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.call_tool(request("BrokenTest")),
+                )
+                .await??,
+            );
+            let status_field = if tool == "run_maven_test" {
+                "report_status"
+            } else {
+                "status"
+            };
+            assert_eq!(
+                result[status_field],
+                if mode == "failure" {
+                    "missing"
+                } else {
+                    "invalid"
+                },
+                "{result}"
+            );
+            if mode == "timeout" {
+                assert_eq!(result["build"]["outcome"], "timeout", "{result}");
+                assert!(project.join(".report-gate/partial").exists());
+            } else if mode == "failure" {
+                assert_eq!(result["build"]["outcome"], "build_failure");
+            }
+            assert!(!project.join("target/maven-mcp/effective-pom.xml").exists());
+            std::fs::remove_file(project.join(".failure-mode"))?;
+            let recovered = structured(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.call_tool(request("RecoveryTest")),
+                )
+                .await??,
+            );
+            assert_eq!(recovered[status_field], "available", "{recovered}");
+            assert_eq!(recovered["build"]["outcome"], "success");
+            if tool == "run_maven_test" {
+                assert_eq!(recovered["summary"]["passed"], 1);
+            } else {
+                assert_eq!(
+                    recovered["projects"][0]["coordinate"]["artifact_id"],
+                    "recovered"
+                );
+            }
+            assert!(!project.join("target/maven-mcp/effective-pom.xml").exists());
+            client.cancel().await?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
     let server = TestServer::start_with_project().await?;

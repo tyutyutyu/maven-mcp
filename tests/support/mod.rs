@@ -228,6 +228,41 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Holds the first Maven child until the test has issued its competing request.
+/// Poll intervals only observe markers; elapsed time never releases the child.
+pub struct MavenReportGate {
+    directory: PathBuf,
+}
+
+impl MavenReportGate {
+    pub fn new(project: &Path, body: &str) -> Result<Self> {
+        let directory = project.join(".report-gate");
+        std::fs::create_dir(&directory)?;
+        write_executable(
+            &project.join("mvnw"),
+            &format!(
+                "#!/bin/sh\nset -eu\ntouch .report-gate/started\nwhile [ ! -e .report-gate/release ]; do sleep 0.01; done\n{body}\n"
+            ),
+        )?;
+        Ok(Self { directory })
+    }
+
+    pub async fn wait_started(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !self.directory.join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("report-producing Maven child did not reach the marker")
+    }
+
+    pub fn release(&self) -> Result<()> {
+        std::fs::write(self.directory.join("release"), "release")?;
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 fn fixture_project(root: &Path, include_inspection_fixtures: bool) -> Result<()> {
     std::fs::create_dir_all(root)?;
