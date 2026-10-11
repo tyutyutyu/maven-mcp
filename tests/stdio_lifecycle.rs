@@ -360,3 +360,117 @@ async fn eof_does_not_leave_an_active_maven_process_group() -> Result<()> {
     .context("Maven process group survived STDIO EOF")?;
     Ok(())
 }
+
+#[tokio::test]
+async fn exited_parent_pipe_holders_stop_on_eof_sigterm_and_request_cancellation() -> Result<()> {
+    use nix::{
+        sys::signal::{Signal, kill},
+        unistd::Pid,
+    };
+    use std::time::Duration;
+
+    for action in ["eof", "sigterm", "cancel"] {
+        for redirections in ["", ">/dev/null", "2>/dev/null"] {
+            let fixture = TestServer::start_with_project().await?;
+            let project = fixture.project_path().unwrap();
+            let holder = support::PipeHolder::new(project, redirections)?;
+            let other = fixture.add_trusted_project("recovery")?;
+            let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+                .env(
+                    "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+                    fixture.trusted_project_directory().unwrap(),
+                )
+                .env("MAVEN_TIMEOUT_SECONDS", "30")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut stdin = child.stdin.take().context("missing stdin")?;
+            let mut lines = BufReader::new(child.stdout.take().context("missing stdout")?).lines();
+            stdin
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": {"name": "pipe-cleanup", "version": "1"}}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+                .await??
+                .context("missing initialize response")?;
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await?;
+            stdin
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                            "params": {"name": "run_maven", "arguments": {
+                                "project_path": project, "arguments": []}}
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            holder.wait_started().await?;
+            if action == "cancel" {
+                stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"regression\"}}\n").await?;
+                holder.assert_stopped().await.with_context(|| {
+                    format!("descendant cleanup: {action}, pipes: {redirections}")
+                })?;
+                stdin
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            json!({
+                                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                "params": {"name": "run_maven", "arguments": {
+                                    "project_path": other, "arguments": []}}
+                            })
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                let response = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        let line = lines.next_line().await?.context("server closed stdout")?;
+                        let value: Value = serde_json::from_str(&line)?;
+                        if value["id"] == 3 {
+                            break Ok::<_, anyhow::Error>(value);
+                        }
+                    }
+                })
+                .await??;
+                assert_eq!(
+                    response["result"]["structuredContent"]["status"], "success",
+                    "{response}"
+                );
+            } else if action == "sigterm" {
+                kill(
+                    Pid::from_raw(i32::try_from(child.id().context("missing server PID")?)?),
+                    Signal::SIGTERM,
+                )?;
+            }
+            if action != "sigterm" {
+                drop(stdin);
+            }
+            let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+                .await
+                .with_context(|| format!("server shutdown: {action}, pipes: {redirections}"))??;
+            assert!(status.success(), "{action}: {status}");
+            holder
+                .assert_stopped()
+                .await
+                .with_context(|| format!("descendant cleanup: {action}, pipes: {redirections}"))?;
+        }
+    }
+    Ok(())
+}

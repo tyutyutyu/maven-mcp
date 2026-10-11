@@ -1230,4 +1230,20 @@ impl MavenMcpServer {
     version = "0.1.0",
     instructions = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository."
 )]
-impl ServerHandler for MavenMcpServer {}
+impl ServerHandler for MavenMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let cancellation = context.ct.clone();
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                Err(ErrorData::internal_error("tool request cancelled", None))
+            }
+            result = self.tool_router.call(call) => result,
+        }
+    }
+}
