@@ -2448,17 +2448,35 @@ fn parse_dependency_tree(output: &str) -> Vec<DependencyNode> {
         .lines()
         .filter_map(|line| {
             let line = line.trim().trim_start_matches("[INFO]").trim();
-            let marker = line.find("+- ").or_else(|| line.find("\\- "));
-            let (depth, coordinate) =
-                marker.map_or((0, line), |index| (index / 3 + 1, line[index + 3..].trim()));
+            // Unmarked lines include the project root and Maven diagnostics.
+            let marker = line.find("+- ").or_else(|| line.find("\\- "))?;
+            let prefix = &line[..marker];
+            if !prefix.len().is_multiple_of(3)
+                || !prefix
+                    .as_bytes()
+                    .chunks_exact(3)
+                    .all(|chunk| chunk == b"|  " || chunk == b"   ")
+            {
+                return None;
+            }
+            let depth = marker / 3 + 1;
+            let coordinate = line[marker + 3..].trim();
             let coordinate = coordinate.split_whitespace().next()?.trim_end_matches(',');
             let parts = coordinate.split(':').collect::<Vec<_>>();
+            if parts.iter().any(|part| part.is_empty())
+                || !matches!(
+                    parts.last().copied(),
+                    Some("compile" | "provided" | "runtime" | "test" | "system" | "import")
+                )
+            {
+                return None;
+            }
             let (normalized, scope) = match parts.as_slice() {
-                [group, artifact, _kind, scope, version] => (
+                [group, artifact, _kind, version, scope] => (
                     format!("{group}:{artifact}:{version}"),
                     Some((*scope).to_owned()),
                 ),
-                [group, artifact, _kind, classifier, scope, version] => (
+                [group, artifact, _kind, classifier, version, scope] => (
                     format!("{group}:{artifact}:{version}:{classifier}"),
                     Some((*scope).to_owned()),
                 ),

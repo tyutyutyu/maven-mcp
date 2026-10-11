@@ -673,15 +673,33 @@ async fn resolves_effective_pom_into_structured_metadata() {
 
 #[tokio::test]
 async fn parses_dependency_tree_and_normalizes_classpath_coordinates() {
-    let tree_script = "#!/bin/sh\nprintf '[INFO] org.example:demo:jar:1.0\\n[INFO] +- org.libs:first:jar:compile:2.0\\n[INFO] \\- org.libs:native:jar:linux:runtime:3.0\\n'\n";
-    let (_root, config) = wrapper_project(tree_script);
+    // Captured with Apache Maven 3.9.9 and maven-dependency-plugin 3.8.1:
+    // mvn -s settings.xml -B -ntp -Dmaven.repo.local=<fixture-repository>
+    //   org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree -DoutputType=text
+    // settings.xml is <settings/>; the fixture repository contains synthetic JARs/POMs.
+    // Expected nodes below are handwritten from the captured output.
+    let tree_script = format!(
+        "#!/bin/sh\ncat <<'TREE'\n{}TREE\n",
+        include_str!("../fixtures/dependency_tree.txt")
+    );
+    let (_root, config) = wrapper_project(&tree_script);
     let runner = MavenRunner::discover(&config).unwrap();
     let tree = runner
         .dependency_tree(None, Some(DependencyScope::Runtime), Some("org.libs:*"))
         .await;
-    assert_eq!(tree.dependencies.len(), 2);
-    assert_eq!(tree.dependencies[0].coordinate, "org.libs:first:2.0");
-    assert_eq!(tree.dependencies[1].coordinate, "org.libs:native:3.0:linux");
+    assert_eq!(tree.dependencies.len(), 4);
+    assert_eq!(
+        tree.dependencies
+            .iter()
+            .map(|node| (node.coordinate.as_str(), node.scope.as_deref(), node.depth))
+            .collect::<Vec<_>>(),
+        vec![
+            ("org.libs:helper:2.0", Some("compile"), 1),
+            ("org.example:lib:1.2.3", Some("compile"), 1),
+            ("org.libs:transitive:2.0", Some("runtime"), 2),
+            ("org.libs:native:3.0:linux", Some("runtime"), 1),
+        ]
+    );
     assert!(!tree.incomplete);
 
     let repository = config.execution_repository.as_ref().unwrap();
@@ -711,9 +729,58 @@ async fn parses_dependency_tree_and_normalizes_classpath_coordinates() {
     );
 }
 
+#[test]
+fn dependency_tree_rejects_roots_missing_scopes_and_coordinate_shaped_noise() {
+    // Adversarial additions to the Maven 3.9.9 / dependency-plugin 3.8.1 capture.
+    let output = format!(
+        "{}{}",
+        include_str!("../fixtures/dependency_tree.txt"),
+        r"[INFO] cache:entry:state:ready:retry
+[INFO] cache:entry:state:classifier:ready:retry
+[INFO] root:project:jar:1.0:compile
+[INFO] +- cache:entry:state:ready:retry
+[INFO] +- cache:entry:state:classifier:ready:retry
+[INFO] +- org.example:missing:jar:1.0
+[INFO] +- org.example:missing:jar:linux:1.0
+[INFO] +- org.example:missing:jar:linux:extra:1.0
+[INFO] diagnostic +- org.example:noise:jar:1.0:compile
+[ERROR] +- org.example:noise:jar:1.0:compile
+[INFO] +- :empty:jar:1.0:compile
+[INFO] +- org.example::jar:1.0:compile
+[INFO] +- org.example:empty::1.0:compile
+[INFO] +- org.example:empty:jar::compile
+[INFO] +- org.example:empty:jar::1.0:compile
+[INFO] +- org.example:empty:jar:1.0:
+"
+    );
+    let nodes = parse_dependency_tree(&output);
+    assert_eq!(nodes.len(), 4);
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| (node.coordinate.as_str(), node.scope.as_deref(), node.depth))
+            .collect::<Vec<_>>(),
+        vec![
+            ("org.libs:helper:2.0", Some("compile"), 1),
+            ("org.example:lib:1.2.3", Some("compile"), 1),
+            ("org.libs:transitive:2.0", Some("runtime"), 2),
+            ("org.libs:native:3.0:linux", Some("runtime"), 1),
+        ]
+    );
+    assert_eq!(parse_dependency_tree(&output), nodes);
+    for scope in ["compile", "provided", "runtime", "test", "system", "import"] {
+        let nodes = parse_dependency_tree(&format!("[INFO] \\- org.example:lib:jar:1.2.3:{scope}"));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].coordinate, "org.example:lib:1.2.3");
+        assert_eq!(nodes[0].scope.as_deref(), Some(scope));
+        assert_eq!(nodes[0].depth, 1);
+    }
+}
+
 #[tokio::test]
 async fn dependency_diagnostics_preserve_transitive_depth_and_report_failures_and_truncation() {
-    let script = "#!/bin/sh\nprintf '[INFO] +- org.libs:first:jar:compile:1\\n[INFO] |  \\- org.libs:transitive:jar:runtime:2\\n[ERROR] dependency resolution failed with a deliberately long diagnostic line\\n'\nexit 1\n";
+    // Synthetic failure/truncation variant of the captured Maven 3.9.9 / plugin 3.8.1 format.
+    let script = "#!/bin/sh\nprintf '[INFO] +- org.libs:first:jar:1:compile\\n[INFO] |  \\- org.libs:transitive:jar:2:runtime\\n[ERROR] dependency resolution failed with a deliberately long diagnostic line\\n'\nexit 1\n";
     let (_root, mut config) = wrapper_project(script);
     config.max_output_bytes = 110;
     let runner = MavenRunner::discover(&config).unwrap();
