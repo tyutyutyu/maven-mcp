@@ -1,0 +1,19 @@
+[INFO] Scanning for projects...
+[INFO]
+[INFO] --------------------< org.example:fixture-project >---------------------
+[INFO] Building fixture-project 1.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO]
+[INFO] --- dependency:3.8.1:tree (default-cli) @ fixture-project ---
+[INFO] org.example:fixture-project:jar:1.0
+[INFO] +- org.libs:helper:jar:2.0:compile
+[INFO] +- org.example:lib:jar:1.2.3:compile
+[INFO] |  \- org.libs:transitive:jar:2.0:runtime
+[INFO] \- org.libs:native:jar:linux:3.0:runtime
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  8.780 s
+[INFO] Finished at: 2026-10-11T14:07:33+02:00
+[INFO] ------------------------------------------------------------------------

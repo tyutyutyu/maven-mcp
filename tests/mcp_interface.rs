@@ -1070,10 +1070,13 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
             )
             .await?,
     );
+    assert_eq!(dependency_tree["dependencies"].as_array().unwrap().len(), 1);
     assert_eq!(
         dependency_tree["dependencies"][0]["coordinate"],
         "org.libs:helper:2.0"
     );
+    assert_eq!(dependency_tree["dependencies"][0]["scope"], "compile");
+    assert_eq!(dependency_tree["dependencies"][0]["depth"], 1);
 
     let resolution = structured(
         client

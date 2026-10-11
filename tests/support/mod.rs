@@ -240,6 +240,10 @@ fn fixture_project(root: &Path, include_inspection_fixtures: bool) -> Result<()>
         root.join(".mvn/wrapper/maven-wrapper.properties"),
         "distributionUrl=https://example.invalid/maven.zip",
     )?;
+    // Helper-only projection of tests/fixtures/dependency_tree.txt (other branches pruned).
+    // Captured using Apache Maven 3.9.9, maven-dependency-plugin 3.8.1:
+    // mvn -s settings.xml -B -ntp -Dmaven.repo.local=<fixture-repository>
+    //   org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree -DoutputType=text
     let wrapper = root.join("mvnw");
     std::fs::write(
         &wrapper,
@@ -255,7 +259,7 @@ for arg in "$@"; do
 done
 case " $* " in
   *" help:effective-pom "*) printf '%s' '<project><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>jar</packaging></project>' > "$output" ;;
-  *" dependency:tree "*) printf '%s\n' '[INFO] org.example:fixture-project:jar:1.0' '[INFO] \- org.libs:helper:jar:compile:2.0' ;;
+  *" dependency:tree "*) printf '%s\n' '[INFO] --- dependency:3.8.1:tree (default-cli) @ fixture-project ---' '[INFO] org.example:fixture-project:jar:1.0' '[INFO] \- org.libs:helper:jar:2.0:compile' ;;
   *" dependency:build-classpath "*)
     classpath="$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar"
     if [ -f .repository-inspection-fixture ]; then
