@@ -1081,3 +1081,54 @@ fn classifies_compiler_test_and_reactor_results() {
     });
     assert_eq!(tests.outcome, MavenBuildOutcome::TestFailure);
 }
+
+#[test]
+fn effective_pom_root_is_detected_from_xml_events() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("effective.xml");
+    let module = |artifact: &str| {
+        format!(
+            "<project><groupId>g</groupId><artifactId>{artifact}</artifactId><version>1</version></project>"
+        )
+    };
+    let multi = format!(
+        "<?xml version=\"1.0\"?>\n<!-- generated -->\n  <projects xmlns=\"http://maven.apache.org/POM/4.0.0\">{}{}</projects>",
+        module("a"),
+        module("b")
+    );
+    fs::write(&path, multi).unwrap();
+    let ids: Vec<_> = parse_effective_pom(&path)
+        .unwrap()
+        .into_iter()
+        .map(|project| project.coordinate.artifact_id)
+        .collect();
+    assert_eq!(ids, ["a", "b"]);
+
+    let single = format!(
+        "<?xml version=\"1.0\"?><!-- c -->{}",
+        module("solo").replace(
+            "<project>",
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">"
+        )
+    );
+    fs::write(&path, single).unwrap();
+    assert_eq!(parse_effective_pom(&path).unwrap().len(), 1);
+
+    for bad in [
+        "<?xml version=\"1.0\"?><other/>",
+        "<!-- only comment -->",
+        "<projects><project><artifactId>a</artifactId>",
+        "<project/><other>",
+        "<project><artifactId>a</artifactId></project><other>",
+        "<projects><project><artifactId>a</artifactId></project></projects><project/>",
+        "<project/>",
+        "<project><artifactId> </artifactId></project>",
+        "text<project><artifactId>a</artifactId></project>",
+        "<project><artifactId>a</artifactId></project>text",
+        "<project><artifactId>a</artifactId></project><![CDATA[text]]>",
+        "<project><artifactId>a</artifactId></project>&amp;",
+    ] {
+        fs::write(&path, bad).unwrap();
+        assert!(parse_effective_pom(&path).is_err(), "{bad}");
+    }
+}
