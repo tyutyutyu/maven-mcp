@@ -587,6 +587,84 @@ async fn discovers_and_runs_focused_tests_with_structured_surefire_results() {
 }
 
 #[tokio::test]
+async fn focused_test_snapshots_only_after_acquiring_the_global_permit() {
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+    };
+
+    let (root, config) = wrapper_project(
+        r#"#!/bin/sh
+mkdir -p target/surefire-reports
+printf '%s' '<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="SecondTest" name="passes"/></testsuite>' > target/surefire-reports/TEST-SecondTest.xml
+"#,
+    );
+    let runner = MavenRunner::discover(&config).unwrap();
+    let permit = runner.permit.acquire().await.unwrap();
+    let invocation = FocusedTestInvocation {
+        test_class: "SecondTest".to_owned(),
+        test_method: None,
+        module: None,
+        also_make: false,
+    };
+    let call = runner.run_focused_test(&invocation);
+    tokio::pin!(call);
+    assert!(matches!(
+        call.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+
+    // Simulate the in-flight request producing its own report while the next
+    // request waits. The old implementation captured its snapshot too early.
+    let reports = root.path().join("target/surefire-reports");
+    fs::create_dir_all(&reports).unwrap();
+    fs::write(reports.join("TEST-FirstTest.xml"), r#"<testsuite tests="1" failures="0" errors="0" skipped="0"><testcase classname="FirstTest" name="passes"/></testsuite>"#).unwrap();
+    drop(permit);
+    let result = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap();
+    assert_eq!(result.report_status, TestReportStatus::Available);
+    assert_eq!(result.summary.as_ref().unwrap().passed, 1);
+    assert_eq!(runner.last_test_failures().await.summary, result.summary);
+}
+
+#[tokio::test]
+async fn focused_test_holds_the_permit_until_the_last_result_is_saved() {
+    let (_root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
+    let runner = MavenRunner::discover(&config).unwrap();
+    let last = runner.last_test_result.read().await;
+    let worker = runner.clone();
+    let task = tokio::spawn(async move {
+        worker
+            .run_focused_test(&FocusedTestInvocation {
+                test_class: "FirstTest".to_owned(),
+                test_method: None,
+                module: None,
+                also_make: false,
+            })
+            .await
+    });
+    // A queued writer makes new readers wait. This handshake proves that the
+    // child has finished and the request is blocked saving its result.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runner.last_test_result.try_read().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(runner.permit.available_permits(), 0);
+    drop(last);
+    let result = task.await.unwrap();
+    assert!(runner.last_test_failures().await.available);
+    assert_eq!(result.report_status, TestReportStatus::Missing);
+    assert_eq!(runner.permit.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn rejects_shell_syntax_in_focused_test_selectors() {
     let (_root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
     let runner = MavenRunner::discover(&config).unwrap();
@@ -669,6 +747,79 @@ async fn resolves_effective_pom_into_structured_metadata() {
         result.projects[0].plugins[0].artifact_id,
         "maven-compiler-plugin"
     );
+    assert!(
+        !config
+            .project_root
+            .join("target/maven-mcp/effective-pom.xml")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn effective_pom_clears_stale_outputs_and_cleans_every_result() {
+    for (body, expected) in [
+        ("exit 1", DiagnosticStatus::Missing),
+        (
+            "printf '%s' '<project>' > \"$output\"; exit 1",
+            DiagnosticStatus::Invalid,
+        ),
+        (
+            "printf '%s' '<project><artifactId>fresh</artifactId></project>' > \"$output\"",
+            DiagnosticStatus::Available,
+        ),
+    ] {
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in -Doutput=*) output=${{arg#-Doutput=}} ;; esac; done\n{body}\n"
+        );
+        let (_root, config) = wrapper_project(&script);
+        let output = config
+            .project_root
+            .join("target/maven-mcp/effective-pom.xml");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, "<project><artifactId>stale</artifactId></project>").unwrap();
+        let runner = MavenRunner::discover(&config).unwrap();
+        let result = runner.effective_pom(None).await;
+        assert_eq!(result.status, expected);
+        if result.status == DiagnosticStatus::Available {
+            assert_eq!(result.projects[0].coordinate.artifact_id, "fresh");
+        }
+        assert!(!output.exists(), "output survived {expected:?}");
+        assert_eq!(runner.permit.available_permits(), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelling_effective_pom_removes_partial_output_and_releases_the_permit() {
+    let (root, config) = wrapper_project(
+        r#"#!/bin/sh
+for arg in "$@"; do case "$arg" in -Doutput=*) output=${arg#-Doutput=} ;; esac; done
+printf '%s' '<project>' > "$output"
+touch started
+while [ ! -e release ]; do sleep 0.01; done
+"#,
+    );
+    let runner = MavenRunner::discover(&config).unwrap();
+    let worker = runner.clone();
+    let task = tokio::spawn(async move { worker.effective_pom(None).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !root.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        !root
+            .path()
+            .join("target/maven-mcp/effective-pom.xml")
+            .exists()
+    );
+    assert_eq!(runner.permit.available_permits(), 1);
+    write_executable(&root.path().join("mvnw"), "#!/bin/sh\necho recovered\n");
+    let result = runner.run_arguments(&[]).await.unwrap();
+    assert_eq!(result.status, MavenRunStatus::Success);
 }
 
 #[tokio::test]

@@ -228,6 +228,13 @@ dependencies and plugins. The general `run_maven` tool passes the requested
 argument list exactly, without adding offline, repository or batch-mode flags.
 All tools run at most one Maven process at a time across the entire STDIO server,
 apply time and output limits, and redact paths and common credential patterns.
+For focused tests, serialization covers the report snapshot, Maven execution,
+report parsing and saving the last result. Concurrent requests therefore report
+only their own updated test reports; `get_last_maven_test_failures` returns the
+last completed focused test for the requested project. Effective POM requests
+hold the same permit through output preparation, execution, parsing and cleanup.
+Previous effective POM output is cleared before execution, and temporary output
+is removed on success, failure, timeout or request cancellation.
 Native execution is not a sandbox: Maven plugins and tests run with the local
 user's permissions.
 

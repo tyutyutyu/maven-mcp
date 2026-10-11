@@ -26,6 +26,26 @@ use crate::config::{JavaEnvironment, MavenExecutionConfig, ProjectExecutionConfi
 
 const JENV_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Created and dropped while the global Maven permit is held.
+struct EffectivePomOutput(PathBuf);
+
+impl EffectivePomOutput {
+    fn prepare(path: PathBuf) -> Result<Self> {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("cannot clear previous effective POM output"),
+        }
+        Ok(Self(path))
+    }
+}
+
+impl Drop for EffectivePomOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct MavenModule {
     pub selector: String,
@@ -775,10 +795,6 @@ impl MavenRunner {
                 };
             }
         };
-        let previous_modified = output
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
         let mut arguments = match self.base_arguments(module, false) {
             Ok(arguments) => arguments,
             Err(error) => {
@@ -792,20 +808,27 @@ impl MavenRunner {
                 };
             }
         };
+        let output = match EffectivePomOutput::prepare(output) {
+            Ok(output) => output,
+            Err(error) => {
+                return EffectivePomResult {
+                    status: DiagnosticStatus::Invalid,
+                    projects: Vec::new(),
+                    error: Some(error.to_string()),
+                    build: MavenBuildResult::from_run(
+                        self.runner_error(started, error.to_string()),
+                    ),
+                };
+            }
+        };
         arguments.push(OsString::from("help:effective-pom"));
-        arguments.push(OsString::from(format!("-Doutput={}", output.display())));
+        arguments.push(OsString::from(format!("-Doutput={}", output.0.display())));
         let build = MavenBuildResult::from_run(
             self.execute_permitted(arguments, Instant::now())
                 .await
                 .result,
         );
-        let modified = output
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if modified.is_none()
-            || previous_modified.is_some_and(|previous| modified == Some(previous))
-        {
+        if !output.0.exists() {
             return EffectivePomResult {
                 status: DiagnosticStatus::Missing,
                 projects: Vec::new(),
@@ -813,9 +836,7 @@ impl MavenRunner {
                 build,
             };
         }
-        let parsed = parse_effective_pom(&output);
-        let _ = std::fs::remove_file(&output);
-        match parsed {
+        match parse_effective_pom(&output.0) {
             Ok(projects) => EffectivePomResult {
                 status: DiagnosticStatus::Available,
                 projects,
