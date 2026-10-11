@@ -492,3 +492,84 @@ fn write_jar(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
     writer.finish()?;
     Ok(())
 }
+
+/// Owns the recorded processes even when a regression assertion unwinds.
+pub struct PipeHolder {
+    project: PathBuf,
+}
+
+impl PipeHolder {
+    pub fn new(project: &Path, redirections: &str) -> Result<Self> {
+        let guard = Self {
+            project: project.to_owned(),
+        };
+        write_executable(
+            &project.join("mvnw"),
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > holder-parent.pid\nsleep 30 {redirections} &\nprintf '%s' \"$!\" > holder-child.pid\nexit 0\n"
+            ),
+        )?;
+        Ok(guard)
+    }
+
+    pub async fn wait_started(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if self.pid("child").is_some()
+                    && self.pid("parent").is_some_and(|pid| !process_is_live(pid))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("pipe holder did not start and its parent exit")
+    }
+
+    pub async fn assert_stopped(&self) -> Result<()> {
+        let pid = self.pid("child").context("missing descendant PID")?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while process_is_live(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("pipe-holding descendant survived cleanup")
+    }
+
+    fn pid(&self, role: &str) -> Option<i32> {
+        std::fs::read_to_string(self.project.join(format!("holder-{role}.pid")))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+}
+
+fn process_is_live(pid: i32) -> bool {
+    // An orphan may be a zombie until the host's init reaps it; it cannot run
+    // or retain pipe descriptors in that state.
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        && stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('Z'))
+    {
+        return false;
+    }
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+}
+
+impl Drop for PipeHolder {
+    fn drop(&mut self) {
+        for role in ["parent", "child"] {
+            if let Some(pid) = self.pid(role) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+}

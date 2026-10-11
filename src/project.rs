@@ -1099,39 +1099,80 @@ impl MavenRunner {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let max_output = self.max_output_bytes;
-        let stdout_task = tokio::spawn(async move { read_bounded(stdout, max_output).await });
-        let stderr_task = tokio::spawn(async move { read_bounded(stderr, max_output).await });
+        // Keep readers in the request future so cancellation closes both pipes.
+        // join! retains a completed reader's result while the other is pending.
+        let mut readers = Box::pin(async move {
+            tokio::join!(
+                read_bounded(stdout, max_output),
+                read_bounded(stderr, max_output)
+            )
+        });
 
-        let (status, exit_code, timed_out) = match tokio::time::timeout(self.timeout, child.wait())
-            .await
-        {
-            Ok(Ok(status)) if status.success() => (MavenRunStatus::Success, status.code(), false),
-            Ok(Ok(status)) => (MavenRunStatus::BuildFailure, status.code(), false),
-            Ok(Err(error)) => {
-                let _ = terminate_process_group(process_id);
-                let _ = child.wait().await;
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let mut wait_result = None;
+        let mut pipe_results = None;
+        let timed_out = tokio::time::timeout_at(deadline, async {
+            tokio::join!(async { wait_result = Some(child.wait().await) }, async {
+                pipe_results = Some((&mut readers).await)
+            });
+        })
+        .await
+        .is_err();
+        let _ = terminate_process_group(process_id);
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        if wait_result.is_none() {
+            wait_result = Some(
+                tokio::time::timeout_at(cleanup_deadline, child.wait())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Maven did not exit after process-group termination",
+                        ))
+                    }),
+            );
+        }
+        // Await only unfinished readers. The pinned join retains either pipe's result.
+        let (stdout, stderr) = match pipe_results {
+            Some(outputs) => outputs,
+            None => tokio::time::timeout_at(cleanup_deadline, &mut readers)
+                .await
+                .unwrap_or_else(|_| (Ok(BoundedOutput::default()), Ok(BoundedOutput::default()))),
+        };
+        let (status, exit_code) = match wait_result {
+            Some(Ok(_)) if timed_out => (MavenRunStatus::Timeout, None),
+            Some(Ok(status)) if status.success() => (MavenRunStatus::Success, status.code()),
+            Some(Ok(status)) => (MavenRunStatus::BuildFailure, status.code()),
+            Some(Err(error)) => {
                 return ExecutedMaven {
                     result: self.runner_error(started, format!("cannot wait for Maven: {error}")),
                     raw_stdout: String::new(),
                 };
             }
-            Err(_) => {
-                let _ = terminate_process_group(process_id);
-                let _ = child.wait().await;
-                (MavenRunStatus::Timeout, None, true)
+            None => {
+                return ExecutedMaven {
+                    result: self.runner_error(started, "missing Maven exit status".to_owned()),
+                    raw_stdout: String::new(),
+                };
             }
         };
+        drop(readers);
         process_group.disarm();
-        let stdout = stdout_task
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
-        let stderr = stderr_task
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let mut pipe_outputs = Vec::new();
+        for joined in [stdout, stderr] {
+            match joined {
+                Ok(output) => pipe_outputs.push(output),
+                Err(error) => {
+                    return ExecutedMaven {
+                        result: self
+                            .runner_error(started, format!("cannot read Maven output: {error}")),
+                        raw_stdout: String::new(),
+                    };
+                }
+            }
+        }
+        let stderr = pipe_outputs.pop().unwrap_or_default();
+        let stdout = pipe_outputs.pop().unwrap_or_default();
         let failed = !matches!(&status, MavenRunStatus::Success);
         let stdout_truncated = stdout.truncated;
         let stderr_truncated = stderr.truncated;

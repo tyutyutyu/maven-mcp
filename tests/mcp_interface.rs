@@ -1220,3 +1220,68 @@ fn resource_limit_configuration_rejects_unbounded_values() {
         assert!(String::from_utf8_lossy(&output.stderr).contains(name));
     }
 }
+
+#[tokio::test]
+async fn pipe_timeouts_clean_up_and_release_the_global_permit() -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    for redirections in ["", ">/dev/null", "2>/dev/null"] {
+        let server = TestServer::start_with_project().await?;
+        let project = server.project_path().unwrap();
+        let holder = support::PipeHolder::new(project, redirections)?;
+        let other = server.add_trusted_project("after-timeout")?;
+        std::fs::write(
+            other.join("mvnw"),
+            "#!/bin/sh\ntouch started\necho recovered\n",
+        )?;
+        let (client, _) = server
+            .connect_with_limits(&[("MAVEN_TIMEOUT_SECONDS", "1")])
+            .await?;
+        let first = CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+            "project_path": project, "arguments": []
+        })));
+        let second = CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+            "project_path": other, "arguments": []
+        })));
+        let started = Instant::now();
+        let first_call = client.call_tool(first);
+        let second_call = async {
+            holder.wait_started().await?;
+            let call = client.call_tool(second.clone());
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => panic!("second project ran before timeout: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+            }
+            assert!(
+                !other.join("started").exists(),
+                "global permit released early"
+            );
+            call.await.map_err(anyhow::Error::from)
+        };
+        let (first, second) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(first_call, second_call)
+        })
+        .await?;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let first = structured(first?);
+        assert_eq!(first["status"], "timeout", "{first}");
+        assert_eq!(first["timed_out"], true);
+        holder.assert_stopped().await?;
+        let second = structured(second?);
+        assert_eq!(second["status"], "success", "{second}");
+        assert!(second["stdout"].as_str().unwrap().contains("recovered"));
+        let after = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_tool(
+                CallToolRequestParams::new("run_maven").with_arguments(arguments(json!({
+                    "project_path": other, "arguments": ["after-timeout"]
+                }))),
+            ),
+        )
+        .await??;
+        assert_eq!(structured(after)["status"], "success");
+        client.cancel().await?;
+    }
+    Ok(())
+}
