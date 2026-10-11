@@ -624,8 +624,25 @@ impl MavenRunner {
                 };
             }
         };
+        let _permit = match self.permit.acquire().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return FocusedTestResult {
+                    report_status: TestReportStatus::Missing,
+                    summary: None,
+                    failures: Vec::new(),
+                    report_error: None,
+                    build: MavenBuildResult::from_run(
+                        self.runner_error(started, error.to_string()),
+                    ),
+                };
+            }
+        };
         let before = self.report_snapshot();
-        let run = self.execute(arguments).await;
+        let run = self
+            .execute_permitted(arguments, Instant::now())
+            .await
+            .result;
         let build = MavenBuildResult::from_run(run);
         let mut result = match self.updated_reports(&before) {
             Ok(reports) if reports.is_empty() => FocusedTestResult {
@@ -745,6 +762,19 @@ impl MavenRunner {
             }
         };
         let output = output_directory.join("effective-pom.xml");
+        let _permit = match self.permit.acquire().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return EffectivePomResult {
+                    status: DiagnosticStatus::Invalid,
+                    projects: Vec::new(),
+                    error: Some(error.to_string()),
+                    build: MavenBuildResult::from_run(
+                        self.runner_error(started, error.to_string()),
+                    ),
+                };
+            }
+        };
         let previous_modified = output
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -764,7 +794,11 @@ impl MavenRunner {
         };
         arguments.push(OsString::from("help:effective-pom"));
         arguments.push(OsString::from(format!("-Doutput={}", output.display())));
-        let build = MavenBuildResult::from_run(self.execute(arguments).await);
+        let build = MavenBuildResult::from_run(
+            self.execute_permitted(arguments, Instant::now())
+                .await
+                .result,
+        );
         let modified = output
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -779,7 +813,9 @@ impl MavenRunner {
                 build,
             };
         }
-        match parse_effective_pom(&output) {
+        let parsed = parse_effective_pom(&output);
+        let _ = std::fs::remove_file(&output);
+        match parsed {
             Ok(projects) => EffectivePomResult {
                 status: DiagnosticStatus::Available,
                 projects,
@@ -1060,6 +1096,11 @@ impl MavenRunner {
                 };
             }
         };
+        self.execute_permitted(arguments, started).await
+    }
+
+    /// Runs Maven while the caller already holds the global permit.
+    async fn execute_permitted(&self, arguments: Vec<OsString>, started: Instant) -> ExecutedMaven {
         let executable = match self.validated_executable() {
             Ok(executable) => executable,
             Err(error) => {
