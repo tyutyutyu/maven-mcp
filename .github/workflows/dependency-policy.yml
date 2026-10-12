@@ -30,7 +30,7 @@ jobs:
           rustup default stable
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.18.9 --locked
+        run: cargo install cargo-deny --version 0.20.0 --locked
 
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check advisories licenses bans sources
