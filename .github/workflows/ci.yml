@@ -33,7 +33,7 @@ jobs:
           rustup default 1.89.0
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.18.9 --locked
+        run: cargo install cargo-deny --version 0.20.0 --locked
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.8.5 --locked
