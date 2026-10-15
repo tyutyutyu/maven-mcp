@@ -91,7 +91,13 @@ directly from the local Maven repository and work even when another reactor
 module's dependency cannot be resolved. They use `MAVEN_EXECUTION_REPO_PATH` when
 set, otherwise `$HOME/.m2/repository`. Set `MAVEN_EXECUTION_REPO_PATH` to the
 same local repository configured in Maven settings when it differs from the
-default. Other repository-search tools ask Maven for
+default. The coordinate must be exactly `groupId:artifactId:version`; empty or
+dot-only segments (for example a leading or trailing `.` in `groupId`), `..`, `/`,
+and `\` are rejected as invalid arguments. Every existing path component is
+resolved and must stay inside the canonical repository, so an artifact, POM, or
+parent-directory symlink pointing outside it (even a dangling one) is rejected
+without reading or returning external content; absent artifacts still report
+`found: false`. Other repository-search tools ask Maven for
 the effective test classpath, build a lazy index only from those local JARs and
 their sibling `-sources.jar` files, and cache that index by canonical
 `project_path`. For a multi-module reactor, classpath sections from every module

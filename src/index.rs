@@ -805,18 +805,14 @@ impl MavenIndex {
     pub fn pom_descriptor_at(root: &Path, coordinate: &str) -> Result<PomDescriptorLookup> {
         let key = parse_exact_coordinate(coordinate)?;
         let coordinate = format!("{}:{}:{}", key.group_id, key.artifact_id, key.version);
-        let path = root
-            .join(key.group_id.replace('.', "/"))
-            .join(&key.artifact_id)
-            .join(&key.version)
-            .join(format!("{}-{}.pom", key.artifact_id, key.version));
-        if !path.exists() {
+        let pom_name = format!("{}-{}.pom", key.artifact_id, key.version);
+        let Some(path) = contained_artifact_path(root, &key, Some(&pom_name))? else {
             return Ok(PomDescriptorLookup {
                 coordinate,
                 found: false,
                 descriptor: None,
             });
-        }
+        };
 
         let xml = crate::config::read_bounded_xml(&path).map_err(|error| {
             let operation = if error.is::<quick_xml::Error>() {
@@ -875,11 +871,8 @@ impl MavenIndex {
     pub fn artifact_health_at(root: &Path, coordinate: &str) -> Result<ArtifactHealth> {
         let key = parse_exact_coordinate(coordinate)?;
         let coordinate = format!("{}:{}:{}", key.group_id, key.artifact_id, key.version);
-        let directory = root
-            .join(key.group_id.replace('.', "/"))
-            .join(&key.artifact_id)
-            .join(&key.version);
-        if !directory.is_dir() {
+        let directory = contained_artifact_path(root, &key, None)?.filter(|path| path.is_dir());
+        let Some(directory) = directory else {
             return Ok(ArtifactHealth {
                 coordinate,
                 found: false,
@@ -889,7 +882,7 @@ impl MavenIndex {
                 last_updated_markers: Vec::new(),
                 repository_ids: Vec::new(),
             });
-        }
+        };
 
         let mut files = Vec::new();
         let mut checksums = Vec::new();
@@ -1748,16 +1741,29 @@ fn convert_dependencies(raw: RawPomDependencies) -> Vec<PomDependency> {
         .collect()
 }
 
+/// Raised when an exact artifact path would resolve outside the configured repository.
+#[derive(Debug)]
+pub struct ArtifactOutsideRepository;
+
+impl std::fmt::Display for ArtifactOutsideRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("artifact path resolves outside the configured Maven repository")
+    }
+}
+
+impl std::error::Error for ArtifactOutsideRepository {}
+
 fn parse_exact_coordinate(coordinate: &str) -> Result<ArtifactKey> {
     let parts = coordinate.trim().split(':').collect::<Vec<_>>();
     if parts.len() != 3
         || parts.iter().any(|part| {
             part.is_empty()
-                || part.contains(['/', '\\'])
+                || part.contains(['/', '\\', '\0'])
                 || *part == "."
                 || *part == ".."
                 || part.contains("..")
         })
+        || parts[0].split('.').any(str::is_empty)
     {
         bail!("coordinate must use exact groupId:artifactId:version form");
     }
@@ -1766,6 +1772,84 @@ fn parse_exact_coordinate(coordinate: &str) -> Result<ArtifactKey> {
         artifact_id: parts[1].to_owned(),
         version: parts[2].to_owned(),
     })
+}
+
+/// Resolves an exact artifact directory (or file inside it) beneath the repository,
+/// following every existing component and rejecting any that leaves the canonical
+/// repository root. Returns `None` when the path does not exist.
+fn contained_artifact_path(
+    root: &Path,
+    key: &ArtifactKey,
+    file_name: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let canonical_root = match root.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("cannot access local Maven repository"),
+    };
+    let mut current = canonical_root.clone();
+    let components = key
+        .group_id
+        .split('.')
+        .chain([key.artifact_id.as_str(), key.version.as_str()])
+        .chain(file_name);
+    for component in components {
+        let next = current.join(component);
+        let metadata = match next.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => bail!("cannot inspect local artifact path"),
+        };
+        match next.canonicalize() {
+            Ok(resolved) if resolved.starts_with(&canonical_root) => current = resolved,
+            Ok(_) => return Err(ArtifactOutsideRepository.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if metadata.file_type().is_symlink() {
+                    ensure_dangling_symlink_contained(&next, &canonical_root)?;
+                }
+                return Ok(None);
+            }
+            Err(_) => bail!("cannot inspect local artifact path"),
+        }
+    }
+    Ok(Some(current))
+}
+
+/// Maximum symlink hops followed for a dangling link, mirroring the usual OS limit.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Follows a dangling symlink chain to the deepest existing ancestor of its final
+/// target and rejects it unless that ancestor resolves inside the repository, so an
+/// outward link is never reported as an absent artifact.
+fn ensure_dangling_symlink_contained(link: &Path, canonical_root: &Path) -> Result<()> {
+    let mut link = link.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let target = std::fs::read_link(&link)
+            .map_err(|_| anyhow::anyhow!("cannot inspect local artifact path"))?;
+        let target = link.parent().unwrap_or(canonical_root).join(target);
+        let mut existing = target.as_path();
+        let metadata = loop {
+            match existing.symlink_metadata() {
+                Ok(metadata) => break metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    existing = existing.parent().ok_or(ArtifactOutsideRepository)?;
+                }
+                Err(_) => bail!("cannot inspect local artifact path"),
+            }
+        };
+        match existing.canonicalize() {
+            Ok(resolved) if resolved.starts_with(canonical_root) => return Ok(()),
+            Ok(_) => return Err(ArtifactOutsideRepository.into()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && metadata.file_type().is_symlink() =>
+            {
+                link = existing.to_path_buf();
+            }
+            Err(_) => bail!("cannot inspect local artifact path"),
+        }
+    }
+    Err(ArtifactOutsideRepository.into())
 }
 
 pub fn validate_exact_coordinate(coordinate: &str) -> Result<()> {
