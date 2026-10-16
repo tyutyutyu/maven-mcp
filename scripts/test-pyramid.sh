@@ -30,5 +30,5 @@ cargo llvm-cov report --locked --json --summary-only --output-path "${COVERAGE_D
 cargo llvm-cov report --locked --html --output-dir "${COVERAGE_DIR}"
 python3 -I "${SCRIPT_DIR}/check-coverage.py" "${COVERAGE_DIR}/summary.json" "${COVERAGE_THRESHOLD}"
 
-echo "MCP keresési riport: ${PROJECT_ROOT}/target/mcp-test-report/report.md"
-echo "Lefedettségi riport: ${COVERAGE_DIR}/html/index.html"
+echo "MCP search report: ${PROJECT_ROOT}/target/mcp-test-report/report.md"
+echo "Coverage report: ${COVERAGE_DIR}/html/index.html"

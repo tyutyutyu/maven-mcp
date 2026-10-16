@@ -286,40 +286,40 @@ fn write_markdown_report(executions: &[Execution]) -> Result<()> {
     let report_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/mcp-test-report");
     fs::create_dir_all(&report_dir)?;
     let mut report = String::from(
-        "# Maven MCP keresési riport\n\n\
-         A riport a `tests/scenarios/maven_search.yaml` scenario-k valódi child-process STDIO MCP-hívásaiból készült.\n\n",
+        "# Maven MCP search report\n\n\
+         This report was generated from real child-process STDIO MCP calls of the `tests/scenarios/maven_search.yaml` scenarios.\n\n",
     );
     let passed = executions
         .iter()
         .filter(|execution| execution.failures.is_empty())
         .count();
     report.push_str(&format!(
-        "**Összesítés:** {passed}/{} scenario sikeres.\n\n",
+        "**Summary:** {passed}/{} scenarios passed.\n\n",
         executions.len()
     ));
 
     for execution in executions {
         let status = if execution.failures.is_empty() {
-            "✅ Sikeres"
+            "✅ Passed"
         } else {
-            "❌ Sikertelen"
+            "❌ Failed"
         };
         report.push_str(&format!(
             "## {status}: {}\n\n{}\n\n",
             execution.scenario.title, execution.scenario.description
         ));
         report.push_str(&format!(
-            "### MCP kérés\n\nTool: `{}`\n\n```json\n{}\n```\n\n",
+            "### MCP request\n\nTool: `{}`\n\n```json\n{}\n```\n\n",
             execution.scenario.tool,
             serde_json::to_string_pretty(&execution.scenario.arguments)?
         ));
         report.push_str(&format!(
-            "### MCP válasz\n\n```json\n{}\n```\n\n",
+            "### MCP response\n\n```json\n{}\n```\n\n",
             serde_json::to_string_pretty(&execution.response)?
         ));
-        report.push_str("### Ellenőrzések\n\n");
+        report.push_str("### Checks\n\n");
         if execution.failures.is_empty() {
-            report.push_str("- ✅ Minden szemantikus elvárás teljesült.\n\n");
+            report.push_str("- ✅ Every semantic expectation was met.\n\n");
         } else {
             for failure in &execution.failures {
                 report.push_str(&format!("- ❌ {failure}\n"));

@@ -1,7 +1,7 @@
 scenarios:
   - id: class-search-project-classpath
-    title: Projekt classpath osztály keresése
-    description: A keresés csak az explicit projekt effektív classpathján lévő JAR-okban talál.
+    title: Search for a class on the project classpath
+    description: The search finds matches only in JARs on the explicit project's effective classpath.
     tool: search_classes
     arguments:
       query: Foo
@@ -13,8 +13,8 @@ scenarios:
             coordinate: org.libs:helper:2.0
 
   - id: class-search-no-global-repository-leak
-    title: Globális repository találat kizárása
-    description: A régi fixture repository demo artifactja nincs a projekt classpathján, ezért nem látható.
+    title: Exclude global repository matches
+    description: The demo artifact of the old fixture repository is not on the project classpath, so it is not visible.
     tool: search_jars
     arguments:
       query: demo
@@ -24,8 +24,8 @@ scenarios:
         results: []
 
   - id: jar-search-scoped-helper
-    title: Scoped helper JAR keresése
-    description: A bináris és a sibling sources JAR is megjelenik a projekt scoped indexében.
+    title: Search for the scoped helper JAR
+    description: Both the binary and the sibling sources JAR appear in the project's scoped index.
     tool: search_jars
     arguments:
       query: helper:2.0
@@ -38,8 +38,8 @@ scenarios:
           classifier: sources
 
   - id: paginated-scoped-class-list
-    title: Scoped JAR osztálylistája
-    description: Az offset és limit csak a visszaadott class listát lapozza, a total teljes marad.
+    title: Class list of a scoped JAR
+    description: Offset and limit page only the returned class list; the total stays complete.
     tool: list_jar_classes
     arguments:
       jar: org.libs:helper:2.0
@@ -54,8 +54,8 @@ scenarios:
             - org.libs.ScopedOnly
 
   - id: source-from-scoped-sibling
-    title: Scoped sources JAR forrása
-    description: A classpath bináris JAR mellé telepített sibling sources JAR-ból forrást ad vissza.
+    title: Source from a scoped sources JAR
+    description: Returns source from the sibling sources JAR installed next to the classpath binary JAR.
     tool: get_class_source
     arguments:
       class_name: org.example.Foo
@@ -71,8 +71,8 @@ scenarios:
           truncated: false
 
   - id: artifact-versions-scoped
-    title: Scoped artifact elérhető verziói
-    description: Csak a projekt classpath indexében szereplő helper verzió látszik.
+    title: Available versions of a scoped artifact
+    description: Only the helper version present in the project classpath index is visible.
     tool: list_artifact_versions
     arguments:
       group_id: org.libs
@@ -83,8 +83,8 @@ scenarios:
           - "2.0"
 
   - id: scoped-pom-descriptor
-    title: Scoped artifact POM descriptor
-    description: A pontos koordinátájú helyi artifact POM-ja classpath index nélkül olvasható.
+    title: POM descriptor of a scoped artifact
+    description: The POM of the local artifact with exact coordinates can be read without a classpath index.
     tool: get_artifact_pom
     arguments:
       coordinate: org.libs:helper:2.0
@@ -96,8 +96,8 @@ scenarios:
           packaging: jar
 
   - id: scoped-type-hierarchy
-    title: Scoped osztályhierarchia keresése
-    description: A classfile superclass kapcsolat a scoped helper artifactban kereshető.
+    title: Search the scoped class hierarchy
+    description: The classfile superclass relationship can be searched in the scoped helper artifact.
     tool: search_type_hierarchy
     arguments:
       type_name: java.lang.Object
@@ -113,8 +113,8 @@ scenarios:
             - org.example.Foo
 
   - id: scoped-source-regex-search
-    title: Regex keresés scoped sources artifactban
-    description: Java forrás regexszel, sorszámmal és korlátozott kontextussal kereshető.
+    title: Regex search in a scoped sources artifact
+    description: Java source can be searched with a regex, with line numbers and bounded context.
     tool: search_source
     arguments:
       query: scoped\s*=\s*2
@@ -129,8 +129,8 @@ scenarios:
           truncated: false
 
   - id: scoped-classfile-description-without-sources
-    title: Osztályleírás sources JAR nélkül
-    description: A classfile-ból a bináris artifact forráscsomag nélkül is vizsgálható.
+    title: Class description without a sources JAR
+    description: The binary artifact can be inspected from the classfile even without a source package.
     tool: describe_class
     arguments:
       class_name: org.libs.ScopedOnly
@@ -145,8 +145,8 @@ scenarios:
             coordinate: org.libs:helper:2.0
 
   - id: scoped-exact-service-entry
-    title: Pontos service entry kiolvasása
-    description: Egy kiválasztott JAR service descriptorja szöveges tartalomként olvasható.
+    title: Read an exact service entry
+    description: The service descriptor of a selected JAR can be read as text content.
     tool: get_jar_entry
     arguments:
       jar: resource-fixture-1.0.jar
@@ -160,8 +160,8 @@ scenarios:
           truncated: false
 
   - id: scoped-artifact-health-diagnostics
-    title: Artifact állapotának diagnosztikája
-    description: A helyi artifact checksum és repository jelölői írás nélkül láthatók.
+    title: Diagnose an artifact's state
+    description: The checksum and repository markers of the local artifact are visible without writing.
     tool: diagnose_artifact
     arguments:
       coordinate: org.libs:resource-fixture:1.0
@@ -172,8 +172,8 @@ scenarios:
         snapshot: false
 
   - id: scoped-class-member-search
-    title: Osztálytag keresése
-    description: A classfile mezőnév keresése JAR-szűréssel és eredménykorláttal működik.
+    title: Search for a class member
+    description: Searching classfile field names works with a JAR filter and a result limit.
     tool: search_class_members
     arguments:
       query: value
@@ -190,8 +190,8 @@ scenarios:
             coordinate: org.libs:helper:2.0
 
   - id: scoped-artifact-api-comparison
-    title: Két helyi artifactverzió API diffje
-    description: A lokális verziók közti hozzáadott és eltávolított osztályok strukturáltan jelennek meg.
+    title: API diff of two local artifact versions
+    description: The classes added and removed between the local versions appear in structured form.
     tool: compare_artifact_api
     arguments:
       group_id: org.libs
@@ -210,8 +210,8 @@ scenarios:
           - org.example.api.LegacyApi
 
   - id: scoped-jar-resource-content-search
-    title: Tartalmi keresés JAR-erőforrásban
-    description: A támogatott szöveges properties entry korlátozott kontextussal kereshető.
+    title: Content search in a JAR resource
+    description: The supported text properties entry can be searched with bounded context.
     tool: search_jar_content
     arguments:
       query: feature.provider
@@ -225,8 +225,8 @@ scenarios:
             coordinate: org.libs:resource-fixture:1.0
 
   - id: scoped-outbound-class-reference-search
-    title: Kimenő classfile hivatkozás keresése
-    description: A classfile superclass hivatkozása a célosztály alapján megtalálható.
+    title: Search for an outbound classfile reference
+    description: The classfile's superclass reference can be found by the target class.
     tool: search_class_references
     arguments:
       class_name: org.example.Foo
@@ -239,8 +239,8 @@ scenarios:
           kind: class
 
   - id: scoped-service-provider-search
-    title: ServiceLoader provider feltárása
-    description: A META-INF/services deklarációból a service és provider külön mezőként jelenik meg.
+    title: Discover a ServiceLoader provider
+    description: From the META-INF/services declaration, the service and the provider appear as separate fields.
     tool: search_providers
     arguments:
       service: org.example.Service
@@ -254,8 +254,8 @@ scenarios:
           entry: META-INF/services/org.example.Service
 
   - id: scoped-source-declaration-lookup
-    title: Forrásosztály deklarációjának lekérdezése
-    description: Egy forrásosztály publikus deklarációja rövid forrásrészletként kérhető le.
+    title: Query a source class declaration
+    description: The public declaration of a source class can be retrieved as a short source fragment.
     tool: get_declaration_source
     arguments:
       class_name: org.example.Foo
