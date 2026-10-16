@@ -1,45 +1,61 @@
 {
   "schema_version": 1,
-  "name": "Common Maven repository inspection commands",
+  "name": "Project-scoped Maven repository inspection commands",
   "cases": [
     {
       "id": "find-slf4j-logger-class",
-      "description": "Find JARs containing org.slf4j.Logger",
+      "description": "Find the project-classpath JARs containing org.slf4j.Logger",
       "shell": {
-        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}\" -type f -name '*.jar' -exec sh -c 'jar tf \"$1\" 2>/dev/null | grep -q \"^org/slf4j/Logger.class$\" && printf \"%s\\n\" \"$1\"' _ {} \\;"
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in *.jar) ;; *) continue ;; esac; entries=$(unzip -Z1 \"$jar\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qi 'org/slf4j/logger.*\\.class$'; then printf '%s\\n' \"$jar\"; fi; done",
+        "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
         "tool": "search_classes",
         "arguments": {
+          "project_path": "${PROJECT_PATH}",
           "query": "org.slf4j.Logger"
         }
+      },
+      "identity": {
+        "mcp_values": "/results/*/jar/path",
+        "normalize": "file_names"
       }
     },
     {
       "id": "list-slf4j-api-versions",
-      "description": "List locally available slf4j-api versions",
+      "description": "List the slf4j-api versions on the project classpath",
       "shell": {
-        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}/org/slf4j/slf4j-api\" -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null | sort"
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in */org/slf4j/slf4j-api/*/slf4j-api-*.jar) basename \"$(dirname \"$jar\")\" ;; esac; done",
+        "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
         "tool": "list_artifact_versions",
         "arguments": {
+          "project_path": "${PROJECT_PATH}",
           "group_id": "org.slf4j",
           "artifact_id": "slf4j-api"
         }
+      },
+      "identity": {
+        "mcp_values": "/*/*"
       }
     },
     {
       "id": "read-slf4j-logger-source",
-      "description": "Read org.slf4j.Logger from a sources JAR",
+      "description": "Read org.slf4j.Logger from the sources JARs of the project classpath",
       "shell": {
-        "command": "find \"${MAVEN_REPO_PATH:-$HOME/.m2/repository}\" -type f -path '*/org/slf4j/slf4j-api/*/slf4j-api-*-sources.jar' -exec unzip -p '{}' org/slf4j/Logger.java \\;"
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do src=\"${jar%.jar}-sources.jar\"; if [ -f \"$src\" ]; then entries=$(unzip -Z1 \"$src\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qx 'org/slf4j/Logger.java'; then unzip -p \"$src\" org/slf4j/Logger.java || exit 1; fi; fi; done",
+        "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
         "tool": "get_class_source",
         "arguments": {
+          "project_path": "${PROJECT_PATH}",
           "class_name": "org.slf4j.Logger"
         }
+      },
+      "identity": {
+        "mcp_values": "/results/*/source"
       }
     }
   ]

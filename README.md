@@ -520,15 +520,19 @@ Benchmark specification format:
       "id": "find-foo",
       "description": "Find all JARs containing org.example.Foo",
       "shell": {
-        "command": "find ~/.m2/repository -name '*.jar' -exec sh -c 'jar tf \"$1\" | grep -q org/example/Foo.class' _ {} \\; -print",
-        "cwd": "/path/to/project"
+        "command": "cd \"$PROJECT_PATH\" || exit 1; cp=$(./mvnw -o dependency:build-classpath) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do entries=$(unzip -Z1 \"$jar\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qx 'org/example/Foo.class'; then printf '%s\\n' \"$jar\"; fi; done",
+        "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
         "tool": "search_classes",
         "arguments": {
-          "project_path": "/path/to/project",
+          "project_path": "${PROJECT_PATH}",
           "query": "org.example.Foo"
         }
+      },
+      "identity": {
+        "mcp_values": "/results/*/jar/path",
+        "normalize": "file_names"
       }
     }
   ]
@@ -536,19 +540,92 @@ Benchmark specification format:
 ```
 
 `shell.command` is passed to `/bin/sh -c`, so run only specifications you own or
-have reviewed. `cwd` is optional. MCP `arguments` can be omitted when the tool
+have reviewed. `/bin/sh` has no `pipefail`, so resolve the classpath into a
+variable and exit on a Maven failure before parsing it, and end each loop body in
+an `if`/`case` so a non-matching last JAR does not become the command's exit
+status; an unreadable JAR still exits non-zero. `cwd` is optional. MCP `arguments` can be omitted when the tool
 expects no arguments. Case IDs must be unique.
+
+### Project binding
+
+`--project-path` takes the absolute Maven project root (a directory containing
+`pom.xml`; symlinks are resolved). It binds one project to the whole run:
+
+- `${PROJECT_PATH}` in `shell.cwd` and in any string of the MCP `arguments` is
+  replaced by the canonical project path. Every MCP argument object must set
+  `project_path` to it, so each MCP call carries a valid `project_path`.
+- Shell commands receive the canonical path in the `PROJECT_PATH` environment
+  variable; use `"$PROJECT_PATH"` inside `command`.
+- The MCP child process gets `MAVEN_TRUSTED_PROJECT_DIRECTORIES` set to exactly
+  that project, replacing any inherited value. Passing `--project-path` is the
+  trust decision; do it only for projects whose Maven build you trust.
+
+A specification that mentions `PROJECT_PATH` without `--project-path` is
+rejected before anything runs, and the bundled `benchmark.json` needs no
+personal path. Without `--project-path`, the specification must carry literal
+absolute `project_path` values and the host trust variable must already be set
+in the environment.
+
+### Comparable results
+
+MCP tools search only the artifacts on the project's Maven test classpath, so a
+shell command that scans all of `~/.m2` measures different work. The bundled
+shell commands therefore resolve the same classpath with Maven
+(`dependency:build-classpath`, test scope, offline, `MAVEN_EXECUTION_REPO_PATH`
+as the local repository when set) and inspect only those JARs. Every case may
+declare an `identity` block; before warmup and measurement, the first shell and
+first MCP execution are normalized and compared:
+
+- `mcp_values` is a slash-separated path into the MCP structured result; `*`
+  iterates the elements of an array or the values of an object.
+- Shell stdout and the selected MCP values are split into lines, trimmed, and
+  compared as sorted sets (`normalize: "lines"`, the default). `file_names`
+  keeps only the last path component, so absolute shell paths compare with
+  repository-relative MCP paths.
+
+The report records `comparison.identity.status` as `matched`, `mismatched`
+(with `only_in_shell`/`only_in_mcp` samples), `unavailable` (a side failed, the
+shell output hit `--max-output-bytes`, the path did not resolve, or both result
+sets are empty), or `not_checked` (no `identity` block). Any status other than
+`matched` and `not_checked` is a failed comparison: the speed and token ratios
+are `null`, and a difference is never reported as a speedup. Raw runs are still
+recorded.
 
 ```bash
 cargo build --locked --bin maven-mcp
 cargo run --locked --bin maven-benchmark -- \
   --spec benchmark.json \
+  --project-path /absolute/path/to/maven-project \
   --mcp-command target/debug/maven-mcp \
   --iterations 10 \
   --warmup 2 \
   --timeout-seconds 300 \
   --output target/benchmark-results.json
 ```
+
+### Cold first call and reuse
+
+Each case on each side first runs once as the **first call** (`first_call`,
+iteration 0), then `--warmup` unmeasured runs, then `--iterations` measured
+runs (`runs`, summarized as the reuse measurement). The report states this in
+`measurement_modes`:
+
+- The MCP first call for a project in the freshly started server includes the
+  Maven classpath resolution and project index construction. Later cases on the
+  same project, and all later calls, reuse the cached index; there is no
+  persistent index cache across benchmark invocations, so every invocation
+  starts cold and is repeatable. Only the first case measures the MCP cold
+  cost; case order matters.
+- Shell commands have no cache: the first call and every reuse run repeat all of
+  their own work, including the Maven classpath resolution in the bundled
+  commands. Maven preparation is therefore part of the measured time on both
+  sides, once per MCP cold call and on every shell run.
+- Not measured: MCP process start and initialization, warmup runs, and building
+  the binaries. Keep the local Maven repository populated and run offline so the
+  first runs do not include downloads. `comparison.first_call_shell_to_mcp_duration_ratio`
+  compares the cold calls, `shell_to_mcp_duration_ratio` the reuse means.
+
+No speedup is promised: report whatever the measurement shows.
 
 The default for `--max-output-bytes` is 1 MiB. It limits the output included in
 request/response metrics; `output_truncated` reports truncation. For shell
@@ -561,10 +638,11 @@ the output pipes open cannot hang the run or outlive it. A timed-out run is
 recorded with `success: false` and a `timed out` error, and the benchmark
 continues with the next run and case. Under
 `schema_version: "1.0"`, the JSON preserves the shell- and MCP-side request size
-for each case, every raw run's duration, success state, response size, and token
-estimate, as well as the mean and median of successful runs and the speed and
-token ratios between the two sides. A failed command or tool call does not stop
-the remaining measurements; its record retains an exit code or error message.
+for each case, the first call and every raw run's duration, success state,
+response size, and token estimate, as well as the mean and median of successful
+runs and the speed and token ratios between the two sides. A failed command or
+tool call does not stop the remaining measurements; its record retains an exit
+code or error message.
 
 The token metric is intentionally a deterministic, provider-neutral estimate:
 `ceil(Unicode scalar values / 4)`. It is not a model tokenizer or API billing
@@ -573,7 +651,10 @@ content. The report records the method and this limitation as metadata. On the
 shell side, the command, stdout, and stderr are included; on the MCP side, the
 tool name/arguments and tool-result JSON are included. MCP initialization,
 server startup, and protocol headers are not part of the measured tool-call
-duration or token value.
+duration or token value. Because the shell side counts its whole command text
+(including the Maven classpath preparation) and the MCP side counts the JSON
+envelope, treat the percentage as a rough relative indicator, not a billing or
+context-window figure.
 
 ## Taskfile Command Interface
 
@@ -595,16 +676,18 @@ task agent-log:analyze INPUT="$HOME/.codex/sessions" -- \
   --format markdown --category maven
 task agent-log:discover -- --format terminal
 
-task benchmark:run
-task benchmark:run SPEC=my-benchmark.json OUTPUT=target/custom-results.json \
-  ITERATIONS=10 WARMUP=2
+task benchmark:run PROJECT_PATH=/absolute/path/to/maven-project
+task benchmark:run PROJECT_PATH=/absolute/path/to/maven-project \
+  SPEC=my-benchmark.json OUTPUT=target/custom-results.json ITERATIONS=10 WARMUP=2
 ```
 
 The repository includes a default `benchmark.json` specification for common
-Maven inspection commands. MCP cases that inspect project or repository state
-must include an absolute `project_path` argument.
+Maven inspection commands, parameterized with `${PROJECT_PATH}`; the project
+must declare `org.slf4j:slf4j-api` on its test classpath for the bundled cases.
+`PROJECT_PATH` is required and is passed as `--project-path`
+(see [Shell–MCP Benchmark CLI](#shellmcp-benchmark-cli)).
 
-Every benchmark variable can be overridden. Defaults are `SPEC=benchmark.json`,
+The other benchmark variables can be overridden. Defaults are `SPEC=benchmark.json`,
 `OUTPUT=target/benchmark-results.json`,
 `MCP_COMMAND=target/debug/maven-mcp`, `ITERATIONS=5`, `WARMUP=1`,
 `TIMEOUT_SECONDS=300`, and `MAX_OUTPUT_BYTES=1048576`. Arguments following `--`

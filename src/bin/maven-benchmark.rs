@@ -2,7 +2,9 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use maven_mcp::benchmark::{BenchmarkOptions, BenchmarkSpec, run_benchmark};
+use maven_mcp::benchmark::{
+    BenchmarkOptions, BenchmarkSpec, canonical_project_path, run_benchmark,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -16,6 +18,12 @@ struct Cli {
     /// Maven MCP executable to start as a child-process STDIO server.
     #[arg(long, default_value = "maven-mcp")]
     mcp_command: PathBuf,
+    /// Absolute Maven project root (containing pom.xml). It replaces
+    /// `${PROJECT_PATH}` in the specification, is exported to shell commands as
+    /// `PROJECT_PATH`, and becomes the only trusted project directory of the MCP
+    /// child (`MAVEN_TRUSTED_PROJECT_DIRECTORIES`).
+    #[arg(long)]
+    project_path: Option<PathBuf>,
     /// JSON report destination.
     #[arg(long)]
     output: PathBuf,
@@ -38,11 +46,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let input = std::fs::read(&cli.spec)
         .with_context(|| format!("cannot read benchmark spec {}", cli.spec.display()))?;
-    let spec = BenchmarkSpec::from_slice(&input)?;
+    let project_path = cli
+        .project_path
+        .as_deref()
+        .map(canonical_project_path)
+        .transpose()?;
+    let spec = BenchmarkSpec::from_slice(&input, project_path.as_deref())?;
     let report = run_benchmark(
         spec,
         &BenchmarkOptions {
             mcp_command: cli.mcp_command,
+            project_path,
             iterations: cli.iterations,
             warmup: cli.warmup,
             timeout: Duration::from_secs(cli.timeout_seconds),
