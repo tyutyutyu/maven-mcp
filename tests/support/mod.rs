@@ -168,6 +168,19 @@ impl TestServer {
         self.repository.path()
     }
 
+    /// Replaces the source entries of the project-scoped `org.libs:helper:2.0` artifact.
+    #[allow(dead_code)]
+    pub fn replace_helper_sources(&self, entries: &[(&str, &[u8])]) -> Result<()> {
+        let project_path = self
+            .project_path
+            .as_deref()
+            .context("a project fixture is required")?;
+        write_jar(
+            &project_path.join("execution-repository/org/libs/helper/2.0/helper-2.0-sources.jar"),
+            entries,
+        )
+    }
+
     pub fn project_path(&self) -> Option<&Path> {
         self.project_path.as_deref()
     }
