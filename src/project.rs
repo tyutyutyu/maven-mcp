@@ -1698,7 +1698,7 @@ async fn spawn_maven(command: &mut Command) -> std::io::Result<Child> {
     unreachable!("spawn retry loop must return")
 }
 
-fn terminate_process_group(process_id: Option<u32>) -> Result<()> {
+pub(crate) fn terminate_process_group(process_id: Option<u32>) -> Result<()> {
     if let Some(process_id) = process_id {
         let process_id = i32::try_from(process_id).context("process id is too large")?;
         killpg(Pid::from_raw(process_id), Signal::SIGKILL)?;
@@ -1706,16 +1706,16 @@ fn terminate_process_group(process_id: Option<u32>) -> Result<()> {
     Ok(())
 }
 
-struct ProcessGroupGuard {
+pub(crate) struct ProcessGroupGuard {
     process_id: Option<u32>,
 }
 
 impl ProcessGroupGuard {
-    fn new(process_id: Option<u32>) -> Self {
+    pub(crate) fn new(process_id: Option<u32>) -> Self {
         Self { process_id }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.process_id = None;
     }
 }
