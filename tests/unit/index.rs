@@ -1331,6 +1331,118 @@ fn searches_java_and_kotlin_sources_with_regex_context_and_limits() {
 }
 
 #[test]
+fn source_search_reports_truncated_sources_regardless_of_matches() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Demo.class", b"unparseable is still indexed")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Short.java", b"class Short { int needle; }"),
+            (
+                "org/example/Long.java",
+                "// padding é\nclass Long { int tail; }".as_bytes(),
+            ),
+        ],
+    );
+    // Short.java is 27 bytes and fits; Long.java is cut inside the word "tail".
+    let index = build_index(&root, 10, 32);
+
+    let after_limit = index.search_source("tail", false, None, 0, None).unwrap();
+    assert!(after_limit.results.is_empty());
+    assert!(after_limit.incomplete);
+    assert_eq!(after_limit.scanned_bytes, 27 + 32);
+
+    let mixed = index.search_source("needle", false, None, 0, None).unwrap();
+    assert_eq!(mixed.results.len(), 1);
+    assert!(!mixed.results[0].truncated);
+    assert!(mixed.incomplete);
+
+    let complete_root = TempDir::new().unwrap();
+    write_jar(
+        &complete_root
+            .path()
+            .join("org/example/demo/1.0/demo-1.0.jar"),
+        &[("org/example/Demo.class", b"unparseable is still indexed")],
+    );
+    write_jar(
+        &complete_root
+            .path()
+            .join("org/example/demo/1.0/demo-1.0-sources.jar"),
+        &[("org/example/Short.java", b"class Short {}")],
+    );
+    let complete = build_index(&complete_root, 10, 32)
+        .search_source("missing", false, None, 0, None)
+        .unwrap();
+    assert!(complete.results.is_empty());
+    assert!(!complete.incomplete);
+    assert_eq!(complete.scanned_bytes, 14);
+}
+
+#[test]
+fn source_search_trims_a_utf8_sequence_cut_by_truncation() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Demo.class", b"unparseable is still indexed")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[("org/example/Demo.java", "abcd\u{e9}\u{e9}".as_bytes())],
+    );
+    let index = build_index(&root, 10, 5);
+
+    let found = index.search_source("abcd", false, None, 0, None).unwrap();
+    assert_eq!(found.results.len(), 1);
+    assert!(found.results[0].truncated);
+    assert_eq!(found.results[0].context, "abcd");
+    assert_eq!(found.scanned_bytes, 4);
+    assert!(found.incomplete);
+}
+
+#[test]
+fn source_search_trims_a_cut_utf8_sequence_after_an_invalid_interior_byte() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Demo.class", b"unparseable is still indexed")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[("org/example/Demo.java", b"\xffabcd\xc3\xa9")],
+    );
+    let index = build_index(&root, 10, 6);
+
+    let found = index.search_source("abcd", false, None, 0, None).unwrap();
+    assert_eq!(found.results.len(), 1);
+    assert!(found.results[0].truncated);
+    assert_eq!(found.results[0].context, "\u{fffd}abcd");
+    assert_eq!(found.scanned_bytes, 5);
+    assert!(found.incomplete);
+}
+
+#[test]
+fn source_search_surfaces_read_errors_after_indexing() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    let sources = base.join("demo-1.0-sources.jar");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Demo.class", b"unparseable is still indexed")],
+    );
+    write_jar(&sources, &[("org/example/Demo.java", b"class Demo {}")]);
+    let index = build_index(&root, 10, 1024);
+    std::fs::write(&sources, b"corrupt after startup").unwrap();
+
+    assert!(index.search_source("Demo", false, None, 0, None).is_err());
+}
+
+#[test]
 fn returns_class_and_method_declaration_source_slices() {
     let root = TempDir::new().unwrap();
     let base = root.path().join("org/example/demo/1.0");

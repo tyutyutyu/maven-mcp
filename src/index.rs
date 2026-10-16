@@ -1289,7 +1289,11 @@ impl MavenIndex {
                     .take(self.max_source_bytes.saturating_add(1) as u64)
                     .read_to_end(&mut bytes)?;
                 let truncated = bytes.len() > self.max_source_bytes;
+                incomplete |= truncated;
                 bytes.truncate(self.max_source_bytes);
+                if truncated {
+                    bytes.truncate(complete_utf8_prefix_len(&bytes));
+                }
                 scanned_bytes = scanned_bytes.saturating_add(bytes.len());
                 let text = String::from_utf8_lossy(&bytes);
                 let lines = text.lines().collect::<Vec<_>>();
@@ -3147,6 +3151,21 @@ fn is_text_resource(entry: &str) -> bool {
                 | "yml"
         )
     )
+}
+
+/// Length of `bytes` without a trailing UTF-8 sequence cut off by truncation;
+/// invalid bytes elsewhere are kept for lossy decoding.
+fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    loop {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => match error.error_len() {
+                Some(invalid_len) => offset += error.valid_up_to() + invalid_len,
+                None => return offset + error.valid_up_to(),
+            },
+        }
+    }
 }
 
 fn matching_context(text: &str, query: &str) -> Option<(usize, String)> {

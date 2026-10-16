@@ -1651,6 +1651,57 @@ async fn resource_limits_are_visible_to_stdio_clients() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn source_search_reports_truncated_sources_with_and_without_matches() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    server.replace_helper_sources(&[
+        (
+            "org/example/Foo.java",
+            b"package org.example; public class Foo { int scoped = 2; }",
+        ),
+        (
+            "org/example/Resource.java",
+            b"class Resource { int marker; }",
+        ),
+    ])?;
+    let project_path = server.project_path().unwrap().display().to_string();
+    let search = |limit: &'static str, query: &'static str| {
+        let project_path = project_path.clone();
+        let server = &server;
+        async move {
+            let (client, _) = server
+                .connect_with_limits(&[("MAX_SOURCE_BYTES", limit)])
+                .await?;
+            let result =
+                client
+                    .call_tool(CallToolRequestParams::new("search_source").with_arguments(
+                        arguments(json!({"project_path": project_path, "query": query})),
+                    ))
+                    .await?;
+            client.cancel().await?;
+            Ok::<_, anyhow::Error>(structured(result))
+        }
+    };
+
+    // Foo.java (57 bytes) and Resource.java (30 bytes) both fit in 64 bytes.
+    let complete = search("64", "no-such-text").await?;
+    assert_eq!(complete["results"], json!([]));
+    assert_eq!(complete["incomplete"], false);
+
+    // At 24 bytes Resource.java ends inside "marker", so nothing matches.
+    let after_limit = search("24", "marker").await?;
+    assert_eq!(after_limit["results"], json!([]));
+    assert_eq!(after_limit["incomplete"], true);
+
+    // A match in a fully read source does not hide the truncated Foo.java.
+    let mixed = search("40", "marker").await?;
+    let matches = mixed["results"].as_array().unwrap();
+    assert_eq!(matches.len(), 1, "{mixed}");
+    assert_eq!(matches[0]["truncated"], false);
+    assert_eq!(mixed["incomplete"], true);
+    Ok(())
+}
+
 #[test]
 fn resource_limit_configuration_rejects_unbounded_values() {
     for name in [

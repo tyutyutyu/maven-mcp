@@ -53,7 +53,10 @@ The server exposes the following MCP tools:
   capped at `MAX_SOURCE_BYTES`, and the aggregate scan at
   `MAX_SOURCE_BYTES × MAX_RESULTS`; binary and unsupported entries are skipped.
 - `search_source` – searches Java/Kotlin sources from local source artifacts by
-  substring or regular expression, with line numbers and bounded context.
+  substring or regular expression, with line numbers and bounded context. Each
+  source is read up to `MAX_SOURCE_BYTES` (the aggregate scan up to
+  `MAX_SOURCE_BYTES × MAX_RESULTS`); `incomplete` is `true` whenever any part of
+  a source was not searched, even with no matches (see below).
 - `get_declaration_source` – returns a focused source excerpt for a class, field,
   or method; overloads can be disambiguated with a JVM descriptor.
 - `search_providers` – returns structured Java ServiceLoader, JPMS
@@ -139,6 +142,17 @@ and UTF-8 entries with the extensions `conf`, `config`, `factories`, `imports`,
 limited by `MAX_SOURCE_BYTES`, while the aggregate read budget is
 `MAX_SOURCE_BYTES × MAX_RESULTS`. The `incomplete` field reports when size or
 result limits prevented a complete search.
+
+`search_source` reads each source up to `MAX_SOURCE_BYTES` (cut at a UTF-8
+character boundary), within the aggregate `MAX_SOURCE_BYTES × MAX_RESULTS` read
+budget; `scanned_bytes` counts the bytes actually searched. Its `incomplete`
+field describes the search, not response paging: it is `true` when any source
+was only partly read (the per-match `truncated` field marks the matches in such
+a source), when the aggregate budget stopped the scan, or when the result
+`limit` was reached; it is `false` only when every source was read completely
+and the result limit was not reached. An empty `results` list with
+`incomplete: true` therefore does not prove that the query is absent. A source
+read error fails the request instead of being reported as a missing match.
 
 `search_providers` interprets `META-INF/services/*`, JPMS `module-info.class`
 `uses`/`provides`, `META-INF/spring.factories`, and
