@@ -4,7 +4,9 @@ version: "3"
 
 tasks:
   run:
-    desc: Benchmark paired shell commands and Maven MCP tool calls
+    desc: Benchmark paired shell commands and Maven MCP tool calls on one project
+    requires:
+      vars: [PROJECT_PATH]
     vars:
       SPEC: '{{.SPEC | default "benchmark.json"}}'
       OUTPUT: '{{.OUTPUT | default "target/benchmark-results.json"}}'
@@ -24,6 +26,7 @@ tasks:
         cargo run --locked --bin maven-benchmark --
         --spec "{{.SPEC}}"
         --mcp-command "{{.MCP_COMMAND}}"
+        --project-path "{{.PROJECT_PATH}}"
         --output "{{.OUTPUT}}"
         --iterations "{{.ITERATIONS}}"
         --warmup "{{.WARMUP}}"

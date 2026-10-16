@@ -2,7 +2,7 @@ mod support;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use support::TestServer;
+use support::{BenchmarkProject, TestServer};
 
 #[tokio::test]
 async fn benchmark_cli_writes_paired_measurements_and_preserves_failures() -> Result<()> {
@@ -266,5 +266,187 @@ async fn benchmark_cli_bounds_shell_output_and_continues_after_timeout() -> Resu
     assert_eq!(next["response"]["bytes"], 9);
     assert_eq!(next["output_truncated"], false);
     assert_eq!(report["cases"].as_array().unwrap().len(), 4);
+    Ok(())
+}
+
+async fn run_project_benchmark(
+    spec_path: &std::path::Path,
+    output_path: &std::path::Path,
+    project: &BenchmarkProject,
+) -> Result<std::process::Output> {
+    Ok(tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-benchmark"))
+            .arg("--spec")
+            .arg(spec_path)
+            .arg("--mcp-command")
+            .arg(env!("CARGO_BIN_EXE_maven-mcp"))
+            .arg("--project-path")
+            .arg(project.project_path())
+            .arg("--output")
+            .arg(output_path)
+            .arg("--iterations")
+            .arg("2")
+            .arg("--warmup")
+            .arg("1")
+            .env_remove("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
+            .env("MAVEN_EXECUTION_REPO_PATH", project.repository_path())
+            .env("RUST_LOG", "maven_mcp=warn")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("benchmark CLI did not finish")??)
+}
+
+#[tokio::test]
+async fn bundled_specification_compares_identical_project_scoped_results() -> Result<()> {
+    let project = BenchmarkProject::new()?;
+    let directory = tempfile::tempdir()?;
+    let output_path = directory.path().join("results.json");
+    let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark.json");
+
+    let output = run_project_benchmark(&spec_path, &output_path, &project).await?;
+    assert!(
+        output.status.success(),
+        "benchmark CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&output_path)?)?;
+    assert!(
+        report["measurement_modes"]["first_call"]
+            .as_str()
+            .unwrap()
+            .contains("Maven classpath resolution")
+    );
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 3);
+    for case in cases {
+        let id = &case["id"];
+        let identity = &case["comparison"]["identity"];
+        assert_eq!(identity["status"], "matched", "{id}: {identity}");
+        assert!(identity.get("only_in_shell").is_none(), "{id}");
+        assert!(identity.get("only_in_mcp").is_none(), "{id}");
+        for side in ["shell", "mcp"] {
+            assert_eq!(case[side]["first_call"]["iteration"], 0, "{id} {side}");
+            assert_eq!(case[side]["first_call"]["success"], true, "{id} {side}");
+            assert_eq!(case[side]["summary"]["successful_runs"], 2, "{id} {side}");
+        }
+        assert!(case["comparison"]["shell_to_mcp_duration_ratio"].is_number());
+        assert!(case["comparison"]["first_call_shell_to_mcp_duration_ratio"].is_number());
+    }
+
+    // Only the classpath JAR is found: the outside control (slf4j-api 9.9) is in
+    // the repository but not in the result set of either side. The unrelated JAR
+    // listed last on the classpath (no match, no sources JAR) keeps every shell
+    // run successful.
+    let classes = &cases[0]["comparison"]["identity"];
+    assert_eq!(classes["shell_values"], 1);
+    assert_eq!(classes["mcp_values"], 1);
+    let versions = &cases[1]["comparison"]["identity"];
+    assert_eq!(versions["shell_values"], 1);
+    assert_eq!(versions["mcp_values"], 1);
+    let source = &cases[2]["comparison"]["identity"];
+    assert_eq!(source["shell_values"], source["mcp_values"]);
+    assert!(!std::fs::read_to_string(&output_path)?.contains(BenchmarkProject::CONTROL_JAR));
+    Ok(())
+}
+
+#[tokio::test]
+async fn bundled_specification_reports_a_maven_failure_as_a_failed_shell_run() -> Result<()> {
+    let project = BenchmarkProject::new()?;
+    project.fail_maven()?;
+    let directory = tempfile::tempdir()?;
+    let output_path = directory.path().join("results.json");
+    let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark.json");
+
+    let output = run_project_benchmark(&spec_path, &output_path, &project).await?;
+    assert!(
+        output.status.success(),
+        "benchmark CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&output_path)?)?;
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 3);
+    for case in cases {
+        let id = &case["id"];
+        assert_eq!(case["shell"]["first_call"]["success"], false, "{id}");
+        assert_eq!(case["shell"]["summary"]["successful_runs"], 0, "{id}");
+        let comparison = &case["comparison"];
+        assert_eq!(comparison["identity"]["status"], "unavailable", "{id}");
+        assert!(comparison["shell_to_mcp_duration_ratio"].is_null(), "{id}");
+        assert!(
+            comparison["first_call_shell_to_mcp_duration_ratio"].is_null(),
+            "{id}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unscoped_shell_result_is_a_failed_comparison_not_a_speedup() -> Result<()> {
+    let project = BenchmarkProject::new()?;
+    let directory = tempfile::tempdir()?;
+    let spec_path = directory.path().join("benchmark.json");
+    let output_path = directory.path().join("results.json");
+    std::fs::write(
+        &spec_path,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "name": "unscoped shell",
+            "cases": [{
+                "id": "whole-repository",
+                "shell": {
+                    "command": "find \"$MAVEN_EXECUTION_REPO_PATH\" -name 'slf4j-api-*.jar' ! -name '*-sources.jar'"
+                },
+                "mcp": {
+                    "tool": "search_classes",
+                    "arguments": { "project_path": "${PROJECT_PATH}", "query": "org.slf4j.Logger" }
+                },
+                "identity": { "mcp_values": "/results/*/jar/path", "normalize": "file_names" }
+            }]
+        }))?,
+    )?;
+
+    let output = run_project_benchmark(&spec_path, &output_path, &project).await?;
+    assert!(
+        output.status.success(),
+        "benchmark CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value = serde_json::from_slice(&std::fs::read(&output_path)?)?;
+    let case = &report["cases"][0];
+    let comparison = &case["comparison"];
+    assert_eq!(comparison["identity"]["status"], "mismatched");
+    assert_eq!(
+        comparison["identity"]["only_in_shell"],
+        json!([BenchmarkProject::CONTROL_JAR])
+    );
+    assert!(comparison["shell_to_mcp_duration_ratio"].is_null());
+    assert!(comparison["first_call_shell_to_mcp_duration_ratio"].is_null());
+    assert!(comparison["estimated_token_reduction_percent"].is_null());
+    assert_eq!(case["shell"]["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(case["mcp"]["summary"]["successful_runs"], 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn specification_with_project_placeholder_requires_project_path() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let output_path = directory.path().join("results.json");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-benchmark"))
+        .arg("--spec")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark.json"))
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .await?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--project-path"));
+    assert!(!output_path.exists());
     Ok(())
 }

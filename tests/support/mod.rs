@@ -634,6 +634,97 @@ fn write_jar(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
     Ok(())
 }
 
+/// A project whose classpath holds `org.slf4j:slf4j-api:2.0.9` followed by an
+/// unrelated `org.example:unrelated:1.0` without a sources JAR, next to a control
+/// `slf4j-api:9.9` in the same local repository but outside the classpath.
+pub struct BenchmarkProject {
+    _root: TempDir,
+    project_path: PathBuf,
+    repository_path: PathBuf,
+}
+
+impl BenchmarkProject {
+    pub const CONTROL_JAR: &'static str = "slf4j-api-9.9.jar";
+    const UNRELATED_JAR: &'static str = "org/example/unrelated/1.0/unrelated-1.0.jar";
+
+    pub fn new() -> Result<Self> {
+        let root = TempDir::new()?;
+        let base = root.path().canonicalize()?;
+        let project_path = base.join("project");
+        let repository_path = base.join("repository");
+        std::fs::create_dir_all(project_path.join(".mvn/wrapper"))?;
+        std::fs::write(
+            project_path.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>benchmark-fixture</artifactId><version>1.0</version></project>",
+        )?;
+        std::fs::write(
+            project_path.join(".mvn/wrapper/maven-wrapper.properties"),
+            "distributionUrl=https://example.invalid/maven.zip",
+        )?;
+        let wrapper = project_path.join("mvnw");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' 'Dependencies classpath:' '{}:{}'\n",
+                repository_path
+                    .join("org/slf4j/slf4j-api/2.0.9/slf4j-api-2.0.9.jar")
+                    .display(),
+                repository_path.join(Self::UNRELATED_JAR).display()
+            ),
+        )?;
+        let mut permissions = wrapper.metadata()?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions)?;
+
+        let logger = minimal_class("org/slf4j/Logger");
+        for (version, source) in [
+            ("2.0.9", "package org.slf4j;\npublic interface Logger {}\n"),
+            (
+                "9.9",
+                "package org.slf4j;\npublic interface ControlLogger {}\n",
+            ),
+        ] {
+            let directory = repository_path.join(format!("org/slf4j/slf4j-api/{version}"));
+            write_jar(
+                &directory.join(format!("slf4j-api-{version}.jar")),
+                &[("org/slf4j/Logger.class", &logger)],
+            )?;
+            write_jar(
+                &directory.join(format!("slf4j-api-{version}-sources.jar")),
+                &[("org/slf4j/Logger.java", source.as_bytes())],
+            )?;
+        }
+        write_jar(
+            &repository_path.join(Self::UNRELATED_JAR),
+            &[(
+                "org/example/Unrelated.class",
+                &minimal_class("org/example/Unrelated"),
+            )],
+        )?;
+        Ok(Self {
+            _root: root,
+            project_path,
+            repository_path,
+        })
+    }
+
+    pub fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
+    pub fn repository_path(&self) -> &Path {
+        &self.repository_path
+    }
+
+    /// Replaces the fake `mvnw` with one that fails classpath resolution.
+    pub fn fail_maven(&self) -> Result<()> {
+        write_executable(
+            &self.project_path.join("mvnw"),
+            "#!/bin/sh\necho 'offline artifact missing' >&2\nexit 3\n",
+        )
+    }
+}
+
 /// Owns the recorded processes even when a regression assertion unwinds.
 pub struct PipeHolder {
     project: PathBuf,

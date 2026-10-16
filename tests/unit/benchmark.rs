@@ -10,6 +10,7 @@ fn token_estimate_uses_unicode_scalar_values() {
 fn rejects_duplicate_case_ids() {
     let error = BenchmarkSpec::from_slice(
         br#"{"schema_version":1,"name":"x","cases":[{"id":"same","shell":{"command":"true"},"mcp":{"tool":"index_stats"}},{"id":"same","shell":{"command":"true"},"mcp":{"tool":"index_stats"}}]}"#,
+        None,
     )
     .unwrap_err();
     assert!(error.to_string().contains("duplicate benchmark case id"));
@@ -43,6 +44,7 @@ fn summary_uses_only_successful_runs() {
 fn shell_options(timeout: Duration, max_output_bytes: usize) -> BenchmarkOptions {
     BenchmarkOptions {
         mcp_command: PathBuf::from("unused"),
+        project_path: None,
         iterations: 1,
         warmup: 0,
         timeout,
@@ -211,4 +213,244 @@ async fn shell_spawn_failure_is_reported_as_a_failed_run() {
     let run = run_shell(&invocation, &shell_options(Duration::from_secs(5), 64), 1).await;
     assert!(!run.success);
     assert!(run.error.unwrap().contains("shell execution failed"));
+}
+
+fn project_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("pom.xml"), "<project/>").unwrap();
+    directory
+}
+
+#[test]
+fn bundled_specification_binds_the_project_in_every_case() {
+    let project = project_directory();
+    let project_path = canonical_project_path(project.path()).unwrap();
+    let spec =
+        BenchmarkSpec::from_slice(include_bytes!("../../benchmark.json"), Some(&project_path))
+            .unwrap();
+    assert!(!spec.cases.is_empty());
+    for case in &spec.cases {
+        assert_eq!(
+            case.mcp.arguments["project_path"],
+            project_path.to_str().unwrap(),
+            "case {}",
+            case.id
+        );
+        assert_eq!(case.shell.cwd.as_deref(), Some(project_path.as_path()));
+        assert!(case.shell.command.contains(PROJECT_PATH_VARIABLE));
+        assert!(case.identity.is_some(), "case {} has no identity", case.id);
+    }
+}
+
+#[test]
+fn bundled_specification_requires_a_project_path() {
+    let error =
+        BenchmarkSpec::from_slice(include_bytes!("../../benchmark.json"), None).unwrap_err();
+    assert!(error.to_string().contains("--project-path"));
+}
+
+#[test]
+fn bound_project_requires_matching_project_path_argument() {
+    let project = project_directory();
+    let project_path = canonical_project_path(project.path()).unwrap();
+    for arguments in [r#"{}"#, r#"{"project_path":"/somewhere/else"}"#] {
+        let spec = format!(
+            r#"{{"schema_version":1,"name":"x","cases":[{{"id":"a","shell":{{"command":"true"}},"mcp":{{"tool":"index_stats","arguments":{arguments}}}}}]}}"#
+        );
+        let error = BenchmarkSpec::from_slice(spec.as_bytes(), Some(&project_path)).unwrap_err();
+        assert!(
+            error.to_string().contains("must set project_path"),
+            "{arguments}: {error}"
+        );
+    }
+}
+
+#[test]
+fn project_path_must_be_an_absolute_maven_project() {
+    assert!(canonical_project_path(Path::new("relative")).is_err());
+    let empty = tempfile::tempdir().unwrap();
+    assert!(
+        canonical_project_path(empty.path())
+            .unwrap_err()
+            .to_string()
+            .contains("pom.xml")
+    );
+    let project = project_directory();
+    let link = empty.path().join("link");
+    std::os::unix::fs::symlink(project.path(), &link).unwrap();
+    assert_eq!(
+        canonical_project_path(&link).unwrap(),
+        project.path().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn shell_receives_the_project_path_and_returns_stdout_only() {
+    let project = project_directory();
+    let project_path = canonical_project_path(project.path()).unwrap();
+    let mut options = shell_options(Duration::from_secs(5), 4096);
+    options.project_path = Some(project_path.clone());
+    let (run, stdout) = run_shell_captured(
+        &shell("printf '%s' \"$PROJECT_PATH\"; printf noise >&2"),
+        &options,
+        0,
+    )
+    .await;
+    assert!(run.success);
+    assert_eq!(stdout, project_path.to_str().unwrap().as_bytes());
+    assert!(run.response.bytes > stdout.len());
+}
+
+fn identity(pointer: &str, normalize: IdentityNormalization) -> ResultIdentity {
+    ResultIdentity {
+        mcp_values: pointer.to_owned(),
+        normalize,
+    }
+}
+
+fn successful_run() -> RunMeasurement {
+    let size = payload_size(b"x");
+    RunMeasurement {
+        iteration: 0,
+        duration_nanoseconds: 1,
+        success: true,
+        request: size,
+        response: size,
+        exit_code: Some(0),
+        error: None,
+        output_truncated: false,
+    }
+}
+
+fn jar_result(paths: &[&str]) -> Value {
+    json!({ "structuredContent": { "results": paths.iter().map(|path| json!({"jar": {"path": path}})).collect::<Vec<_>>() } })
+}
+
+#[test]
+fn identity_matches_after_normalizing_paths_and_order() {
+    let check = check_identity(
+        Some(&identity(
+            "/results/*/jar/path",
+            IdentityNormalization::FileNames,
+        )),
+        &successful_run(),
+        b"/home/u/.m2/repository/org/a/1/a-1.jar\n/home/u/.m2/repository/org/b/1/b-1.jar\n",
+        &successful_run(),
+        Some(&jar_result(&["org/b/1/b-1.jar", "org/a/1/a-1.jar"])),
+    );
+    assert_eq!(check.status, IdentityStatus::Matched);
+    assert_eq!((check.shell_values, check.mcp_values), (2, 2));
+    assert!(check.permits_ratios());
+}
+
+#[test]
+fn identity_reports_an_outside_control_jar_as_a_mismatch() {
+    let check = check_identity(
+        Some(&identity(
+            "/results/*/jar/path",
+            IdentityNormalization::FileNames,
+        )),
+        &successful_run(),
+        b"/r/a/1/a-1.jar\n/r/a/9/a-control.jar\n",
+        &successful_run(),
+        Some(&jar_result(&["a/1/a-1.jar"])),
+    );
+    assert_eq!(check.status, IdentityStatus::Mismatched);
+    assert_eq!(check.only_in_shell, ["a-control.jar"]);
+    assert!(check.only_in_mcp.is_empty());
+    assert!(!check.permits_ratios());
+}
+
+#[test]
+fn identity_is_unavailable_when_a_side_cannot_be_compared() {
+    let pointer = identity("/results/*/jar/path", IdentityNormalization::Lines);
+    let result = jar_result(&["a.jar"]);
+    let failed = failed_run(0, 1, payload_size(b"x"), "failed".to_owned());
+    let truncated = RunMeasurement {
+        output_truncated: true,
+        ..successful_run()
+    };
+    let cases = [
+        (
+            &failed,
+            &successful_run(),
+            Some(&result),
+            "shell side failed",
+        ),
+        (&successful_run(), &failed, None, "MCP side failed"),
+        (
+            &successful_run(),
+            &successful_run(),
+            None,
+            "MCP side failed",
+        ),
+        (
+            &truncated,
+            &successful_run(),
+            Some(&result),
+            "--max-output-bytes",
+        ),
+    ];
+    for (shell_run, mcp_run, mcp_result, expected) in cases {
+        let check = check_identity(Some(&pointer), shell_run, b"a.jar", mcp_run, mcp_result);
+        assert_eq!(check.status, IdentityStatus::Unavailable);
+        assert!(check.detail.unwrap().contains(expected), "{expected}");
+    }
+
+    let empty = check_identity(
+        Some(&pointer),
+        &successful_run(),
+        b"\n",
+        &successful_run(),
+        Some(&jar_result(&[])),
+    );
+    assert_eq!(empty.status, IdentityStatus::Unavailable);
+    assert!(empty.detail.unwrap().contains("empty"));
+
+    let missing = check_identity(
+        Some(&identity("/results/*/nope", IdentityNormalization::Lines)),
+        &successful_run(),
+        b"a.jar",
+        &successful_run(),
+        Some(&result),
+    );
+    assert_eq!(missing.status, IdentityStatus::Unavailable);
+    assert!(format!("{missing:?}").contains("nope"));
+}
+
+#[test]
+fn identity_is_optional_and_does_not_block_ratios() {
+    let check = check_identity(None, &successful_run(), b"", &successful_run(), None);
+    assert_eq!(check.status, IdentityStatus::NotChecked);
+    assert!(check.permits_ratios());
+}
+
+#[test]
+fn mcp_values_accept_object_values_and_text_content() {
+    let versions = json!({ "content": [{ "type": "text", "text": "{\"g:a\":[\"1\",\"2\"]}" }] });
+    assert_eq!(mcp_result_values(&versions, "/*/*").unwrap(), ["1", "2"]);
+    assert!(mcp_result_values(&json!({ "content": [] }), "/*").is_err());
+    assert!(mcp_result_values(&json!({ "structuredContent": 1 }), "/*").is_err());
+}
+
+#[test]
+fn mismatched_comparison_reports_no_speedup() {
+    let summary = MeasurementSummary {
+        runs: 1,
+        successful_runs: 1,
+        mean_duration_nanoseconds: Some(100),
+        median_duration_nanoseconds: Some(100),
+        mean_total_estimated_tokens: Some(10),
+    };
+    let run = successful_run();
+    let mismatch = IdentityCheck::with_status(IdentityStatus::Mismatched);
+    let comparison = compare(&summary, &summary, (&run, &run), mismatch);
+    assert!(comparison.shell_to_mcp_duration_ratio.is_none());
+    assert!(comparison.first_call_shell_to_mcp_duration_ratio.is_none());
+    assert!(comparison.estimated_token_reduction_percent.is_none());
+
+    let matched = IdentityCheck::with_status(IdentityStatus::Matched);
+    let comparison = compare(&summary, &summary, (&run, &run), matched);
+    assert_eq!(comparison.shell_to_mcp_duration_ratio, Some(1.0));
+    assert_eq!(comparison.first_call_shell_to_mcp_duration_ratio, Some(1.0));
 }
