@@ -1733,3 +1733,135 @@ async fn pipe_timeouts_clean_up_and_release_the_global_permit() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn classfile_tools_agree_on_the_effective_multi_release_variant() -> Result<()> {
+    let server = TestServer::start_with_multi_release_project().await?;
+    let project_path = server.project_path().unwrap().display().to_string();
+    let client = server.connect().await?;
+    let call = |tool: &'static str, extra: Value| {
+        let mut arguments = arguments(extra);
+        arguments.insert("project_path".to_owned(), json!(project_path));
+        let client = &client;
+        async move {
+            Ok::<_, anyhow::Error>(structured(
+                client
+                    .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments))
+                    .await?,
+            ))
+        }
+    };
+    let count = |value: &Value| value["results"].as_array().map_or(0, Vec::len);
+
+    let described = call(
+        "describe_class",
+        json!({"class_name": "org.mr.Shape", "jar": "org.libs:multi-release:1.0"}),
+    )
+    .await?;
+    assert_eq!(count(&described), 1);
+    let shape = &described["results"][0];
+    assert_eq!(shape["super_class"], "java.lang.Number");
+    let fields = shape["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["name"], "java17x");
+
+    let hierarchy = |parent: &'static str, jar: &'static str| {
+        call(
+            "search_type_hierarchy",
+            json!({"type_name": parent, "jar": jar}),
+        )
+    };
+    assert_eq!(
+        count(&hierarchy("java.lang.Number", "org.libs:multi-release:1.0").await?),
+        1
+    );
+    let object_children = hierarchy("java.lang.Object", "org.libs:multi-release:1.0").await?;
+    assert_eq!(
+        object_children["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["type_name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["org.mr.VersionOnly"]
+    );
+
+    for (query, expected) in [("java17x", 1), ("java11x", 0), ("baseval", 0)] {
+        let members = call(
+            "search_class_members",
+            json!({"query": query, "jar": "org.libs:multi-release:1.0"}),
+        )
+        .await?;
+        assert_eq!(count(&members), expected, "member query {query}");
+    }
+
+    let references = call(
+        "search_class_references",
+        json!({
+            "class_name": "org.mr.Shape",
+            "direction": "outbound",
+            "kind": "class",
+            "jar": "org.libs:multi-release:1.0"
+        }),
+    )
+    .await?;
+    let targets = references["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reference| reference["target_owner"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(targets.contains(&"java.lang.Number"), "{targets:?}");
+    assert!(!targets.contains(&"java.lang.Object"), "{targets:?}");
+
+    let listed = call(
+        "list_jar_classes",
+        json!({"jar": "org.libs:multi-release:1.0"}),
+    )
+    .await?;
+    assert_eq!(
+        listed["results"][0]["classes"],
+        json!(["org.mr.Shape", "org.mr.VersionOnly"])
+    );
+
+    let diff = call(
+        "compare_artifact_api",
+        json!({
+            "group_id": "org.libs",
+            "artifact_id": "multi-release",
+            "previous_version": "1.0",
+            "current_version": "2.0"
+        }),
+    )
+    .await?;
+    assert_eq!(diff["added_classes"], json!([]));
+    assert_eq!(diff["removed_classes"], json!(["org.mr.VersionOnly"]));
+    let changed = &diff["changed_classes"][0];
+    assert_eq!(changed["class_name"], "org.mr.Shape");
+    assert_eq!(changed["previous_super_class"], "java.lang.Number");
+    assert_eq!(changed["current_super_class"], "java.lang.Object");
+    assert_eq!(changed["removed_members"], json!(["field:java17x:I"]));
+    assert_eq!(changed["added_members"], json!(["field:baseval:I"]));
+
+    // Control: no `Multi-Release: true` manifest, so every versioned entry is ignored.
+    let plain = call(
+        "describe_class",
+        json!({"class_name": "org.mr.Shape", "jar": "org.libs:plain-release:1.0"}),
+    )
+    .await?;
+    assert_eq!(plain["results"][0]["super_class"], "java.lang.Object");
+    assert_eq!(plain["results"][0]["fields"][0]["name"], "baseval");
+    assert_eq!(
+        count(&hierarchy("java.lang.Number", "org.libs:plain-release:1.0").await?),
+        0
+    );
+    let version_only = call(
+        "describe_class",
+        json!({"class_name": "org.mr.VersionOnly", "jar": "org.libs:plain-release:1.0"}),
+    )
+    .await?;
+    assert_eq!(count(&version_only), 0);
+
+    client.cancel().await?;
+    Ok(())
+}
