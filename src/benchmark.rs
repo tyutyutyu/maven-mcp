@@ -1,4 +1,11 @@
-use std::{collections::BTreeSet, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeSet,
+    os::unix::process::CommandExt,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use rmcp::{
@@ -7,10 +14,20 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::{process::Command, time::Instant};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::{Child, Command},
+    time::Instant,
+};
+
+use crate::project::{ProcessGroupGuard, terminate_process_group};
 
 pub const SPEC_SCHEMA_VERSION: u32 = 1;
 pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+
+/// Time allowed for the shell process group to exit and its pipes to close
+/// after the run has ended or timed out.
+const SHELL_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -298,46 +315,194 @@ async fn run_shell(
     command
         .arg("-c")
         .arg(&invocation.command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
     if let Some(cwd) = &invocation.cwd {
         command.current_dir(cwd);
     }
     let started = Instant::now();
-    let result = tokio::time::timeout(options.timeout, command.output()).await;
-    let duration = started.elapsed().as_nanos();
-    match result {
-        Ok(Ok(output)) => {
-            let mut response = output.stdout;
-            response.extend_from_slice(&output.stderr);
-            let original_len = response.len();
-            response.truncate(options.max_output_bytes);
-            RunMeasurement {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return failed_run(
                 iteration,
-                duration_nanoseconds: duration,
-                success: output.status.success(),
+                started.elapsed().as_nanos(),
                 request,
-                response: payload_size(&response),
-                exit_code: output.status.code(),
-                error: (!output.status.success())
-                    .then(|| format!("shell command exited with status {}", output.status)),
-                output_truncated: original_len > response.len(),
-            }
+                format!("shell execution failed: {error}"),
+            );
         }
-        Ok(Err(error)) => failed_run(
+    };
+    let mut process_group = ProcessGroupGuard::new(child.id());
+    let execution = supervise_shell(&mut child, options, started).await;
+    process_group.disarm();
+    let response = payload_size(&execution.output);
+    match execution.outcome {
+        ShellOutcome::Exited(status) => RunMeasurement {
             iteration,
-            duration,
+            duration_nanoseconds: execution.duration,
+            success: status.success(),
             request,
-            format!("shell execution failed: {error}"),
-        ),
-        Err(_) => failed_run(
+            response,
+            exit_code: status.code(),
+            error: (!status.success())
+                .then(|| format!("shell command exited with status {status}")),
+            output_truncated: execution.truncated,
+        },
+        ShellOutcome::TimedOut => RunMeasurement {
             iteration,
-            duration,
+            duration_nanoseconds: execution.duration,
+            success: false,
             request,
-            format!(
+            response,
+            exit_code: None,
+            error: Some(format!(
                 "shell command timed out after {} ms",
                 options.timeout.as_millis()
+            )),
+            output_truncated: execution.truncated,
+        },
+        ShellOutcome::Failed(error) => RunMeasurement {
+            iteration,
+            duration_nanoseconds: execution.duration,
+            success: false,
+            request,
+            response,
+            exit_code: None,
+            error: Some(error),
+            output_truncated: execution.truncated,
+        },
+    }
+}
+
+enum ShellOutcome {
+    Exited(ExitStatus),
+    TimedOut,
+    Failed(String),
+}
+
+struct ShellExecution {
+    outcome: ShellOutcome,
+    duration: u128,
+    /// Bounded stdout followed by stderr; never larger than the output budget.
+    output: Vec<u8>,
+    truncated: bool,
+}
+
+/// Runs the shell process group to completion within the run deadline.
+///
+/// The process group is always killed once the direct child has exited or the
+/// deadline has passed, so descendants cannot keep the output pipes open or
+/// outlive the run. Output beyond the shared budget is read and discarded.
+async fn supervise_shell(
+    child: &mut Child,
+    options: &BenchmarkOptions,
+    started: Instant,
+) -> ShellExecution {
+    let process_id = child.id();
+    let budget = AtomicUsize::new(options.max_output_bytes);
+    let truncated = AtomicBool::new(false);
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut readers = Box::pin(async {
+        tokio::join!(
+            drain_bounded(stdout, &budget, &truncated, &mut stdout_bytes),
+            drain_bounded(stderr, &budget, &truncated, &mut stderr_bytes)
+        )
+    });
+
+    let deadline = started + options.timeout;
+    let mut read_result = None;
+    let waited = tokio::time::timeout_at(deadline, async {
+        let mut exit = Box::pin(child.wait());
+        loop {
+            tokio::select! {
+                status = &mut exit => return status,
+                result = &mut readers, if read_result.is_none() => read_result = Some(result),
+            }
+        }
+    })
+    .await;
+    let duration = started.elapsed().as_nanos();
+    let timed_out = waited.is_err();
+    let _ = terminate_process_group(process_id);
+
+    let cleanup_deadline = Instant::now() + SHELL_CLEANUP_GRACE;
+    let waited = match waited {
+        Ok(status) => status,
+        Err(_) => tokio::time::timeout_at(cleanup_deadline, child.wait())
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "shell did not exit after process-group termination",
+                ))
+            }),
+    };
+    if read_result.is_none() {
+        read_result = tokio::time::timeout_at(cleanup_deadline, &mut readers)
+            .await
+            .ok();
+    }
+    drop(readers);
+
+    let outcome = if timed_out {
+        ShellOutcome::TimedOut
+    } else {
+        match (waited, read_result) {
+            (Err(error), _) => ShellOutcome::Failed(format!("cannot wait for shell: {error}")),
+            (Ok(_), None) => ShellOutcome::Failed(
+                "shell output pipes stayed open after process-group termination".to_owned(),
             ),
-        ),
+            (Ok(_), Some((Err(error), _) | (_, Err(error)))) => {
+                ShellOutcome::Failed(format!("cannot read shell output: {error}"))
+            }
+            (Ok(status), Some((Ok(()), Ok(())))) => ShellOutcome::Exited(status),
+        }
+    };
+    let mut output = stdout_bytes;
+    output.append(&mut stderr_bytes);
+    ShellExecution {
+        outcome,
+        duration,
+        output,
+        truncated: truncated.load(Ordering::Relaxed),
+    }
+}
+
+/// Reads a stream to EOF, keeping bytes only while the budget shared with the
+/// other stream has room and discarding the rest.
+async fn drain_bounded<R>(
+    reader: Option<R>,
+    budget: &AtomicUsize,
+    truncated: &AtomicBool,
+    stored: &mut Vec<u8>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return Ok(());
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let reserved = budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining - remaining.min(read))
+            })
+            .map_or(0, |remaining| remaining.min(read));
+        stored.extend_from_slice(&buffer[..reserved]);
+        if reserved < read {
+            truncated.store(true, Ordering::Relaxed);
+        }
     }
 }
 

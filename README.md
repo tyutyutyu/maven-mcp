@@ -551,7 +551,15 @@ cargo run --locked --bin maven-benchmark -- \
 ```
 
 The default for `--max-output-bytes` is 1 MiB. It limits the output included in
-request/response metrics; `output_truncated` reports truncation. Under
+request/response metrics; `output_truncated` reports truncation. For shell
+commands the limit is a single budget shared by stdout and stderr: the benchmark
+never stores more than that many bytes and reads and discards the remainder, so
+very large or endless output does not exhaust memory. Each shell command runs in
+its own process group within the `--timeout-seconds` deadline. When the shell
+exits or the deadline passes, the whole group is killed, so descendants that hold
+the output pipes open cannot hang the run or outlive it. A timed-out run is
+recorded with `success: false` and a `timed out` error, and the benchmark
+continues with the next run and case. Under
 `schema_version: "1.0"`, the JSON preserves the shell- and MCP-side request size
 for each case, every raw run's duration, success state, response size, and token
 estimate, as well as the mean and median of successful runs and the speed and
