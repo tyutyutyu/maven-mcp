@@ -64,6 +64,20 @@ impl TestServer {
         })
     }
 
+    /// Adds JARs whose classfile variants differ by Java version: `multi-release:1.0`
+    /// (flagged, base plus 11 and 17), `multi-release:2.0` (base only) and
+    /// `plain-release:1.0` (same layout as 1.0 but without the manifest flag).
+    pub async fn start_with_multi_release_project() -> Result<Self> {
+        let server = Self::start_with_project().await?;
+        let project_path = server
+            .project_path
+            .as_ref()
+            .context("test server has no project")?;
+        std::fs::write(project_path.join(".multi-release-fixture"), "enabled\n")?;
+        fixture_multi_release_jars(&project_path.join("execution-repository"))?;
+        Ok(server)
+    }
+
     pub async fn start_with_jenv_project() -> Result<Self> {
         let mut server = Self::start_with_project().await?;
         server.jenv_root = Some(fixture_jenv_root()?);
@@ -306,6 +320,11 @@ case " $* " in
     if [ -f .repository-inspection-fixture ]; then
       classpath="$classpath:$PWD/execution-repository/org/libs/api-fixture/1.0/api-fixture-1.0.jar:$PWD/execution-repository/org/libs/api-fixture/2.0/api-fixture-2.0.jar:$PWD/execution-repository/org/libs/resource-fixture/1.0/resource-fixture-1.0.jar"
     fi
+    if [ -f .multi-release-fixture ]; then
+      for jar in multi-release/1.0/multi-release-1.0 multi-release/2.0/multi-release-2.0 plain-release/1.0/plain-release-1.0; do
+        classpath="$classpath:$PWD/execution-repository/org/libs/$jar.jar"
+      done
+    fi
     printf '%s\n' 'Dependencies classpath:' "$classpath"
     ;;
   *) printf '%s\n' '[INFO] BUILD SUCCESS' ;;
@@ -486,7 +505,71 @@ fn fixture_execution_repository(root: &Path, include_inspection_fixtures: bool) 
     Ok(())
 }
 
+type JarEntries<'a> = Vec<(&'a str, &'a [u8])>;
+
+fn fixture_multi_release_jars(root: &Path) -> Result<()> {
+    let shape = |super_class, field| variant_class("org/mr/Shape", super_class, field);
+    let base = shape("java/lang/Object", "baseval");
+    let java11 = shape("java/lang/Number", "java11x");
+    let java17 = shape("java/lang/Number", "java17x");
+    let version_only = minimal_class("org/mr/VersionOnly");
+    let manifest: (&str, &[u8]) = (
+        "META-INF/MANIFEST.MF",
+        b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
+    );
+    let java17_entry = ("META-INF/versions/17/org/mr/Shape.class", java17.as_slice());
+    let layouts: [(&str, &str, JarEntries); 3] = [
+        (
+            "multi-release",
+            "1.0",
+            vec![
+                manifest,
+                ("org/mr/Shape.class", &base),
+                ("META-INF/versions/11/org/mr/Shape.class", &java11),
+                java17_entry,
+                (
+                    "META-INF/versions/17/org/mr/VersionOnly.class",
+                    &version_only,
+                ),
+            ],
+        ),
+        ("multi-release", "2.0", vec![("org/mr/Shape.class", &base)]),
+        (
+            "plain-release",
+            "1.0",
+            vec![
+                ("org/mr/Shape.class", &base),
+                ("META-INF/versions/11/org/mr/Shape.class", &java11),
+                java17_entry,
+                (
+                    "META-INF/versions/17/org/mr/VersionOnly.class",
+                    &version_only,
+                ),
+            ],
+        ),
+    ];
+    for (artifact, version, entries) in layouts {
+        let directory = root.join(format!("org/libs/{artifact}/{version}"));
+        write_jar(
+            &directory.join(format!("{artifact}-{version}.jar")),
+            &entries,
+        )?;
+        std::fs::write(
+            directory.join(format!("{artifact}-{version}.pom")),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>org.libs</groupId><artifactId>{artifact}</artifactId><version>{version}</version><packaging>jar</packaging></project>"
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 fn minimal_class(class_name: &str) -> Vec<u8> {
+    variant_class(class_name, "java/lang/Object", "value")
+}
+
+/// Public class with one public `int` field; superclass and field name select the variant.
+fn variant_class(class_name: &str, super_class: &str, field_name: &str) -> Vec<u8> {
     fn push_u16(bytes: &mut Vec<u8>, value: u16) {
         bytes.extend_from_slice(&value.to_be_bytes());
     }
@@ -509,9 +592,9 @@ fn minimal_class(class_name: &str) -> Vec<u8> {
     push_u16(&mut bytes, 7);
     push_utf8(&mut bytes, class_name);
     push_class(&mut bytes, 1);
-    push_utf8(&mut bytes, "java/lang/Object");
+    push_utf8(&mut bytes, super_class);
     push_class(&mut bytes, 3);
-    push_utf8(&mut bytes, "value");
+    push_utf8(&mut bytes, field_name);
     push_utf8(&mut bytes, "I");
     push_u16(&mut bytes, 0x0021);
     push_u16(&mut bytes, 2);

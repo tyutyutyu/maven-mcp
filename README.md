@@ -62,6 +62,27 @@ The server exposes the following MCP tools:
 - `list_artifact_versions` – lists locally available versions of an artifact,
   with an optional `groupId` filter.
 
+### Multi-release JARs
+
+Every classfile-based tool (`describe_class`, `search_class_members`,
+`search_type_hierarchy`, `search_class_references`, `compare_artifact_api`,
+`search_providers`, and `list_jar_classes`) reads the same effective class
+variant, so one class never shows different superclasses or members in different
+tools. The server does not target a particular Java runtime; the answer applies
+to the **highest** `META-INF/versions/<N>` variant (`N >= 9`), not to the Java
+version of your project:
+
+- Only a JAR whose `META-INF/MANIFEST.MF` declares `Multi-Release: true` has its
+  `META-INF/versions/<N>/` entries considered. The highest `N` wins; the base
+  entry is the fallback, and a class present only in a versioned directory is
+  indexed with that variant.
+- Without the manifest flag, all versioned entries are ignored (as the JVM does):
+  the base entry is the only variant, and a class that exists only under
+  `META-INF/versions/` is not indexed.
+- Version directories that are not canonical decimal numbers (for example `x`,
+  `+11`, or `011`) or are below 9 are never selected.
+- `search_jar_entries` still lists the raw entries, including every versioned one.
+
 Project inspection and execution use the same request `project_path`:
 
 - `inspect_maven_project` – models the root project, Maven Wrapper, and recursive

@@ -5,6 +5,11 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 use super::*;
 
+const MULTI_RELEASE_MANIFEST: (&str, &[u8]) = (
+    "META-INF/MANIFEST.MF",
+    b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
+);
+
 fn write_jar(path: &Path, entries: &[(&str, &[u8])]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut writer = ZipWriter::new(File::create(path).unwrap());
@@ -166,7 +171,7 @@ fn archive_preflight_supports_zip64_and_bounds_central_directory_bytes() {
     bytes.extend(end);
     std::fs::write(&path, &bytes).unwrap();
     preflight_archive(&path, &mut ArchiveBudget::configured()).unwrap();
-    assert_eq!(read_jar_index(&path).unwrap().1, ["a", "b"]);
+    assert_eq!(read_jar_index(&path).unwrap().entries, ["a", "b"]);
     let size_offset = zip64_offset as usize + 40;
     bytes[size_offset..size_offset + 8]
         .copy_from_slice(&(MAX_CENTRAL_DIRECTORY_BYTES + 1).to_le_bytes());
@@ -700,6 +705,7 @@ fn describes_inner_and_multi_release_classes_once() {
     write_jar(
         &jar,
         &[
+            MULTI_RELEASE_MANIFEST,
             ("org/example/Outer$Inner.class", &inner),
             (
                 "META-INF/versions/17/org/example/VersionOnly.class",
@@ -1033,12 +1039,16 @@ fn jar_content_search_surfaces_zip_errors_after_indexing() {
 }
 
 #[test]
-fn recognizes_multi_release_classes_once() {
+fn recognizes_effective_class_names() {
     assert_eq!(
-        class_name_from_entry("META-INF/versions/17/org/example/Foo.class"),
+        class_name_from_entry("org/example/Foo.class"),
         Some("org.example.Foo".to_owned())
     );
     assert_eq!(class_name_from_entry("module-info.class"), None);
+    assert_eq!(
+        class_name_from_entry("org/example/package-info.class"),
+        None
+    );
 }
 
 #[test]
@@ -1236,6 +1246,7 @@ fn classifiers_are_addressable_and_multi_release_classes_are_deduplicated() {
     write_jar(
         &path,
         &[
+            MULTI_RELEASE_MANIFEST,
             ("org/example/Foo.class", b"base"),
             ("META-INF/versions/17/org/example/Foo.class", b"java17"),
             ("module-info.class", b"module"),
@@ -1696,4 +1707,313 @@ fn exact_artifact_lookups_allow_symlinks_that_stay_inside_the_repository() {
 
     assert!(index.pom_descriptor("org.alias:demo:1.0").unwrap().found);
     assert!(!index.pom_descriptor("org.alias:demo:2.0").unwrap().found);
+}
+
+fn shape_variant(super_class: &[u8], member: &[u8]) -> Vec<u8> {
+    let mut bytes = inspection_class("org/example/Shape");
+    replace_ascii(&mut bytes, b"java/lang/Object", super_class);
+    replace_ascii(&mut bytes, b"greet", member);
+    bytes
+}
+
+#[test]
+fn multi_release_manifest_flag_parsing_is_strict_and_case_insensitive() {
+    assert!(manifest_declares_multi_release(
+        "Manifest-Version: 1.0\nmulti-release:  TRUE\n"
+    ));
+    assert!(manifest_declares_multi_release(
+        "Manifest-Version: 1.0\nMulti-Rel\n ease: true\n"
+    ));
+    assert!(manifest_declares_multi_release(
+        "Manifest-Version: 1.0\rMulti-Release: true\r\r"
+    ));
+    assert!(manifest_declares_multi_release(
+        "Manifest-Version: 1.0\rMulti-Rel\r ease: true\r\r"
+    ));
+    assert!(!manifest_declares_multi_release(
+        "Manifest-Version: 1.0\r\rMulti-Release: true\r"
+    ));
+    assert!(!manifest_declares_multi_release("Multi-Release: false\n"));
+    assert!(!manifest_declares_multi_release("Created-By: x\n"));
+    assert!(!manifest_declares_multi_release(
+        "Manifest-Version: 1.0\n\nName: a\nMulti-Release: true\n"
+    ));
+}
+
+#[test]
+fn effective_class_entries_follow_manifest_flag_base_fallback_and_minimum_version() {
+    let entries = [
+        "META-INF/versions/11/a/Both.class",
+        "META-INF/versions/17/a/Both.class",
+        "META-INF/versions/17/a/Only.class",
+        "META-INF/versions/8/a/Old.class",
+        "META-INF/versions/x/a/Bad.class",
+        "META-INF/versions/+11/a/Signed.class",
+        "META-INF/versions/011/a/Padded.class",
+        "META-INF/versions/+21/a/Both.class",
+        "META-INF/versions/021/a/Both.class",
+        "a/Both.class",
+        "a/Base.class",
+    ]
+    .map(str::to_owned);
+    let enabled = effective_class_entries(&entries, true);
+    assert_eq!(
+        enabled.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("a/Base.class".to_owned(), "a/Base.class".to_owned()),
+            (
+                "a/Both.class".to_owned(),
+                "META-INF/versions/17/a/Both.class".to_owned()
+            ),
+            (
+                "a/Only.class".to_owned(),
+                "META-INF/versions/17/a/Only.class".to_owned()
+            ),
+        ]
+    );
+    let disabled = effective_class_entries(&entries, false);
+    assert_eq!(
+        disabled.into_values().collect::<Vec<_>>(),
+        vec!["a/Base.class", "a/Both.class"]
+    );
+}
+
+#[test]
+fn all_classfile_tools_use_the_same_multi_release_variant() {
+    let root = TempDir::new().unwrap();
+    let base = shape_variant(b"java/lang/Object", b"greet");
+    let java11 = shape_variant(b"java/lang/Number", b"mid11");
+    let java17 = shape_variant(b"java/lang/Number", b"late7");
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[
+            MULTI_RELEASE_MANIFEST,
+            ("org/example/Shape.class", &base),
+            ("META-INF/versions/11/org/example/Shape.class", &java11),
+            ("META-INF/versions/17/org/example/Shape.class", &java17),
+        ],
+    );
+    write_jar(
+        &root.path().join("org/example/demo/2.0/demo-2.0.jar"),
+        &[("org/example/Shape.class", &base)],
+    );
+    write_jar(
+        &root.path().join("org/example/legacy/1.0/legacy-1.0.jar"),
+        &[
+            ("org/example/Shape.class", &base),
+            ("META-INF/versions/17/org/example/Shape.class", &java17),
+            (
+                "META-INF/versions/17/org/example/VersionOnly.class",
+                &inspection_class("org/example/VersionOnly"),
+            ),
+        ],
+    );
+    let index = build_index(&root, 50, 64 * 1024);
+
+    let described = index
+        .describe_class(
+            "org.example.Shape",
+            Some("org.example:demo:1.0"),
+            None,
+            false,
+        )
+        .unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(
+        described[0].super_class.as_deref(),
+        Some("java.lang.Number")
+    );
+    assert!(
+        described[0]
+            .methods
+            .iter()
+            .any(|method| method.name == "late7")
+    );
+
+    let hierarchy = |parent: &str| {
+        index
+            .search_type_hierarchy(parent, false, Some("org.example:demo:1.0"), None)
+            .len()
+    };
+    assert_eq!(hierarchy("java.lang.Number"), 1);
+    assert_eq!(hierarchy("java.lang.Object"), 0);
+
+    let members = |query: &str| {
+        index
+            .search_class_members(query, Some("org.example:demo:1.0"), None)
+            .len()
+    };
+    assert_eq!(members("late7"), 2);
+    assert_eq!(members("mid11"), 0);
+    assert_eq!(members("greet"), 0);
+
+    let outbound = index.search_class_references(
+        "org.example.Shape",
+        ReferenceDirection::Outbound,
+        Some(ClassReferenceKind::Class),
+        None,
+        None,
+        Some("org.example:demo:1.0"),
+        None,
+    );
+    let targets = outbound
+        .iter()
+        .map(|reference| reference.target_owner.as_str())
+        .collect::<Vec<_>>();
+    assert!(targets.contains(&"java.lang.Number"));
+    assert!(!targets.contains(&"java.lang.Object"));
+
+    let diff = index
+        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
+        .unwrap();
+    assert!(diff.added_classes.is_empty() && diff.removed_classes.is_empty());
+    assert_eq!(diff.changed_classes.len(), 1);
+    assert_eq!(
+        diff.changed_classes[0].previous_super_class.as_deref(),
+        Some("java.lang.Number")
+    );
+    assert_eq!(
+        diff.changed_classes[0].current_super_class.as_deref(),
+        Some("java.lang.Object")
+    );
+
+    let listed = index.list_classes("org.example:demo:1.0", 0, None);
+    assert_eq!(listed[0].classes, vec!["org.example.Shape"]);
+}
+
+#[test]
+fn versioned_entries_without_manifest_flag_are_ignored_deterministically() {
+    let root = TempDir::new().unwrap();
+    let base = shape_variant(b"java/lang/Object", b"greet");
+    let java17 = shape_variant(b"java/lang/Number", b"late7");
+    write_jar(
+        &root.path().join("org/example/legacy/1.0/legacy-1.0.jar"),
+        &[
+            ("org/example/Shape.class", &base),
+            ("META-INF/versions/17/org/example/Shape.class", &java17),
+            (
+                "META-INF/versions/17/org/example/VersionOnly.class",
+                &inspection_class("org/example/VersionOnly"),
+            ),
+        ],
+    );
+    let index = build_index(&root, 50, 64 * 1024);
+
+    let described = index
+        .describe_class("org.example.Shape", None, None, false)
+        .unwrap();
+    assert_eq!(
+        described[0].super_class.as_deref(),
+        Some("java.lang.Object")
+    );
+    assert_eq!(
+        index
+            .search_type_hierarchy("java.lang.Object", false, None, None)
+            .len(),
+        1
+    );
+    assert!(
+        index
+            .search_type_hierarchy("java.lang.Number", false, None, None)
+            .is_empty()
+    );
+    assert!(
+        index
+            .describe_class("org.example.VersionOnly", None, None, false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(index.search_jars("legacy", None)[0].class_count, 1);
+}
+
+#[test]
+fn cr_only_multi_release_manifest_selects_the_highest_versioned_variant() {
+    let root = TempDir::new().unwrap();
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[
+            (
+                "META-INF/MANIFEST.MF",
+                b"Manifest-Version: 1.0\rMulti-Release: true\r\r",
+            ),
+            (
+                "org/example/Shape.class",
+                &shape_variant(b"java/lang/Object", b"greet"),
+            ),
+            (
+                "META-INF/versions/17/org/example/Shape.class",
+                &shape_variant(b"java/lang/Number", b"late7"),
+            ),
+            (
+                "META-INF/versions/17/org/example/VersionOnly.class",
+                &inspection_class("org/example/VersionOnly"),
+            ),
+        ],
+    );
+    let index = build_index(&root, 50, 64 * 1024);
+
+    let described = index
+        .describe_class("org.example.Shape", None, None, false)
+        .unwrap();
+    assert_eq!(
+        described[0].super_class.as_deref(),
+        Some("java.lang.Number")
+    );
+    assert_eq!(
+        index
+            .search_type_hierarchy("java.lang.Number", false, None, None)
+            .len(),
+        1
+    );
+    assert_eq!(
+        index
+            .describe_class("org.example.VersionOnly", None, None, false)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn flagged_jar_without_base_entry_uses_highest_versioned_entry() {
+    let root = TempDir::new().unwrap();
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[
+            MULTI_RELEASE_MANIFEST,
+            (
+                "META-INF/versions/11/org/example/Shape.class",
+                &shape_variant(b"java/lang/Object", b"mid11"),
+            ),
+            (
+                "META-INF/versions/17/org/example/Shape.class",
+                &shape_variant(b"java/lang/Number", b"late7"),
+            ),
+            (
+                "META-INF/versions/8/org/example/Old.class",
+                &inspection_class("org/example/Old"),
+            ),
+        ],
+    );
+    let index = build_index(&root, 50, 64 * 1024);
+
+    let described = index
+        .describe_class("org.example.Shape", None, None, false)
+        .unwrap();
+    assert_eq!(
+        described[0].super_class.as_deref(),
+        Some("java.lang.Number")
+    );
+    assert_eq!(
+        index
+            .search_type_hierarchy("java.lang.Number", false, None, None)
+            .len(),
+        1
+    );
+    assert!(
+        index
+            .describe_class("org.example.Old", None, None, false)
+            .unwrap()
+            .is_empty()
+    );
 }

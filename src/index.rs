@@ -34,6 +34,9 @@ struct JarRecord {
     path: PathBuf,
     classes: Vec<String>,
     entries: Vec<String>,
+    /// Effective physical classfile entry per logical entry path
+    /// (see [`effective_class_entries`]).
+    class_entries: BTreeMap<String, String>,
     fact_strings: Vec<Arc<str>>,
     class_facts: Vec<IndexedClassFacts>,
     providers: Vec<IndexedProvider>,
@@ -1866,7 +1869,11 @@ fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<J
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
-    let (classes, entries) = match read_jar_index(path) {
+    let JarIndex {
+        classes,
+        entries,
+        class_entries,
+    } = match read_jar_index(path) {
         Ok(content) => content,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "skipping unreadable jar");
@@ -1876,7 +1883,7 @@ fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<J
     let (class_facts, providers, fact_strings) = if classifier.as_deref() == Some("sources") {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
-        collect_jar_facts(path, &entries, max_entry_bytes)
+        collect_jar_facts(path, &entries, &class_entries, max_entry_bytes)
     };
     Some(JarRecord {
         key,
@@ -1885,6 +1892,7 @@ fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<J
         path: path.to_owned(),
         classes,
         entries,
+        class_entries,
         fact_strings,
         class_facts,
         providers,
@@ -1924,6 +1932,7 @@ fn source_jar_path(binary_jar: &Path) -> Option<PathBuf> {
 fn collect_jar_facts(
     path: &Path,
     entries: &[String],
+    class_entries: &BTreeMap<String, String>,
     max_entry_bytes: usize,
 ) -> (Vec<IndexedClassFacts>, Vec<IndexedProvider>, Vec<Arc<str>>) {
     let Ok(file) = File::open(path) else {
@@ -1935,9 +1944,8 @@ fn collect_jar_facts(
     let mut class_facts = Vec::new();
     let mut providers = BTreeSet::new();
     let mut strings = FactStringPool::default();
-    let class_entries = effective_class_entries(entries);
-    for entry_path in class_entries {
-        let Ok(mut entry) = archive.by_name(&entry_path) else {
+    for entry_path in class_entries.values() {
+        let Ok(mut entry) = archive.by_name(entry_path) else {
             continue;
         };
         if entry.size() > max_entry_bytes as u64 {
@@ -1960,7 +1968,7 @@ fn collect_jar_facts(
         let source_class_name = binary_name(&parsed.this_class);
         let source_class = strings.intern(&source_class_name);
         if source_class_name == "module-info" {
-            collect_module_providers(&parsed.attributes, &entry_path, &mut providers);
+            collect_module_providers(&parsed.attributes, entry_path, &mut providers);
             continue;
         }
         let mut parents = Vec::new();
@@ -2018,16 +2026,38 @@ fn collect_jar_facts(
     )
 }
 
-fn effective_class_entries(entries: &[String]) -> Vec<String> {
+/// Selects the one effective classfile entry per logical class path.
+///
+/// Every classfile-based tool shares this rule. Base entries are always
+/// candidates. When the manifest declares `Multi-Release: true`, entries under
+/// `META-INF/versions/<N>/` with `N >= 9` also compete and the highest `N` wins;
+/// the server does not target a specific Java runtime. Without the flag every
+/// versioned entry is ignored, as the JVM does, so a class that exists only under
+/// `META-INF/versions/` is not indexed. Entries whose version directory is not a
+/// canonical decimal number (digits only, no sign or leading zero) or is `< 9`
+/// are never selected, because the JVM never looks them up.
+fn effective_class_entries(entries: &[String], multi_release: bool) -> BTreeMap<String, String> {
     let mut selected = BTreeMap::<String, (u32, String)>::new();
     for entry in entries.iter().filter(|entry| entry.ends_with(".class")) {
-        let (version, logical) = if let Some(rest) = entry.strip_prefix("META-INF/versions/") {
+        let (version, logical) = if let Some(rest) = entry.strip_prefix(VERSIONED_ENTRY_PREFIX) {
+            if !multi_release {
+                continue;
+            }
             let Some((version, logical)) = rest.split_once('/') else {
                 continue;
             };
+            if version.is_empty()
+                || version.starts_with('0')
+                || !version.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                continue;
+            }
             let Ok(version) = version.parse::<u32>() else {
                 continue;
             };
+            if version < MIN_MULTI_RELEASE_VERSION {
+                continue;
+            }
             (version, logical)
         } else {
             (0, entry.as_str())
@@ -2039,7 +2069,55 @@ fn effective_class_entries(entries: &[String]) -> Vec<String> {
             *candidate = (version, entry.clone());
         }
     }
-    selected.into_values().map(|(_, entry)| entry).collect()
+    selected
+        .into_iter()
+        .map(|(logical, (_, entry))| (logical, entry))
+        .collect()
+}
+
+fn manifest_lines(manifest: &str) -> impl Iterator<Item = &str> {
+    let mut rest = manifest;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let Some(end) = rest.find(['\r', '\n']) else {
+            return Some(std::mem::take(&mut rest));
+        };
+        let line = &rest[..end];
+        let separator = if rest[end..].starts_with("\r\n") {
+            2
+        } else {
+            1
+        };
+        rest = &rest[end + separator..];
+        Some(line)
+    })
+}
+
+const VERSIONED_ENTRY_PREFIX: &str = "META-INF/versions/";
+const MIN_MULTI_RELEASE_VERSION: u32 = 9;
+const MAX_MANIFEST_BYTES: u64 = 1_048_576;
+
+/// Reads the main manifest section; lines end with CRLF, LF, or a CR not followed
+/// by LF, matching the JAR specification and the JDK manifest parser.
+fn manifest_declares_multi_release(manifest: &str) -> bool {
+    let mut unfolded = Vec::<String>::new();
+    for line in manifest_lines(manifest) {
+        if line.is_empty() {
+            break;
+        }
+        match (line.strip_prefix(' '), unfolded.last_mut()) {
+            (Some(continuation), Some(previous)) => previous.push_str(continuation),
+            _ => unfolded.push(line.to_owned()),
+        }
+    }
+    unfolded.iter().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("Multi-Release")
+                && value.trim().eq_ignore_ascii_case("true")
+        })
+    })
 }
 
 fn indexed_reference(
@@ -2376,11 +2454,16 @@ fn preflight_archive(path: &Path, budget: &mut ArchiveBudget) -> Result<()> {
     Ok(())
 }
 
-fn read_jar_index(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
+struct JarIndex {
+    classes: Vec<String>,
+    entries: Vec<String>,
+    class_entries: BTreeMap<String, String>,
+}
+
+fn read_jar_index(path: &Path) -> Result<JarIndex> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut archive =
         ZipArchive::new(file).with_context(|| format!("invalid ZIP/JAR: {}", path.display()))?;
-    let mut classes = BTreeSet::new();
     let mut entries = Vec::with_capacity(archive.len());
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index)?;
@@ -2388,22 +2471,47 @@ fn read_jar_index(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
             continue;
         }
         let name = entry.name().context("cannot decode JAR entry name")?;
-        let name = name.replace('\\', "/");
-        if let Some(class_name) = class_name_from_entry(&name) {
-            classes.insert(class_name);
-        }
-        entries.push(name);
+        entries.push(name.replace('\\', "/"));
     }
     entries.sort();
-    Ok((classes.into_iter().collect(), entries))
+    let multi_release = read_multi_release_flag(&mut archive, &entries);
+    let class_entries = effective_class_entries(&entries, multi_release);
+    let classes = class_entries
+        .keys()
+        .filter_map(|logical| class_name_from_entry(logical))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(JarIndex {
+        classes,
+        entries,
+        class_entries,
+    })
 }
 
-fn class_name_from_entry(entry: &str) -> Option<String> {
-    let mut entry = entry;
-    if let Some(rest) = entry.strip_prefix("META-INF/versions/") {
-        let (_, versioned_entry) = rest.split_once('/')?;
-        entry = versioned_entry;
+fn read_multi_release_flag(archive: &mut ZipArchive<File>, entries: &[String]) -> bool {
+    let Some(manifest_path) = entries
+        .iter()
+        .find(|entry| entry.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
+    else {
+        return false;
+    };
+    let Ok(entry) = archive.by_name(manifest_path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if entry
+        .take(MAX_MANIFEST_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
     }
+    manifest_declares_multi_release(&String::from_utf8_lossy(&bytes))
+}
+
+/// Logical class name of an effective (already version-resolved) entry path.
+fn class_name_from_entry(entry: &str) -> Option<String> {
     let class = entry.strip_suffix(".class")?;
     if class == "module-info" || class.ends_with("/module-info") || class.ends_with("package-info")
     {
@@ -2570,7 +2678,7 @@ fn declaration_candidates(
         }]);
     };
     let mut archive = ZipArchive::new(File::open(&jar.path)?)?;
-    let entry_path = select_class_entry(&jar.entries, class_name)
+    let entry_path = select_class_entry(jar, class_name)
         .with_context(|| format!("indexed class entry is missing for {class_name}"))?;
     let mut entry = archive.by_name(entry_path)?;
     if entry.size() > max_bytes as u64 {
@@ -2729,7 +2837,7 @@ fn read_class_description(
     public_only: bool,
 ) -> Result<ClassDescription> {
     let mut archive = ZipArchive::new(File::open(&jar.path)?)?;
-    let entry_path = select_class_entry(&jar.entries, class_name)
+    let entry_path = select_class_entry(jar, class_name)
         .with_context(|| format!("indexed class entry is missing for {class_name}"))?;
     let mut entry = archive.by_name(entry_path)?;
     if entry.size() > max_bytes as u64 {
@@ -2821,25 +2929,9 @@ fn read_class_description(
     })
 }
 
-fn select_class_entry<'a>(entries: &'a [String], class_name: &str) -> Option<&'a str> {
-    let exact = format!("{}.class", class_name.replace('.', "/"));
-    if let Some(entry) = entries.iter().find(|entry| entry.as_str() == exact) {
-        return Some(entry);
-    }
-    let suffix = format!("/{exact}");
-    entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .strip_prefix("META-INF/versions/")
-                .and_then(|rest| rest.split_once('/'))
-                .filter(|(_, versioned)| versioned.ends_with(&suffix[1..]))
-                .and_then(|(version, _)| {
-                    version.parse::<u32>().ok().map(|version| (version, entry))
-                })
-        })
-        .max_by_key(|(version, _)| *version)
-        .map(|(_, entry)| entry.as_str())
+fn select_class_entry<'a>(jar: &'a JarRecord, class_name: &str) -> Option<&'a str> {
+    let logical = format!("{}.class", class_name.replace('.', "/"));
+    jar.class_entries.get(&logical).map(String::as_str)
 }
 
 fn binary_name(value: &str) -> String {
