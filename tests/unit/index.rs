@@ -1513,3 +1513,187 @@ fn malformed_and_non_maven_jars_are_skipped() {
         }
     );
 }
+
+const OUTSIDE_MARKER: &str = "outside-marker-secret";
+
+fn outside_pom(directory: &Path) {
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("demo-1.0.pom"),
+        format!("<project><description>{OUTSIDE_MARKER}</description></project>"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn exact_coordinates_reject_empty_dot_and_separator_segments() {
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    outside_pom(&outside.path().join("demo/1.0"));
+    let index = build_index(&root, 10, 1024);
+    let absolute = outside.path().display().to_string().replace('/', ".");
+    for coordinate in [
+        format!("{absolute}:demo:1.0"),
+        ".com.example:demo:1.0".to_owned(),
+        "com.example.:demo:1.0".to_owned(),
+        "com..example:demo:1.0".to_owned(),
+        ".:demo:1.0".to_owned(),
+        "com.example:..:1.0".to_owned(),
+        "com.example:demo:..".to_owned(),
+        "com/example:demo:1.0".to_owned(),
+        "com\\example:demo:1.0".to_owned(),
+        "com.example:de/mo:1.0".to_owned(),
+        "com.example:demo:1.0/".to_owned(),
+        "com.example:demo:1.0\\..\\x".to_owned(),
+        "com.example:demo:1.0:../../classifier".to_owned(),
+        "com.example:demo:1.0:sources".to_owned(),
+    ] {
+        assert!(
+            validate_exact_coordinate(&coordinate).is_err(),
+            "{coordinate}"
+        );
+        let error = index.pom_descriptor(&coordinate).expect_err(&coordinate);
+        assert!(!error.to_string().contains(OUTSIDE_MARKER));
+        assert!(index.artifact_health(&coordinate).is_err(), "{coordinate}");
+    }
+    for coordinate in [
+        "org.example:demo:1.0",
+        "org.example:demo:1.0-SNAPSHOT",
+        "org.example-x:demo_y:1.0.0.RELEASE",
+    ] {
+        validate_exact_coordinate(coordinate).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_artifact_lookups_do_not_follow_symlinks_outside_the_repository() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    outside_pom(&outside.path().join("demo/1.0"));
+    std::fs::write(outside.path().join("demo/1.0/demo-1.0-evil.jar"), b"x").unwrap();
+    let index = build_index(&root, 10, 1024);
+
+    // Symlinked group directory.
+    std::fs::create_dir_all(root.path().join("org")).unwrap();
+    symlink(outside.path(), root.path().join("org/example")).unwrap();
+    // Symlinked version directory.
+    let linked_version = root.path().join("org/linked/demo");
+    std::fs::create_dir_all(&linked_version).unwrap();
+    symlink(outside.path().join("demo/1.0"), linked_version.join("1.0")).unwrap();
+    // Symlinked POM file and jar inside a real artifact directory.
+    let real = root.path().join("org/real/demo/1.0");
+    std::fs::create_dir_all(&real).unwrap();
+    symlink(
+        outside.path().join("demo/1.0/demo-1.0.pom"),
+        real.join("demo-1.0.pom"),
+    )
+    .unwrap();
+    symlink(
+        outside.path().join("demo/1.0/demo-1.0-evil.jar"),
+        real.join("demo-1.0-evil.jar"),
+    )
+    .unwrap();
+
+    for coordinate in [
+        "org.example:demo:1.0",
+        "org.linked:demo:1.0",
+        "org.real:demo:1.0",
+    ] {
+        let error = index.pom_descriptor(coordinate).expect_err(coordinate);
+        assert!(error.is::<ArtifactOutsideRepository>(), "{coordinate}");
+        let message = error.to_string();
+        assert!(!message.contains(OUTSIDE_MARKER));
+        assert!(!message.contains(outside.path().to_str().unwrap()));
+    }
+    for coordinate in ["org.example:demo:1.0", "org.linked:demo:1.0"] {
+        let error = index.artifact_health(coordinate).expect_err(coordinate);
+        assert!(error.is::<ArtifactOutsideRepository>(), "{coordinate}");
+    }
+    // Symlinked files are never listed as artifact files.
+    let health = index.artifact_health("org.real:demo:1.0").unwrap();
+    assert!(health.found);
+    assert!(health.files.is_empty());
+
+    // A missing artifact below a symlinked parent is still rejected, not reported as absent.
+    let error = index
+        .pom_descriptor("org.example:missing:1.0")
+        .expect_err("missing artifact below outward symlink");
+    assert!(error.is::<ArtifactOutsideRepository>());
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_artifact_lookups_reject_dangling_symlinks_outside_the_repository() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let index = build_index(&root, 10, 1024);
+    let missing_outside = outside.path().join("missing");
+
+    // Dangling group directory symlink.
+    std::fs::create_dir_all(root.path().join("org")).unwrap();
+    symlink(&missing_outside, root.path().join("org/dangling")).unwrap();
+    // Dangling relative POM symlink inside a real artifact directory.
+    let real = root.path().join("org/real/demo/1.0");
+    std::fs::create_dir_all(&real).unwrap();
+    let depth = real.canonicalize().unwrap().components().count() - 1;
+    let relative_outside = std::iter::repeat_n("..", depth)
+        .collect::<PathBuf>()
+        .join(missing_outside.strip_prefix("/").unwrap())
+        .join("demo-1.0.pom");
+    symlink(&relative_outside, real.join("demo-1.0.pom")).unwrap();
+    // Chained dangling symlinks: in-repository hop to an outward dangling link.
+    symlink(
+        root.path().join("org/dangling"),
+        root.path().join("org/chained"),
+    )
+    .unwrap();
+
+    for coordinate in ["org.dangling:demo:1.0", "org.chained:demo:1.0"] {
+        for error in [
+            index.pom_descriptor(coordinate).expect_err(coordinate),
+            index.artifact_health(coordinate).expect_err(coordinate),
+        ] {
+            assert!(error.is::<ArtifactOutsideRepository>(), "{coordinate}");
+            assert!(!error.to_string().contains(outside.path().to_str().unwrap()));
+        }
+    }
+    let error = index
+        .pom_descriptor("org.real:demo:1.0")
+        .expect_err("dangling outward POM symlink");
+    assert!(error.is::<ArtifactOutsideRepository>());
+    assert!(!error.to_string().contains(outside.path().to_str().unwrap()));
+
+    // A dangling symlink that stays inside the repository is still an absent artifact.
+    symlink(
+        root.path().join("org/nowhere"),
+        root.path().join("org/inside"),
+    )
+    .unwrap();
+    assert!(!index.pom_descriptor("org.inside:demo:1.0").unwrap().found);
+    assert!(!index.artifact_health("org.inside:demo:1.0").unwrap().found);
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_artifact_lookups_allow_symlinks_that_stay_inside_the_repository() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let real = root.path().join("org/example/demo/1.0");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("demo-1.0.pom"), "<project/>").unwrap();
+    symlink(
+        root.path().join("org/example"),
+        root.path().join("org/alias"),
+    )
+    .unwrap();
+    let index = build_index(&root, 10, 1024);
+
+    assert!(index.pom_descriptor("org.alias:demo:1.0").unwrap().found);
+    assert!(!index.pom_descriptor("org.alias:demo:2.0").unwrap().found);
+}

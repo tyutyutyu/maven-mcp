@@ -488,6 +488,7 @@ async fn exact_artifact_lookups_work_when_reactor_classpath_fails() -> Result<()
     std::fs::set_permissions(&wrapper, permissions)?;
 
     let client = server.connect().await?;
+    let project_path_buf = project_path.to_path_buf();
     let project_path = project_path.display().to_string();
     let pom = structured(
         client
@@ -553,6 +554,125 @@ async fn exact_artifact_lookups_work_when_reactor_classpath_fails() -> Result<()
             )
             .await
             .expect_err("invalid coordinate must be rejected");
+    }
+
+    let outside = tempfile::TempDir::new()?;
+    let outside_marker = "outside-marker-secret";
+    std::fs::create_dir_all(outside.path().join("demo/1.0"))?;
+    std::fs::write(
+        outside.path().join("demo/1.0/demo-1.0.pom"),
+        format!("<project><description>{outside_marker}</description></project>"),
+    )?;
+    let absolute_group = outside.path().display().to_string().replace('/', ".");
+    for tool in ["get_artifact_pom", "diagnose_artifact"] {
+        for coordinate in [
+            format!("{absolute_group}:demo:1.0"),
+            ".org.libs:helper:2.0".to_owned(),
+            "org.libs.:helper:2.0".to_owned(),
+            "org..libs:helper:2.0".to_owned(),
+            "org/libs:helper:2.0".to_owned(),
+            "org\\libs:helper:2.0".to_owned(),
+            "org.libs:helper:2.0:../sources".to_owned(),
+        ] {
+            let error = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(arguments(json!({
+                        "project_path": project_path,
+                        "coordinate": coordinate
+                    }))),
+                )
+                .await
+                .expect_err("traversal coordinate must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("exact groupId:artifactId:version"),
+                "{message}"
+            );
+            assert!(!message.contains(outside_marker));
+            assert!(!message.contains(outside.path().to_str().unwrap()));
+        }
+    }
+
+    let repository = project_path_buf.join("execution-repository");
+    std::os::unix::fs::symlink(outside.path(), repository.join("org/escape"))?;
+    let linked_artifact = repository.join("org/libs/linked/1.0");
+    std::fs::create_dir_all(&linked_artifact)?;
+    std::os::unix::fs::symlink(
+        outside.path().join("demo/1.0/demo-1.0.pom"),
+        linked_artifact.join("linked-1.0.pom"),
+    )?;
+    for tool in ["get_artifact_pom", "diagnose_artifact"] {
+        for coordinate in ["org.escape:demo:1.0", "org.escape:missing:1.0"] {
+            let error = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(arguments(json!({
+                        "project_path": project_path,
+                        "coordinate": coordinate
+                    }))),
+                )
+                .await
+                .expect_err("outward symlink must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("outside the configured Maven repository"),
+                "{message}"
+            );
+            assert!(!message.contains(outside_marker));
+            assert!(!message.contains(outside.path().to_str().unwrap()));
+        }
+    }
+    let error = client
+        .call_tool(
+            CallToolRequestParams::new("get_artifact_pom").with_arguments(arguments(json!({
+                "project_path": project_path,
+                "coordinate": "org.libs:linked:1.0"
+            }))),
+        )
+        .await
+        .expect_err("outward POM symlink must be rejected");
+    assert!(!error.to_string().contains(outside_marker));
+    let linked_health = structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("diagnose_artifact").with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": "org.libs:linked:1.0"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(linked_health["files"], json!([]));
+
+    std::os::unix::fs::symlink(
+        outside.path().join("missing"),
+        repository.join("org/dangling"),
+    )?;
+    let dangling_artifact = repository.join("org/libs/dangling/1.0");
+    std::fs::create_dir_all(&dangling_artifact)?;
+    std::os::unix::fs::symlink(
+        outside.path().join("demo/missing.pom"),
+        dangling_artifact.join("dangling-1.0.pom"),
+    )?;
+    for (tool, coordinate) in [
+        ("get_artifact_pom", "org.dangling:demo:1.0"),
+        ("diagnose_artifact", "org.dangling:demo:1.0"),
+        ("get_artifact_pom", "org.libs:dangling:1.0"),
+    ] {
+        let error = client
+            .call_tool(
+                CallToolRequestParams::new(tool).with_arguments(arguments(json!({
+                    "project_path": project_path,
+                    "coordinate": coordinate
+                }))),
+            )
+            .await
+            .expect_err("dangling outward symlink must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("outside the configured Maven repository"),
+            "{message}"
+        );
+        assert!(!message.contains(outside.path().to_str().unwrap()));
     }
 
     let untrusted_project = tempfile::TempDir::new()?;

@@ -19,11 +19,11 @@ use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::index::{
-    ArtifactApiDiff, ArtifactHealth, ClassDescription, ClassList, ClassLocation, ClassMemberMatch,
-    ClassReference, ClassReferenceKind, DeclarationSourceLookup, EntryMatch, IndexStats,
-    JarContentSearch, JarEntryContent, JarSummary, MavenIndex, PomDescriptorLookup,
-    ProviderDescriptorKind, ProviderFact, ReferenceDirection, SourceResult, SourceSearch,
-    TypeHierarchyMatch, validate_exact_coordinate,
+    ArtifactApiDiff, ArtifactHealth, ArtifactOutsideRepository, ClassDescription, ClassList,
+    ClassLocation, ClassMemberMatch, ClassReference, ClassReferenceKind, DeclarationSourceLookup,
+    EntryMatch, IndexStats, JarContentSearch, JarEntryContent, JarSummary, MavenIndex,
+    PomDescriptorLookup, ProviderDescriptorKind, ProviderFact, ReferenceDirection, SourceResult,
+    SourceSearch, TypeHierarchyMatch, validate_exact_coordinate,
 };
 use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
@@ -403,6 +403,14 @@ pub struct MavenMcpServer {
     indexes: Arc<Mutex<ProjectIndexCache>>,
     runtime_status: Arc<RuntimeStatusPublisher>,
     tool_router: ToolRouter<Self>,
+}
+
+fn artifact_lookup_error(error: anyhow::Error) -> ErrorData {
+    if error.is::<ArtifactOutsideRepository>() {
+        ErrorData::invalid_params(error.to_string(), None)
+    } else {
+        ErrorData::internal_error(error.to_string(), None)
+    }
 }
 
 impl MavenMcpServer {
@@ -808,7 +816,7 @@ impl MavenMcpServer {
         let repository = self.artifact_repository_for(&request.project_path)?;
         MavenIndex::pom_descriptor_at(&repository, &request.coordinate)
             .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+            .map_err(artifact_lookup_error)
     }
 
     #[tool(
@@ -843,7 +851,7 @@ impl MavenMcpServer {
         let repository = self.artifact_repository_for(&request.project_path)?;
         MavenIndex::artifact_health_at(&repository, &request.coordinate)
             .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+            .map_err(artifact_lookup_error)
     }
 
     #[tool(
