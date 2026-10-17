@@ -2447,3 +2447,83 @@ fn estimated_index_bytes_grow_with_indexed_content() {
     assert!(small.estimated_bytes() > empty);
     assert!(many.estimated_bytes() > small.estimated_bytes());
 }
+
+#[test]
+fn cancelled_scoped_builds_stop_without_producing_an_index() {
+    let repository = TempDir::new().unwrap();
+    let jar = repository.path().join("org/example/demo/1.0/demo-1.0.jar");
+    write_jar(&jar, &[("org/example/Demo.class", b"not a class")]);
+    let reactor_root = TempDir::new().unwrap();
+    let reactor_root = reactor_root.path().canonicalize().unwrap();
+    let build = || {
+        MavenIndex::build_scoped(
+            Some(repository.path()),
+            &ReactorLayout {
+                root: &reactor_root,
+                modules: &[],
+            },
+            std::slice::from_ref(&jar),
+            50,
+            1024,
+        )
+    };
+
+    let token = tokio_util::sync::CancellationToken::new();
+    assert_eq!(
+        crate::blocking::scope(&token, build)
+            .unwrap()
+            .index
+            .stats()
+            .jar_count,
+        1,
+        "an uncancelled job indexes the jar"
+    );
+    token.cancel();
+    let error = crate::blocking::scope(&token, build).unwrap_err();
+    assert!(error.is::<crate::blocking::Cancelled>(), "{error:#}");
+}
+
+#[test]
+fn cancelled_searches_stop_at_their_entry_checkpoint() {
+    let root = TempDir::new().unwrap();
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[("config.properties", b"needle=1")],
+    );
+    write_jar(
+        &root
+            .path()
+            .join("org/example/demo/1.0/demo-1.0-sources.jar"),
+        &[("org/example/Demo.java", b"class Demo { /* needle */ }")],
+    );
+    let index = build_index(&root, 10, 1024);
+    assert_eq!(
+        index
+            .search_jar_content("needle", None, None)
+            .unwrap()
+            .results
+            .len(),
+        1
+    );
+    assert_eq!(
+        index
+            .search_source("needle", false, None, 0, None)
+            .unwrap()
+            .results
+            .len(),
+        1
+    );
+
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    crate::blocking::scope(&token, || {
+        for error in [
+            index.search_jar_content("needle", None, None).unwrap_err(),
+            index
+                .search_source("needle", false, None, 0, None)
+                .unwrap_err(),
+        ] {
+            assert!(error.is::<crate::blocking::Cancelled>(), "{error:#}");
+        }
+    });
+}

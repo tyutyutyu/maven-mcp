@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,8 +32,22 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// How long the runtime waits for blocking index work to stop after the server finished. Work
+/// inside a single system call cannot be interrupted, so it is abandoned afterwards.
+const BLOCKING_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot start the async runtime")?;
+    let result = runtime.block_on(run());
+    // Dropping the runtime would wait for every blocking thread without a limit.
+    runtime.shutdown_timeout(BLOCKING_SHUTDOWN_GRACE);
+    result
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Some(Command::Stats { json }) = cli.command {
         let report = read_runtime_report()?;
@@ -64,11 +78,15 @@ async fn main() -> Result<()> {
     );
 
     let server = MavenMcpServer::new(config);
+    let lifecycle = server.clone();
     let service = tokio::select! {
         result = server.serve(rmcp::transport::stdio()) => {
             result.context("cannot start STDIO MCP server")?
         }
-        _ = &mut shutdown => exit_after_signal(),
+        _ = &mut shutdown => {
+            lifecycle.shutdown();
+            exit_after_signal()
+        }
     };
     tracing::info!(transport = "stdio", "MCP server ready");
     let cancellation = service.cancellation_token();
@@ -76,9 +94,11 @@ async fn main() -> Result<()> {
     tokio::pin!(waiting);
     tokio::select! {
         result = &mut waiting => {
+            lifecycle.shutdown();
             result.context("STDIO MCP server task failed")?;
         }
         _ = &mut shutdown => {
+            lifecycle.shutdown();
             cancellation.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut waiting).await;
             exit_after_signal();

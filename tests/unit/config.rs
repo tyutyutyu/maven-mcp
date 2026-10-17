@@ -11,6 +11,8 @@ fn default_config_is_not_bound_to_repository_or_project_root() {
         config.max_project_index_bytes,
         DEFAULT_MAX_PROJECT_INDEX_BYTES
     );
+    assert_eq!(config.max_heavy_jobs, DEFAULT_MAX_HEAVY_JOBS);
+    assert_eq!(config.max_queued_heavy_jobs, DEFAULT_MAX_QUEUED_HEAVY_JOBS);
     assert_eq!(
         config.execution.timeout,
         Duration::from_secs(DEFAULT_MAVEN_TIMEOUT_SECONDS as u64)
