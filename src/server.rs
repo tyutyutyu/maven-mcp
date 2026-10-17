@@ -15,8 +15,9 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 
+use crate::blocking::{HeavyWork, HeavyWorkError, HeavyWorkLimits};
 use crate::config::Config;
 use crate::index::{
     ArtifactApiDiff, ArtifactHealth, ArtifactOutsideRepository, ClassDescription, ClassList,
@@ -34,8 +35,8 @@ use crate::project::{
     MavenRunner, canonical_project_root,
 };
 use crate::project_cache::{
-    BuildOutcome, CacheLimits, IndexLookup, ProjectCache, ProjectFingerprint, Publication,
-    ReserveError, RunnerSnapshot,
+    BuildOutcome, BuildOwner, CacheLimits, IndexLookup, ProjectCache, ProjectFingerprint,
+    Publication, ReserveError, RunnerSnapshot,
 };
 use crate::runtime_stats::RuntimeStatusPublisher;
 
@@ -407,9 +408,14 @@ pub struct VersionsRequest {
 pub struct MavenMcpServer {
     config: Config,
     execution_permit: Arc<Semaphore>,
+    heavy_work: HeavyWork,
     projects: Arc<Mutex<ProjectCache>>,
     runtime_status: Arc<RuntimeStatusPublisher>,
     tool_router: ToolRouter<Self>,
+}
+
+fn heavy_work_error(error: HeavyWorkError) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
 }
 
 fn artifact_lookup_error(error: anyhow::Error) -> ErrorData {
@@ -429,13 +435,43 @@ impl MavenMcpServer {
             max_runners: config.max_project_indexes.saturating_mul(RUNNERS_PER_INDEX),
             max_bytes: u64::try_from(config.max_project_index_bytes).unwrap_or(u64::MAX),
         });
+        let heavy_work = HeavyWork::new(HeavyWorkLimits {
+            running: config.max_heavy_jobs,
+            queued: config.max_queued_heavy_jobs,
+        });
         Self {
             config,
             execution_permit: Arc::new(Semaphore::new(1)),
+            heavy_work,
             projects: Arc::new(Mutex::new(projects)),
             runtime_status: Arc::new(runtime_status),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Cancels all heavy jobs and rejects new ones; called when the server stops.
+    pub fn shutdown(&self) {
+        self.heavy_work.shutdown();
+    }
+
+    /// Runs blocking index, archive or file work outside the async runtime within the bounded
+    /// heavy-job pool.
+    async fn blocking<T, F>(&self, work: F) -> Result<T, ErrorData>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.heavy_work.run(work).await.map_err(heavy_work_error)
+    }
+
+    /// Resolves the project's index and evaluates `work` on it as a heavy job.
+    async fn query<T, F>(&self, project_path: String, work: F) -> Result<T, ErrorData>
+    where
+        F: FnOnce(&MavenIndex) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let index = self.index_for(&project_path).await?;
+        self.blocking(move || work(&index)).await
     }
 
     fn validate_project_path(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
@@ -511,7 +547,13 @@ impl MavenMcpServer {
                 .lookup_index(&root, &snapshot.fingerprint);
             match lookup {
                 IndexLookup::Cached { entry, generation } => {
-                    if entry.artifacts_are_current() {
+                    // Validation stats every stamped artifact and class-directory file, so it
+                    // is heavy work too.
+                    let checked = Arc::clone(&entry);
+                    if self
+                        .blocking(move || checked.artifacts_are_current())
+                        .await?
+                    {
                         self.lock_projects()?.record_hit(&root);
                         self.publish_runtime_status();
                         return Ok(Arc::clone(&entry.index));
@@ -519,9 +561,13 @@ impl MavenMcpServer {
                     self.lock_projects()?
                         .invalidate_generation(&root, generation);
                 }
-                IndexLookup::Build { cell, generation } => {
+                IndexLookup::Build {
+                    cell,
+                    owner,
+                    generation,
+                } => {
                     let outcome = cell
-                        .get_or_init(|| self.build_index(&root, &snapshot, generation))
+                        .get_or_init(|| self.build_index(&root, &snapshot, generation, owner))
                         .await
                         .clone();
                     self.publish_runtime_status();
@@ -546,8 +592,13 @@ impl MavenMcpServer {
         root: &Path,
         snapshot: &RunnerSnapshot,
         generation: u64,
+        owner: BuildOwner,
     ) -> BuildOutcome {
-        let outcome = self.try_build_index(root, snapshot, generation).await;
+        // Blocking work of a cancelled build of this generation may still run: wait for it.
+        let ownership = owner.lock_owned().await;
+        let outcome = self
+            .try_build_index(root, snapshot, generation, ownership)
+            .await;
         if matches!(outcome, BuildOutcome::Failed(_))
             && let Ok(mut projects) = self.lock_projects()
         {
@@ -556,11 +607,14 @@ impl MavenMcpServer {
         outcome
     }
 
+    /// `ownership` moves into every blocking job of the build, so it is released only when the
+    /// build's blocking work has stopped, even after the request was cancelled.
     async fn try_build_index(
         &self,
         root: &Path,
         snapshot: &RunnerSnapshot,
         generation: u64,
+        ownership: OwnedMutexGuard<()>,
     ) -> BuildOutcome {
         let classpath = snapshot
             .runner
@@ -589,12 +643,22 @@ impl MavenMcpServer {
             ));
         }
         // Class directories are stamped file by file, so editing a nested class invalidates.
-        let artifacts =
-            ProjectFingerprint::capture_trees(classpath.paths.iter().flat_map(|path| {
-                [path.clone()]
-                    .into_iter()
-                    .chain(crate::index::source_jar_path(path))
-            }));
+        let stamped_paths = classpath.paths.clone();
+        let (artifacts, ownership) = match self
+            .blocking(move || {
+                let artifacts =
+                    ProjectFingerprint::capture_trees(stamped_paths.iter().flat_map(|path| {
+                        [path.clone()]
+                            .into_iter()
+                            .chain(crate::index::source_jar_path(path))
+                    }));
+                (artifacts, ownership)
+            })
+            .await
+        {
+            Ok(captured) => captured,
+            Err(error) => return BuildOutcome::Failed(error),
+        };
         let reservation = {
             let Ok(mut projects) = self.lock_projects() else {
                 return BuildOutcome::Failed(ErrorData::internal_error(
@@ -618,16 +682,34 @@ impl MavenMcpServer {
             }
         };
         let modules = snapshot.runner.module_directories();
-        let scoped = match MavenIndex::build_scoped(
-            repository_root.as_deref(),
-            &ReactorLayout {
-                root,
-                modules: &modules,
-            },
-            &classpath.paths,
-            self.config.max_results,
-            self.config.max_source_bytes,
-        ) {
+        let project_root = root.to_owned();
+        let fingerprint = Arc::clone(&snapshot.fingerprint);
+        let (max_results, max_source_bytes) =
+            (self.config.max_results, self.config.max_source_bytes);
+        // The reservation moves into the job: an abandoned build keeps counting against the
+        // memory budget until its blocking thread has really stopped.
+        let built = self
+            .blocking(move || {
+                let scoped = MavenIndex::build_scoped(
+                    repository_root.as_deref(),
+                    &ReactorLayout {
+                        root: &project_root,
+                        modules: &modules,
+                    },
+                    &classpath.paths,
+                    max_results,
+                    max_source_bytes,
+                );
+                // Files that changed while Maven and the indexer ran describe a different project.
+                let changed = !fingerprint.is_current() || !artifacts.is_current();
+                (scoped, changed, artifacts, reservation, ownership)
+            })
+            .await;
+        let (scoped, changed, artifacts, reservation, _ownership) = match built {
+            Ok(built) => built,
+            Err(error) => return BuildOutcome::Failed(error),
+        };
+        let scoped = match scoped {
             Ok(scoped) => scoped,
             Err(error) => {
                 return BuildOutcome::Failed(ErrorData::internal_error(error.to_string(), None));
@@ -640,8 +722,6 @@ impl MavenMcpServer {
             ));
         }
         let index = Arc::new(scoped.index);
-        // Files that changed while Maven and the indexer ran describe a different project.
-        let changed = !snapshot.fingerprint.is_current() || !artifacts.is_current();
         let Ok(mut projects) = self.lock_projects() else {
             return BuildOutcome::Failed(ErrorData::internal_error(
                 "project cache is poisoned",
@@ -825,7 +905,10 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<ProjectPathRequest>,
     ) -> Result<Json<IndexStats>, ErrorData> {
-        Ok(Json(self.index_for(&request.project_path).await?.stats()))
+        Ok(Json(
+            self.query(request.project_path, |index| index.stats())
+                .await?,
+        ))
     }
 
     #[tool(
@@ -836,10 +919,11 @@ impl MavenMcpServer {
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<Json<Results<ClassLocation>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_classes(&request.query, request.limit)
-                .into(),
+            self.query(request.project_path.clone(), move |index| {
+                index.search_classes(&request.query, request.limit)
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -851,10 +935,11 @@ impl MavenMcpServer {
         Parameters(request): Parameters<SearchRequest>,
     ) -> Result<Json<Results<JarSummary>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_jars(&request.query, request.limit)
-                .into(),
+            self.query(request.project_path.clone(), move |index| {
+                index.search_jars(&request.query, request.limit)
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -864,10 +949,11 @@ impl MavenMcpServer {
         Parameters(request): Parameters<EntrySearchRequest>,
     ) -> Result<Json<Results<EntryMatch>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_entries(&request.query, request.jar.as_deref(), request.limit)
-                .into(),
+            self.query(request.project_path.clone(), move |index| {
+                index.search_entries(&request.query, request.jar.as_deref(), request.limit)
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -877,10 +963,11 @@ impl MavenMcpServer {
         Parameters(request): Parameters<ClassListRequest>,
     ) -> Result<Json<Results<ClassList>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .list_classes(&request.jar, request.offset.unwrap_or(0), request.limit)
-                .into(),
+            self.query(request.project_path.clone(), move |index| {
+                index.list_classes(&request.jar, request.offset.unwrap_or(0), request.limit)
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -889,16 +976,17 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<SourceRequest>,
     ) -> Result<Json<Results<SourceResult>>, ErrorData> {
-        self.index_for(&request.project_path)
-            .await?
-            .class_source(
+        self.query(request.project_path.clone(), move |index| {
+            index.class_source(
                 &request.class_name,
                 request.jar.as_deref(),
                 request.version.as_deref(),
             )
-            .map(Results::from)
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        })
+        .await?
+        .map(Results::from)
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -914,12 +1002,13 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        self.index_for(&request.project_path)
-            .await?
-            .jar_entry(&request.jar, &request.entry)
-            .map(Results::from)
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        self.query(request.project_path.clone(), move |index| {
+            index.jar_entry(&request.jar, &request.entry)
+        })
+        .await?
+        .map(Results::from)
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -932,7 +1021,8 @@ impl MavenMcpServer {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let repository = self.artifact_repository_for(&request.project_path)?;
-        MavenIndex::pom_descriptor_at(&repository, &request.coordinate)
+        self.blocking(move || MavenIndex::pom_descriptor_at(&repository, &request.coordinate))
+            .await?
             .map(Json)
             .map_err(artifact_lookup_error)
     }
@@ -944,17 +1034,18 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<ClassDescriptionRequest>,
     ) -> Result<Json<Results<ClassDescription>>, ErrorData> {
-        self.index_for(&request.project_path)
-            .await?
-            .describe_class(
+        self.query(request.project_path.clone(), move |index| {
+            index.describe_class(
                 &request.class_name,
                 request.jar.as_deref(),
                 request.version.as_deref(),
                 !matches!(request.visibility, Some(ClassVisibility::All)),
             )
-            .map(Results::from)
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        })
+        .await?
+        .map(Results::from)
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -967,7 +1058,8 @@ impl MavenMcpServer {
         validate_exact_coordinate(&request.coordinate)
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         let repository = self.artifact_repository_for(&request.project_path)?;
-        MavenIndex::artifact_health_at(&repository, &request.coordinate)
+        self.blocking(move || MavenIndex::artifact_health_at(&repository, &request.coordinate))
+            .await?
             .map(Json)
             .map_err(artifact_lookup_error)
     }
@@ -980,10 +1072,11 @@ impl MavenMcpServer {
         Parameters(request): Parameters<ClassMemberSearchRequest>,
     ) -> Result<Json<Results<ClassMemberMatch>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_class_members(&request.query, request.jar.as_deref(), request.limit)
-                .into(),
+            self.query(request.project_path.clone(), move |index| {
+                index.search_class_members(&request.query, request.jar.as_deref(), request.limit)
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -1007,16 +1100,17 @@ impl MavenMcpServer {
             validate_exact_coordinate(&coordinate)
                 .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
-        self.index_for(&request.project_path)
-            .await?
-            .compare_artifact_api(
+        self.query(request.project_path.clone(), move |index| {
+            index.compare_artifact_api(
                 &request.group_id,
                 &request.artifact_id,
                 &request.previous_version,
                 &request.current_version,
             )
-            .map(Json)
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
+        })
+        .await?
+        .map(Json)
+        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
     }
 
     #[tool(
@@ -1026,11 +1120,12 @@ impl MavenMcpServer {
         &self,
         Parameters(request): Parameters<JarContentSearchRequest>,
     ) -> Result<Json<JarContentSearch>, ErrorData> {
-        self.index_for(&request.project_path)
-            .await?
-            .search_jar_content(&request.query, request.jar.as_deref(), request.limit)
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        self.query(request.project_path.clone(), move |index| {
+            index.search_jar_content(&request.query, request.jar.as_deref(), request.limit)
+        })
+        .await?
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -1041,15 +1136,16 @@ impl MavenMcpServer {
         Parameters(request): Parameters<TypeHierarchyRequest>,
     ) -> Result<Json<Results<TypeHierarchyMatch>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_type_hierarchy(
+            self.query(request.project_path.clone(), move |index| {
+                index.search_type_hierarchy(
                     &request.type_name,
                     request.transitive,
                     request.jar.as_deref(),
                     request.limit,
                 )
-                .into(),
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -1070,17 +1166,18 @@ impl MavenMcpServer {
             regex::Regex::new(&request.query)
                 .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
-        self.index_for(&request.project_path)
-            .await?
-            .search_source(
+        self.query(request.project_path.clone(), move |index| {
+            index.search_source(
                 &request.query,
                 request.regex,
                 request.jar.as_deref(),
                 request.context_lines,
                 request.limit,
             )
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        })
+        .await?
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -1096,17 +1193,18 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        self.index_for(&request.project_path)
-            .await?
-            .get_declaration_source(
+        self.query(request.project_path.clone(), move |index| {
+            index.get_declaration_source(
                 &request.class_name,
                 request.member_name.as_deref(),
                 request.descriptor.as_deref(),
                 request.jar.as_deref(),
                 request.version.as_deref(),
             )
-            .map(Json)
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
+        })
+        .await?
+        .map(Json)
+        .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     #[tool(
@@ -1117,9 +1215,8 @@ impl MavenMcpServer {
         Parameters(request): Parameters<ClassReferenceRequest>,
     ) -> Result<Json<Results<ClassReference>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_class_references(
+            self.query(request.project_path.clone(), move |index| {
+                index.search_class_references(
                     &request.class_name,
                     request.direction,
                     request.kind,
@@ -1128,7 +1225,9 @@ impl MavenMcpServer {
                     request.jar.as_deref(),
                     request.limit,
                 )
-                .into(),
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -1140,16 +1239,17 @@ impl MavenMcpServer {
         Parameters(request): Parameters<ProviderSearchRequest>,
     ) -> Result<Json<Results<ProviderFact>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .search_providers(
+            self.query(request.project_path.clone(), move |index| {
+                index.search_providers(
                     request.service.as_deref(),
                     request.provider.as_deref(),
                     request.descriptor_kind,
                     request.jar.as_deref(),
                     request.limit,
                 )
-                .into(),
+            })
+            .await?
+            .into(),
         ))
     }
 
@@ -1205,12 +1305,13 @@ impl MavenMcpServer {
     #[tool(
         description = "List Java and Kotlin test classes under the validated Maven reactor root"
     )]
-    fn list_maven_test_classes(
+    async fn list_maven_test_classes(
         &self,
         Parameters(request): Parameters<ProjectPathRequest>,
     ) -> Result<Json<Results<String>>, ErrorData> {
-        self.runner_for(&request.project_path)?
-            .test_classes()
+        let runner = self.runner_for(&request.project_path)?;
+        self.blocking(move || runner.test_classes())
+            .await?
             .map(Results::from)
             .map(Json)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None))
@@ -1320,23 +1421,26 @@ impl MavenMcpServer {
     #[tool(
         description = "Read existing JaCoCo XML reports without running Maven and return per-module counters with missing and stale state"
     )]
-    fn get_jacoco_coverage(
+    async fn get_jacoco_coverage(
         &self,
         Parameters(request): Parameters<ProjectPathRequest>,
     ) -> Result<Json<CoverageSummaryResult>, ErrorData> {
         let runner = self.runner_for(&request.project_path)?;
-        Ok(Json(runner.jacoco_coverage()))
+        Ok(Json(self.blocking(move || runner.jacoco_coverage()).await?))
     }
 
     #[tool(
         description = "Rank low-coverage classes from existing JaCoCo XML reports without running Maven"
     )]
-    fn get_jacoco_coverage_gaps(
+    async fn get_jacoco_coverage_gaps(
         &self,
         Parameters(request): Parameters<CoverageGapRequest>,
     ) -> Result<Json<CoverageGapResult>, ErrorData> {
         let runner = self.runner_for(&request.project_path)?;
-        Ok(Json(runner.jacoco_coverage_gaps(request.limit)))
+        Ok(Json(
+            self.blocking(move || runner.jacoco_coverage_gaps(request.limit))
+                .await?,
+        ))
     }
 
     #[tool(description = "List all locally available versions of a Maven artifact")]
@@ -1345,9 +1449,10 @@ impl MavenMcpServer {
         Parameters(request): Parameters<VersionsRequest>,
     ) -> Result<Json<BTreeMap<String, Vec<String>>>, ErrorData> {
         Ok(Json(
-            self.index_for(&request.project_path)
-                .await?
-                .artifact_versions(&request.artifact_id, request.group_id.as_deref()),
+            self.query(request.project_path.clone(), move |index| {
+                index.artifact_versions(&request.artifact_id, request.group_id.as_deref())
+            })
+            .await?,
         ))
     }
 }

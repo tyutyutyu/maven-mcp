@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod blocking;
 pub mod config;
 pub mod index;
 pub mod log_analysis;

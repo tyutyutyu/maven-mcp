@@ -518,6 +518,7 @@ impl MavenIndex {
         let mut jars = BTreeMap::new();
         let mut unindexed = Vec::new();
         for path in classpath {
+            crate::blocking::checkpoint()?;
             let path = match path.canonicalize() {
                 Ok(path) => path,
                 Err(_) => {
@@ -575,6 +576,7 @@ impl MavenIndex {
         jars.sort_by(|left, right| left.0.cmp(&right.0));
         let mut records = Vec::new();
         for (path, identity) in &jars {
+            crate::blocking::checkpoint()?;
             let preflight = if path.is_dir() {
                 preflight_directory(path, &mut budget)
             } else {
@@ -594,6 +596,8 @@ impl MavenIndex {
         }
         records.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
+        // A cancelled job may have skipped jars; its partial records must never become an index.
+        crate::blocking::checkpoint()?;
         for record in records {
             let key = record.key.clone();
             let jar_index = index.jars.len();
@@ -1239,6 +1243,7 @@ impl MavenIndex {
         {
             let mut archive = ClassArchive::open(&jar.path)?;
             for entry_path in jar.entries.iter().filter(|entry| is_text_resource(entry)) {
+                crate::blocking::checkpoint()?;
                 let mut entry = archive.indexed_entry(entry_path)?;
                 let declared_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
                 if declared_size > self.max_source_bytes
@@ -1384,6 +1389,7 @@ impl MavenIndex {
                 .iter()
                 .filter(|entry| entry.ends_with(".java") || entry.ends_with(".kt"))
             {
+                crate::blocking::checkpoint()?;
                 let mut entry = archive.by_name(entry_path)?;
                 let declared_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
                 if scanned_bytes.saturating_add(declared_size) > total_budget {
@@ -2350,6 +2356,9 @@ fn collect_jar_facts(
     let mut providers = BTreeSet::new();
     let mut strings = FactStringPool::default();
     for entry_path in class_entries.values() {
+        if crate::blocking::is_cancelled() {
+            break;
+        }
         let Ok(Some(mut entry)) = archive.by_name(entry_path) else {
             continue;
         };

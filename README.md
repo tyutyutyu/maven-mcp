@@ -188,6 +188,22 @@ not retained. Evicting a runner also forgets that project's last focused-test
 failures. The sizes are estimates of retained heap, not allocator measurements;
 `maven-mcp stats` reports them next to the process RSS.
 
+Index builds, the validation of a cached index against its classpath artifacts,
+and every tool that reads indexes, JARs or other local files run as bounded heavy
+jobs on blocking threads, so a long build or search never occupies the async
+runtime that answers `initialize`, `tools/list` and the light project inspection
+tools. At most `MAX_HEAVY_JOBS` jobs run and `MAX_QUEUED_HEAVY_JOBS`
+more wait for a slot; a job that finds both full fails at once with an
+"overloaded" MCP error naming both variables instead of growing a queue, and the
+request can be retried. Cancelling a request, EOF, SIGINT or SIGTERM cancels the
+job: long loops of the index build and of the source/content searches stop at
+their next checkpoint, a cancelled build is never published to the cache, and a
+job that cannot be interrupted (for example one blocked in a system call) keeps
+its slot until it returns, but never delays shutdown by more than a couple of
+seconds. A retry of a cancelled index build waits until that build's blocking
+work has stopped, so one project generation never has two builds running. Maven
+runs are unchanged: one Maven process at a time across the server.
+
 `search_jar_content` examines the manifest, `META-INF/services/*` descriptors,
 and UTF-8 entries with the extensions `conf`, `config`, `factories`, `imports`,
 `json`, `list`, `properties`, `txt`, `xml`, `yaml`, and `yml`. Each entry is
@@ -425,6 +441,8 @@ Surefire failures follow the existing report-error contract.
 | XML aggregate bytes / files | `67108864` / `4096` (fixed) | One shared budget per module-discovery, JaCoCo-report-set or Surefire-report-set operation. Module traversal also has a depth limit of 128. |
 | `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots whose index is retained in the in-process project-index cache; the number of retained project runners is four times this value. |
 | `MAX_PROJECT_INDEX_BYTES` | `1073741824` | Budget for the estimated retained memory of cached runners, indexes and running index builds together. Exceeding it evicts least recently used idle entries; a build that cannot fit fails with an error naming this variable. |
+| `MAX_HEAVY_JOBS` | `2` | Maximum number of blocking index, archive and file jobs that run at the same time. |
+| `MAX_QUEUED_HEAVY_JOBS` | `16` | Maximum number of further heavy jobs waiting for a running slot. When running and queued slots are all taken, new jobs fail immediately with an "overloaded" MCP error. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
 | `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for structured Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. `run_maven` requires an explicit `-Dmaven.repo.local` argument to select this repository. |
@@ -784,7 +802,8 @@ cargo test --test mcp_interface
 The integration contract verifies that all project-dependent tools require
 `project_path`, Maven-backed operations require a host-configured trusted
 directory tree, and execution occurs through a real STDIO MCP client. Lifecycle
-tests ensure EOF and SIGTERM stop the process and stdout contains JSON-RPC only.
+tests ensure EOF and SIGTERM stop the process, even while index work is blocked,
+and stdout contains JSON-RPC only.
 
 Run the complete test pyramid—unit tests, real child-process STDIO MCP
 integration and lifecycle tests, YAML scenarios, JSON snapshots, and a Markdown

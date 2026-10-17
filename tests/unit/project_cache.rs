@@ -118,7 +118,9 @@ fn cold_lookups_of_one_generation_share_a_single_build() {
     let lookups = (0..8)
         .map(|_| cache.lookup_index(&root, &snapshot.fingerprint))
         .map(|lookup| match lookup {
-            IndexLookup::Build { cell, generation } => (cell, generation),
+            IndexLookup::Build {
+                cell, generation, ..
+            } => (cell, generation),
             IndexLookup::Cached { .. } => panic!("nothing is cached yet"),
         })
         .collect::<Vec<_>>();
@@ -171,6 +173,7 @@ fn invalidation_during_a_build_prevents_publication_and_starts_a_new_generation(
     let IndexLookup::Build {
         cell: old_cell,
         generation: old_generation,
+        ..
     } = cache.lookup_index(&root, &snapshot.fingerprint)
     else {
         panic!("expected a cold lookup");
@@ -191,7 +194,9 @@ fn invalidation_during_a_build_prevents_publication_and_starts_a_new_generation(
         Publication::Stale
     );
     assert!(cache.reserve(&root, old_generation, 0).is_err());
-    let IndexLookup::Build { cell, generation } = cache.lookup_index(&root, &snapshot.fingerprint)
+    let IndexLookup::Build {
+        cell, generation, ..
+    } = cache.lookup_index(&root, &snapshot.fingerprint)
     else {
         panic!("a stale build must not leave a cached index");
     };
@@ -208,6 +213,7 @@ fn failed_builds_clear_the_in_flight_marker_so_a_retry_can_run() {
     let IndexLookup::Build {
         cell: failed,
         generation,
+        ..
     } = cache.lookup_index(&root, &snapshot.fingerprint)
     else {
         panic!("expected a cold lookup");
@@ -483,6 +489,7 @@ fn cancelled_builds_do_not_pin_runners_or_project_states() {
     let IndexLookup::Build {
         cell: waiting,
         generation,
+        ..
     } = cache.lookup_index(&live_root, &live_snapshot.fingerprint)
     else {
         panic!("expected a cold lookup");
@@ -496,6 +503,7 @@ fn cancelled_builds_do_not_pin_runners_or_project_states() {
     let IndexLookup::Build {
         cell: joined,
         generation: joined_generation,
+        ..
     } = cache.lookup_index(&live_root, &live_snapshot.fingerprint)
     else {
         panic!("expected to join the running build");
@@ -577,4 +585,43 @@ fn repeated_failed_and_oversized_builds_do_not_accumulate_bookkeeping() {
         assert!(tiny.released.len() <= 1);
         assert!(tiny.reservations.len() <= 1);
     }
+}
+
+#[test]
+fn abandoned_build_work_keeps_its_generation_owned_until_it_stops() {
+    let mut cache = ProjectCache::new(limits(1, 2, u64::MAX));
+    let (_directory, root, runner) = project("abandoned");
+    let snapshot = install(&mut cache, &root, &runner);
+    let IndexLookup::Build {
+        cell,
+        owner,
+        generation,
+    } = cache.lookup_index(&root, &snapshot.fingerprint)
+    else {
+        panic!("expected a cold lookup");
+    };
+    // The build's blocking work owns the generation; then its request is cancelled.
+    let work = Arc::clone(&owner).try_lock_owned().unwrap();
+    drop((cell, owner));
+    for number in 0..4 {
+        let (directory, other, other_runner) = project(&format!("abandoned-other-{number}"));
+        install(&mut cache, &other, &other_runner);
+        drop(directory);
+    }
+
+    let IndexLookup::Build {
+        owner: retry,
+        generation: retry_generation,
+        ..
+    } = cache.lookup_index(&root, &snapshot.fingerprint)
+    else {
+        panic!("expected a retry build");
+    };
+    assert_eq!(retry_generation, generation);
+    assert!(
+        retry.try_lock().is_err(),
+        "a retry must wait for the abandoned work of its generation"
+    );
+    drop(work);
+    assert!(retry.try_lock().is_ok());
 }

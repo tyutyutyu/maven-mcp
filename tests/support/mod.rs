@@ -635,22 +635,24 @@ fn write_jar(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
 }
 
 /// Wrapper whose `dependency:build-classpath` output and timing are driven by marker files in
-/// the project: `classpath.txt` (the printed classpath), `fail-classpath` (fail the run), `gate`
-/// (block until removed) and `slow` (sleep). Every classpath run appends a line to
+/// the project: `classpath.txt` (the printed classpath), `gate` (block until removed), `slow`
+/// (sleep) and `fail-classpath` (fail the run, after the gate and the sleep so that a failing
+/// build has the same window for concurrent requests as a successful one). Every classpath run
+/// appends a line to
 /// `classpath-runs` and creates `classpath-started`.
 #[allow(dead_code)]
 pub const CONTROLLED_WRAPPER: &str = r#"#!/bin/sh
 case " $* " in
   *" dependency:build-classpath "*)
     echo run >> "$PWD/classpath-runs"
-    if [ -f "$PWD/fail-classpath" ]; then
-      printf '%s\n' '[ERROR] classpath resolution failed on purpose' >&2
-      exit 1
-    fi
     classpath=$(cat "$PWD/classpath.txt")
     : > "$PWD/classpath-started"
     while [ -f "$PWD/gate" ]; do sleep 0.05; done
     if [ -f "$PWD/slow" ]; then sleep 0.5; fi
+    if [ -f "$PWD/fail-classpath" ]; then
+      printf '%s\n' '[ERROR] classpath resolution failed on purpose' >&2
+      exit 1
+    fi
     printf '%s\n' 'Dependencies classpath:' "$classpath"
     ;;
   *) printf '%s\n' '[INFO] BUILD SUCCESS' ;;
@@ -677,6 +679,118 @@ pub fn set_controlled_classpath(project: &Path, classpath: &[PathBuf]) -> Result
 #[allow(dead_code)]
 pub fn controlled_classpath_runs(project: &Path) -> usize {
     std::fs::read_to_string(project.join("classpath-runs")).map_or(0, |runs| runs.lines().count())
+}
+
+/// A classpath JAR that is a named pipe: indexing it blocks in `open` until [`Self::release`]
+/// attaches a writer, which makes the blocking index work deterministically controllable.
+#[allow(dead_code)]
+pub struct BlockedJar {
+    path: PathBuf,
+    /// Where [`Self::replace_with_regular_jar`] moves the pipe; readers blocked on it stay
+    /// blocked until they are released there.
+    parked: PathBuf,
+}
+
+const BLOCKED_JAR_DEADLINE: Duration = Duration::from_secs(10);
+
+#[allow(dead_code)]
+impl BlockedJar {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn fifo(&self) -> &Path {
+        if self.parked.exists() {
+            &self.parked
+        } else {
+            &self.path
+        }
+    }
+
+    /// Lets the readers that wait in `open` continue; they then find an empty, malformed
+    /// archive and skip it. Fails when no reader attaches before the deadline. The writer is
+    /// opened without blocking, so no thread stays parked when nobody reads.
+    pub async fn release(&self) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let deadline = tokio::time::Instant::now() + BLOCKED_JAR_DEADLINE;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(self.fifo())
+            {
+                Ok(_writer) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "no reader was waiting for the blocked JAR"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// Replaces the pipe with a regular, non-blocking JAR so later builds do not wait. Readers
+    /// already blocked on the pipe stay blocked until [`Self::release`].
+    pub fn replace_with_regular_jar(&self) -> Result<()> {
+        std::fs::rename(&self.path, &self.parked)?;
+        write_class_jar(&self.path, &["org/t/BlockedOne".to_owned()])
+    }
+}
+
+/// Number of threads of process `pid` that wait in `open` for the writer of a named pipe.
+#[allow(dead_code)]
+pub fn blocked_fifo_readers(pid: u32) -> Result<usize> {
+    let mut readers = 0;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
+        // The kernel reports the wait of a FIFO `open` without a partner as this channel.
+        if std::fs::read_to_string(task?.path().join("wchan"))
+            .is_ok_and(|channel| channel.trim() == "wait_for_partner")
+        {
+            readers += 1;
+        }
+    }
+    Ok(readers)
+}
+
+/// Waits until `count` threads of process `pid` are blocked opening a [`BlockedJar`].
+#[allow(dead_code)]
+pub async fn wait_for_blocked_fifo_readers(pid: u32, count: usize) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + BLOCKED_JAR_DEADLINE;
+    loop {
+        let readers = blocked_fifo_readers(pid)?;
+        if readers >= count {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "{readers} of {count} index workers blocked on the JAR pipe"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Makes the project's classpath `alpha` (a normal JAR) plus a [`BlockedJar`]; the project
+/// needs a controlled wrapper afterwards, which this installs.
+#[allow(dead_code)]
+pub fn install_blocked_classpath(project: &Path) -> Result<BlockedJar> {
+    let repository = project.join("execution-repository/org/t");
+    let alpha = repository.join("alpha/1.0/alpha-1.0.jar");
+    write_class_jar(&alpha, &["org/t/AlphaOne".to_owned()])?;
+    let blocked = repository.join("blocked/1.0/blocked-1.0.jar");
+    std::fs::create_dir_all(blocked.parent().context("blocked jar has a parent")?)?;
+    let status = std::process::Command::new("mkfifo")
+        .arg(&blocked)
+        .status()?;
+    anyhow::ensure!(status.success(), "mkfifo failed");
+    install_controlled_wrapper(project, &[alpha, blocked.clone()])?;
+    Ok(BlockedJar {
+        parked: blocked.with_extension("parked"),
+        path: blocked,
+    })
 }
 
 /// Writes a JAR with one public empty class per name (`org/example/Name`).

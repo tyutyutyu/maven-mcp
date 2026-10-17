@@ -1,4 +1,4 @@
-use std::{fs, io::Write};
+use std::fs;
 
 use tempfile::TempDir;
 
@@ -104,17 +104,21 @@ fn write_pom(path: &Path, artifact_id: &str, packaging: &str, modules: &[&str]) 
         .unwrap();
 }
 
+/// Writes the script through a separate `install` process: a write descriptor of this process,
+/// inherited by a child that a parallel test forks, would make executing it fail with ETXTBSY.
 fn write_executable(path: &Path, script: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let staged = path.with_extension("tmp");
-    let mut file = fs::File::create(&staged).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    let mut permissions = staged.metadata().unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&staged, permissions).unwrap();
-    fs::rename(staged, path).unwrap();
+    fs::write(&staged, script).unwrap();
+    let status = std::process::Command::new("install")
+        .arg("-m")
+        .arg("0755")
+        .arg(&staged)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install failed for {}", path.display());
+    fs::remove_file(staged).unwrap();
 }
 
 fn wrapper_project(script: &str) -> (TempDir, ProjectExecutionConfig) {

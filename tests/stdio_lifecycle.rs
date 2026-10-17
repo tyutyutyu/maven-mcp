@@ -474,3 +474,85 @@ async fn exited_parent_pipe_holders_stop_on_eof_sigterm_and_request_cancellation
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn blocked_index_work_does_not_keep_the_server_alive_after_eof_or_sigterm() -> Result<()> {
+    use std::time::Duration;
+
+    for action in ["eof", "sigterm"] {
+        let fixture = TestServer::start_with_project().await?;
+        let project = fixture.project_path().unwrap();
+        let _blocked = support::install_blocked_classpath(project)?;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+            .env(
+                "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+                fixture.trusted_project_directory().unwrap(),
+            )
+            .env(
+                "MAVEN_EXECUTION_REPO_PATH",
+                project.join("execution-repository"),
+            )
+            .env("MAVEN_TIMEOUT_SECONDS", "30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("missing stdin")?;
+        let mut lines = BufReader::new(child.stdout.take().context("missing stdout")?).lines();
+        stdin
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": {"name": "blocked-index-shutdown", "version": "1"}}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await??
+            .context("missing initialize response")?;
+        stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await?;
+        stdin
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "search_classes", "arguments": {
+                            "project_path": project, "query": "One"}}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await?;
+        // The index build now blocks on the pipe JAR inside a blocking thread that no
+        // checkpoint can reach; shutdown must still be bounded.
+        support::wait_for_blocked_fifo_readers(child.id().context("missing server PID")?, 1)
+            .await?;
+
+        if action == "sigterm" {
+            use nix::{
+                sys::signal::{Signal, kill},
+                unistd::Pid,
+            };
+            kill(
+                Pid::from_raw(i32::try_from(child.id().context("missing server PID")?)?),
+                Signal::SIGTERM,
+            )?;
+        } else {
+            drop(stdin);
+        }
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .with_context(|| format!("server kept running after {action} with blocked work"))??;
+        assert!(status.success(), "{action}: {status}");
+    }
+    Ok(())
+}
