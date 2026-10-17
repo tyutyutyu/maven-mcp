@@ -35,6 +35,8 @@ pub struct RuntimeConfigStatus {
     pub max_results: usize,
     pub max_source_bytes: usize,
     pub max_project_indexes: usize,
+    #[serde(default)]
+    pub max_project_index_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,6 +45,14 @@ pub struct RuntimeCacheStatus {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    #[serde(default)]
+    pub invalidations: u64,
+    #[serde(default)]
+    pub retained_bytes: u64,
+    #[serde(default)]
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub runners: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +60,8 @@ pub struct ProjectIndexStatus {
     pub project_path: String,
     pub last_used_unix_ms: u128,
     pub index: IndexStats,
+    #[serde(default)]
+    pub estimated_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +97,7 @@ impl RuntimeStatusPublisher {
                     max_results: config.max_results,
                     max_source_bytes: config.max_source_bytes,
                     max_project_indexes: config.max_project_indexes,
+                    max_project_index_bytes: config.max_project_index_bytes,
                 },
                 cache: RuntimeCacheStatus::default(),
                 projects: Vec::new(),
@@ -171,21 +184,29 @@ pub fn format_runtime_report(report: &RuntimeReport) -> String {
             bytes_label(instance.memory.peak_rss_bytes)
         ));
         output.push_str(&format!(
-            "  cache: entries={} hits={} misses={} evictions={} max_project_indexes={}\n",
+            "  cache: entries={} hits={} misses={} evictions={} invalidations={} max_project_indexes={}\n",
             instance.cache.entries,
             instance.cache.hits,
             instance.cache.misses,
             instance.cache.evictions,
+            instance.cache.invalidations,
             instance.config.max_project_indexes
+        ));
+        output.push_str(&format!(
+            "  retained: bytes={} max_bytes={} runners={}\n",
+            instance.cache.retained_bytes,
+            instance.config.max_project_index_bytes,
+            instance.cache.runners
         ));
         for project in &instance.projects {
             output.push_str(&format!(
-                "  project: {} jars={} sources={} classes={} artifacts={}\n",
+                "  project: {} jars={} sources={} classes={} artifacts={} estimated_bytes={}\n",
                 project.project_path,
                 project.index.jar_count,
                 project.index.source_jar_count,
                 project.index.class_count,
-                project.index.artifact_count
+                project.index.artifact_count,
+                project.estimated_bytes
             ));
         }
     }

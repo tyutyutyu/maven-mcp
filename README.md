@@ -126,15 +126,67 @@ the effective test classpath, build a lazy index only from those local JARs and
 their sibling `-sources.jar` files, and cache that index by canonical
 `project_path`. For a multi-module reactor, classpath sections from every module
 are aggregated; empty parent or aggregator POM sections do not hide dependencies
-reported by later modules. Artifacts present elsewhere in the same local Maven
-repository are not searched unless Maven selected them for the requested
-project. Repeated classfile fact strings are stored once per JAR and referenced
+reported by later modules. Reactor outputs on that classpath are indexed with the
+repository artifacts: packaged JARs (conventionally named or with a custom
+`finalName`) and class directories such as `target/classes` and
+`target/test-classes` below the `target` directory of a discovered reactor module.
+They are listed under the module's coordinate, resolved from its POM, its parent
+POMs inside the project and `.mvn/maven.config` `-D` properties, so CI-friendly
+versions such as `${revision}` work; `test-classes` and `*-tests.jar` use the
+`tests` classifier, and a class directory is addressed by its project-relative
+path (for example `core/target/classes`). Artifacts present elsewhere in the same
+local Maven repository are never searched. If Maven selects a classpath entry that
+cannot be indexed — a missing file, a JAR outside both the local repository and the
+reactor build directories (such as a `system`-scope JAR), or a reactor output
+whose module coordinate cannot be resolved — the request fails with an error that
+counts the entries per reason and names their files; no index is cached, so the
+next request retries. Repeated classfile fact strings are stored once per JAR and referenced
 by compact numeric identifiers, so large dependency sets do not retain a
 separate allocation for every constant-pool reference. The effective classpath
 must be fully resolvable; for example, a reactor dependency on an unbuilt sibling
 SNAPSHOT can prevent the index from being created. In that case the MCP error
 includes a bounded, redacted summary of Maven's error output, regardless of
-whether Maven wrote it to stdout or stderr.
+whether Maven wrote it to stdout or stderr. If Maven's classpath output is
+truncated or malformed (for example cut off by `MAX_MAVEN_OUTPUT_BYTES`), the
+request fails with an explicit error instead of caching an index that would be
+incomplete; nothing is cached, so the next request retries.
+
+### Project index cache
+
+The runner (reactor model) and the index of one project share a validity check
+on every request. A cached index is reused while the root and module POMs, the
+Maven executable and Maven Wrapper files (`mvnw`,
+`.mvn/wrapper/maven-wrapper.properties`), `.mvn/maven.config`, `.mvn/jvm.config`,
+`.mvn/extensions.xml` and every classpath JAR (and its `-sources.jar`) keep their
+size and modification time; a classpath class directory is checked file by file,
+so editing, adding or removing a nested `.class` file also counts. Any difference re-reads the reactor model — for
+example a module added to the POM shows up in `inspect_maven_project` — and drops
+the index, which is rebuilt on demand. `run_maven` and `run_maven_lifecycle`
+always re-read the model and drop the index afterwards, because Maven may have
+changed POMs, dependencies or reactor outputs. Parent POMs outside the project,
+`settings.xml` and the contents of the local repository beyond the classpath JARs
+are not watched; use `run_maven` (or restart the server) after changing them.
+
+Concurrent cold requests for one project share a single Maven classpath run and
+index build and receive the same result or the same error; after a failure the
+next request retries. If the project is invalidated, or its files change, while a
+build is running, that build is discarded and the request is served from a fresh
+one (up to four attempts, then an error asks the client to retry).
+
+The cache is bounded three ways: `MAX_PROJECT_INDEXES` indexes, four times that
+many runners, and `MAX_PROJECT_INDEX_BYTES` of estimated memory for runners,
+indexes and running builds together. The least recently used idle index (then
+runner) is evicted first; the project being served is never evicted for its own
+request. An evicted index that a request still holds stays counted until that
+request finishes; the same holds for an evicted or replaced runner. A runner is
+charged a fixed share plus the estimated size of its last focused-test result. A
+cancelled request does not keep its project's build marker or runner alive past
+these limits. A running build is charged the size of its classpath JARs up
+front and fails with an error naming `MAX_PROJECT_INDEX_BYTES` when that cannot
+fit; a finished index larger than the whole budget serves its requester but is
+not retained. Evicting a runner also forgets that project's last focused-test
+failures. The sizes are estimates of retained heap, not allocator measurements;
+`maven-mcp stats` reports them next to the process RSS.
 
 `search_jar_content` examines the manifest, `META-INF/services/*` descriptors,
 and UTF-8 entries with the extensions `conf`, `config`, `factories`, `imports`,
@@ -192,7 +244,8 @@ maven-mcp stats --json
 
 The stats command reads user-private runtime status files for live host-managed
 STDIO instances and reports PIDs, process RSS where the platform exposes it,
-active project indexes, index sizes, and cache hit/miss/eviction counters. If no
+active project indexes, index sizes, estimated retained bytes, and cache
+hit/miss/eviction/invalidation counters. If no
 server is running, it exits successfully with an empty report.
 
 For local source-tree inspection, the bundled helper builds the binary and lets
@@ -303,8 +356,9 @@ accepted. NUL characters and non-string items are invalid MCP parameters. Maven
 itself validates its options; unsupported options or failed goals return a
 structured execution result rather than an MCP argument error.
 
-A `run_maven` call drops the cached project index, so index-backed tools such as
-`get_class_source` rebuild it on the next request. Those tools read
+A `run_maven` call (like `run_maven_lifecycle`) drops the cached project index and
+re-reads the reactor model, so index-backed tools such as `get_class_source`
+rebuild it on the next request. Those tools read
 `MAVEN_EXECUTION_REPO_PATH` when it is set (otherwise `$HOME/.m2/repository`), so
 when it is configured, pass the same directory as `-Dmaven.repo.local=...` in
 goals such as `dependency:sources`.
@@ -369,7 +423,8 @@ Surefire failures follow the existing report-error contract.
 | Central directory bytes | `67108864` (fixed) | Maximum central-directory size per JAR, including extra fields and comments; checked before ZIP metadata allocation. |
 | XML nesting / elements | `128` / `200000` (fixed) | Structural preflight before XML deserialization. |
 | XML aggregate bytes / files | `67108864` / `4096` (fixed) | One shared budget per module-discovery, JaCoCo-report-set or Surefire-report-set operation. Module traversal also has a depth limit of 128. |
-| `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots retained in the in-process project-index cache. |
+| `MAX_PROJECT_INDEXES` | `4` | Maximum number of canonical project roots whose index is retained in the in-process project-index cache; the number of retained project runners is four times this value. |
+| `MAX_PROJECT_INDEX_BYTES` | `1073741824` | Budget for the estimated retained memory of cached runners, indexes and running index builds together. Exceeding it evicts least recently used idle entries; a build that cannot fit fails with an error naming this variable. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
 | `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for structured Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. `run_maven` requires an explicit `-Dmaven.repo.local` argument to select this repository. |

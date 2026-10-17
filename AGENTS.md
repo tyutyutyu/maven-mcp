@@ -23,6 +23,8 @@ agent-specific development rules.
 - `src/config.rs`: environment configuration and request-independent limits.
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
   index, and all search operations.
+- `src/project_cache.rs`: per-project runner and index cache: file fingerprints,
+  generations, single-flight index builds, and the shared memory budget.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
 - `src/main.rs`: STDIO transport, EOF, SIGINT, and SIGTERM
   lifecycle.
@@ -47,6 +49,15 @@ agent-specific development rules.
   directory containing `pom.xml`.
 - Multiple project contexts may be interleaved in one STDIO process. Cache,
   runner, and last-test state must be keyed by canonical project root.
+- Runner and index validity is shared per project: POM/wrapper/`.mvn` stamps and
+  classpath artifact stamps are checked on every request, `run_maven` and
+  `run_maven_lifecycle` invalidate, only one index build runs per project
+  generation, and a build from an older generation must never publish. An
+  incomplete classpath, including a selected entry that cannot be indexed, must
+  never produce a cached index; it is an explicit error. Reactor outputs (JARs
+  and class directories below a module `target`) are indexed under the module
+  coordinate, and evicted runners or indexes still held by requests stay counted
+  in the memory budget.
 - Maven coordinates use the format
   `groupId:artifactId:version[:classifier]`.
 - Treat `-sources.jar` artifacts as source archives, not binary class JARs.
@@ -70,7 +81,10 @@ Java-selection flag are:
 
 - `MAX_RESULTS`, default: `100`; must be a positive integer.
 - `MAX_SOURCE_BYTES`, default: `1048576`; must be a positive integer.
-- `MAX_PROJECT_INDEXES`, default: `4`; must be a positive integer.
+- `MAX_PROJECT_INDEXES`, default: `4`; must be a positive integer. Runners are
+  retained at four times this count.
+- `MAX_PROJECT_INDEX_BYTES`, default: `1073741824`; must be a positive integer.
+  Budget for estimated retained memory of runners, indexes, and running builds.
 - `MAVEN_TRUSTED_PROJECT_DIRECTORIES`, optional platform path-list of existing
   absolute directory trees. Maven-backed project operations are disabled when
   unset; a canonical `project_path` must be equal to or below one configured

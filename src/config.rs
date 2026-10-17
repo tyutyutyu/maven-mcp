@@ -14,6 +14,7 @@ pub const DEFAULT_MAX_SOURCE_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAVEN_TIMEOUT_SECONDS: usize = 300;
 pub const DEFAULT_MAX_MAVEN_OUTPUT_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_PROJECT_INDEXES: usize = 4;
+pub const DEFAULT_MAX_PROJECT_INDEX_BYTES: usize = 1_073_741_824;
 pub const DEFAULT_MAX_XML_BYTES: usize = 16_777_216;
 pub const DEFAULT_MAX_JAR_ENTRIES: usize = 200_000;
 pub const DEFAULT_MAX_INDEX_ENTRIES: usize = 20_000_000;
@@ -188,6 +189,7 @@ pub struct Config {
     pub max_results: usize,
     pub max_source_bytes: usize,
     pub max_project_indexes: usize,
+    pub max_project_index_bytes: usize,
     pub execution: MavenExecutionConfig,
 }
 
@@ -215,6 +217,10 @@ impl Config {
             max_results: positive_env("MAX_RESULTS", DEFAULT_MAX_RESULTS)?,
             max_source_bytes: positive_env("MAX_SOURCE_BYTES", DEFAULT_MAX_SOURCE_BYTES)?,
             max_project_indexes: positive_env("MAX_PROJECT_INDEXES", DEFAULT_MAX_PROJECT_INDEXES)?,
+            max_project_index_bytes: positive_env(
+                "MAX_PROJECT_INDEX_BYTES",
+                DEFAULT_MAX_PROJECT_INDEX_BYTES,
+            )?,
             execution: maven_execution_from_env(use_jenv)?,
         })
     }

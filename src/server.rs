@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::BTreeMap,
     env,
-    path::PathBuf,
-    sync::{Arc, Mutex},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use rmcp::{
@@ -22,8 +22,9 @@ use crate::index::{
     ArtifactApiDiff, ArtifactHealth, ArtifactOutsideRepository, ClassDescription, ClassList,
     ClassLocation, ClassMemberMatch, ClassReference, ClassReferenceKind, DeclarationSourceLookup,
     EntryMatch, IndexStats, JarContentSearch, JarEntryContent, JarSummary, MavenIndex,
-    PomDescriptorLookup, ProviderDescriptorKind, ProviderFact, ReferenceDirection, SourceResult,
-    SourceSearch, TypeHierarchyMatch, validate_exact_coordinate,
+    PomDescriptorLookup, ProviderDescriptorKind, ProviderFact, ReactorLayout, ReferenceDirection,
+    SourceResult, SourceSearch, TypeHierarchyMatch, UnindexedClasspathEntry, UnindexedReason,
+    validate_exact_coordinate,
 };
 use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
@@ -32,10 +33,17 @@ use crate::project::{
     MavenBuildResult, MavenClasspathResult, MavenInvocation, MavenProject, MavenRunResult,
     MavenRunner, canonical_project_root,
 };
-use crate::runtime_stats::{
-    ProjectIndexStatus, RuntimeCacheStatus, RuntimeStatusPublisher, unix_ms,
+use crate::project_cache::{
+    BuildOutcome, CacheLimits, IndexLookup, ProjectCache, ProjectFingerprint, Publication,
+    ReserveError, RunnerSnapshot,
 };
+use crate::runtime_stats::RuntimeStatusPublisher;
 
+/// Number of times one request retries after the project changed while its index was built.
+const MAX_INDEX_BUILD_ATTEMPTS: usize = 4;
+/// Runner entries retained per allowed project index; runners carry the last focused-test
+/// state, so they outlive their indexes.
+const RUNNERS_PER_INDEX: usize = 4;
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct Results<T> {
     pub results: Vec<T>,
@@ -398,9 +406,8 @@ pub struct VersionsRequest {
 #[derive(Debug, Clone)]
 pub struct MavenMcpServer {
     config: Config,
-    runners: Arc<Mutex<HashMap<PathBuf, Arc<MavenRunner>>>>,
     execution_permit: Arc<Semaphore>,
-    indexes: Arc<Mutex<ProjectIndexCache>>,
+    projects: Arc<Mutex<ProjectCache>>,
     runtime_status: Arc<RuntimeStatusPublisher>,
     tool_router: ToolRouter<Self>,
 }
@@ -417,11 +424,15 @@ impl MavenMcpServer {
     pub fn new(config: Config) -> Self {
         let runtime_status = RuntimeStatusPublisher::register(&config)
             .expect("runtime status registration must be writable");
+        let projects = ProjectCache::new(CacheLimits {
+            max_indexes: config.max_project_indexes,
+            max_runners: config.max_project_indexes.saturating_mul(RUNNERS_PER_INDEX),
+            max_bytes: u64::try_from(config.max_project_index_bytes).unwrap_or(u64::MAX),
+        });
         Self {
             config,
-            runners: Arc::new(Mutex::new(HashMap::new())),
             execution_permit: Arc::new(Semaphore::new(1)),
-            indexes: Arc::new(Mutex::new(ProjectIndexCache::default())),
+            projects: Arc::new(Mutex::new(projects)),
             runtime_status: Arc::new(runtime_status),
             tool_router: Self::tool_router(),
         }
@@ -432,7 +443,20 @@ impl MavenMcpServer {
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
     }
 
+    fn lock_projects(&self) -> Result<MutexGuard<'_, ProjectCache>, ErrorData> {
+        self.projects
+            .lock()
+            .map_err(|_| ErrorData::internal_error("project cache is poisoned", None))
+    }
+
     fn runner_for(&self, project_path: &str) -> Result<Arc<MavenRunner>, ErrorData> {
+        self.project_runner(project_path)
+            .map(|(_, snapshot)| snapshot.runner)
+    }
+
+    /// Returns the project's runner, re-reading the reactor model when a POM, the wrapper or
+    /// the Maven configuration changed or Maven ran in the project since it was discovered.
+    fn project_runner(&self, project_path: &str) -> Result<(PathBuf, RunnerSnapshot), ErrorData> {
         let root = self.validate_project_path(project_path)?;
         if !self
             .config
@@ -446,37 +470,104 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        let mut runners = self
-            .runners
-            .lock()
-            .map_err(|_| ErrorData::internal_error("project runner cache is poisoned", None))?;
-        if let Some(runner) = runners.get(&root) {
-            return Ok(Arc::clone(runner));
+        let cached = self.lock_projects()?.runner(&root);
+        if let Some(snapshot) = cached.as_ref()
+            && !snapshot.revalidate
+            && snapshot.fingerprint.is_current()
+        {
+            return Ok((root, snapshot.clone()));
         }
-        let runner = Arc::new(
-            MavenRunner::discover_canonical_with_permit(
+        let discovered = match &cached {
+            Some(snapshot) => snapshot
+                .runner
+                .rediscover(&self.config.execution, Arc::clone(&self.execution_permit)),
+            None => MavenRunner::discover_canonical_with_permit(
                 root.clone(),
                 &self.config.execution,
                 Arc::clone(&self.execution_permit),
-            )
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?,
-        );
-        runners.insert(root, Arc::clone(&runner));
-        Ok(runner)
+            ),
+        };
+        let runner = match discovered {
+            Ok(runner) => Arc::new(runner),
+            Err(error) => {
+                self.lock_projects()?.discard_project(&root);
+                self.publish_runtime_status();
+                return Err(ErrorData::invalid_params(error.to_string(), None));
+            }
+        };
+        let fingerprint = ProjectFingerprint::capture(runner.fingerprint_paths());
+        let snapshot = self
+            .lock_projects()?
+            .install_runner(&root, runner, fingerprint);
+        self.publish_runtime_status();
+        Ok((root, snapshot))
     }
 
     async fn index_for(&self, project_path: &str) -> Result<Arc<MavenIndex>, ErrorData> {
-        let root = self.validate_project_path(project_path)?;
-        if let Some(index) = self.cached_index(&root)? {
-            return Ok(index);
+        for _ in 0..MAX_INDEX_BUILD_ATTEMPTS {
+            let (root, snapshot) = self.project_runner(project_path)?;
+            let lookup = self
+                .lock_projects()?
+                .lookup_index(&root, &snapshot.fingerprint);
+            match lookup {
+                IndexLookup::Cached { entry, generation } => {
+                    if entry.artifacts_are_current() {
+                        self.lock_projects()?.record_hit(&root);
+                        self.publish_runtime_status();
+                        return Ok(Arc::clone(&entry.index));
+                    }
+                    self.lock_projects()?
+                        .invalidate_generation(&root, generation);
+                }
+                IndexLookup::Build { cell, generation } => {
+                    let outcome = cell
+                        .get_or_init(|| self.build_index(&root, &snapshot, generation))
+                        .await
+                        .clone();
+                    self.publish_runtime_status();
+                    match outcome {
+                        BuildOutcome::Built(index) => return Ok(index),
+                        BuildOutcome::Failed(error) => return Err(error),
+                        BuildOutcome::Stale => {}
+                    }
+                }
+            }
         }
+        Err(ErrorData::internal_error(
+            "the project changed repeatedly while its index was being built; retry the request",
+            None,
+        ))
+    }
 
-        let runner = self.runner_for(project_path)?;
-        let classpath = runner
+    /// Runs the single build of one project generation; failures are shared with every waiter
+    /// and leave the project ready for a retry.
+    async fn build_index(
+        &self,
+        root: &Path,
+        snapshot: &RunnerSnapshot,
+        generation: u64,
+    ) -> BuildOutcome {
+        let outcome = self.try_build_index(root, snapshot, generation).await;
+        if matches!(outcome, BuildOutcome::Failed(_))
+            && let Ok(mut projects) = self.lock_projects()
+        {
+            projects.finish_failed(root, generation);
+        }
+        outcome
+    }
+
+    async fn try_build_index(
+        &self,
+        root: &Path,
+        snapshot: &RunnerSnapshot,
+        generation: u64,
+    ) -> BuildOutcome {
+        let classpath = snapshot
+            .runner
             .build_classpath_paths(None, ClasspathKind::Test)
             .await;
         if classpath.build.outcome != MavenBuildOutcome::Success {
-            return Err(ErrorData::invalid_params(
+            return BuildOutcome::Failed(ErrorData::invalid_params(
                 format!(
                     "cannot build Maven classpath for project index: {}",
                     maven_failure_detail(&classpath.build)
@@ -484,23 +575,103 @@ impl MavenMcpServer {
                 None,
             ));
         }
-        let Some(repository_root) = repository_root_for(&classpath.paths, &self.config) else {
-            return Err(ErrorData::invalid_params(
+        if classpath.paths_incomplete {
+            return BuildOutcome::Failed(ErrorData::invalid_params(
+                "Maven classpath output was truncated or malformed; the project index was not built because it would be incomplete",
+                None,
+            ));
+        }
+        let repository_root = repository_root_for(&classpath.paths, root, &self.config);
+        if !has_indexable_jars(&classpath.paths, root, repository_root.is_some()) {
+            return BuildOutcome::Failed(ErrorData::invalid_params(
                 "Maven classpath did not contain indexable local repository JARs",
                 None,
             ));
+        }
+        // Class directories are stamped file by file, so editing a nested class invalidates.
+        let artifacts =
+            ProjectFingerprint::capture_trees(classpath.paths.iter().flat_map(|path| {
+                [path.clone()]
+                    .into_iter()
+                    .chain(crate::index::source_jar_path(path))
+            }));
+        let reservation = {
+            let Ok(mut projects) = self.lock_projects() else {
+                return BuildOutcome::Failed(ErrorData::internal_error(
+                    "project cache is poisoned",
+                    None,
+                ));
+            };
+            // Until the index exists, charge one byte per classpath JAR byte: local measurements
+            // found finished indexes at 0.7-0.9 bytes per JAR byte.
+            match projects.reserve(root, generation, artifacts.file_bytes()) {
+                Ok(reservation) => reservation,
+                Err(ReserveError::Stale) => return BuildOutcome::Stale,
+                Err(ReserveError::OverBudget { needed, limit }) => {
+                    return BuildOutcome::Failed(ErrorData::invalid_params(
+                        format!(
+                            "building this project index needs an estimated {needed} bytes, which exceeds MAX_PROJECT_INDEX_BYTES ({limit})"
+                        ),
+                        None,
+                    ));
+                }
+            }
         };
-        let index = Arc::new(
-            MavenIndex::build_scoped(
-                &repository_root,
-                &classpath.paths,
-                self.config.max_results,
-                self.config.max_source_bytes,
-            )
-            .map_err(|error| ErrorData::internal_error(error.to_string(), None))?,
-        );
-        self.store_index(root, Arc::clone(&index))?;
-        Ok(index)
+        let modules = snapshot.runner.module_directories();
+        let scoped = match MavenIndex::build_scoped(
+            repository_root.as_deref(),
+            &ReactorLayout {
+                root,
+                modules: &modules,
+            },
+            &classpath.paths,
+            self.config.max_results,
+            self.config.max_source_bytes,
+        ) {
+            Ok(scoped) => scoped,
+            Err(error) => {
+                return BuildOutcome::Failed(ErrorData::internal_error(error.to_string(), None));
+            }
+        };
+        if !scoped.unindexed.is_empty() {
+            return BuildOutcome::Failed(ErrorData::invalid_params(
+                unindexed_classpath_message(&scoped.unindexed),
+                None,
+            ));
+        }
+        let index = Arc::new(scoped.index);
+        // Files that changed while Maven and the indexer ran describe a different project.
+        let changed = !snapshot.fingerprint.is_current() || !artifacts.is_current();
+        let Ok(mut projects) = self.lock_projects() else {
+            return BuildOutcome::Failed(ErrorData::internal_error(
+                "project cache is poisoned",
+                None,
+            ));
+        };
+        if changed {
+            projects.invalidate_generation(root, generation);
+            return BuildOutcome::Stale;
+        }
+        match projects.publish(
+            root,
+            generation,
+            &index,
+            artifacts,
+            Arc::clone(&snapshot.fingerprint),
+            reservation,
+        ) {
+            Publication::Stale => BuildOutcome::Stale,
+            Publication::Retained | Publication::Uncached => BuildOutcome::Built(index),
+        }
+    }
+
+    /// Maven may have changed dependencies, sources, outputs or POMs: drop the project's
+    /// index, abandon its running build and re-read the model on the next request.
+    fn invalidate_project(&self, project_path: &str) -> Result<(), ErrorData> {
+        let root = self.validate_project_path(project_path)?;
+        self.lock_projects()?.invalidate_after_maven(&root);
+        self.publish_runtime_status();
+        Ok(())
     }
 
     fn artifact_repository_for(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
@@ -529,112 +700,13 @@ impl MavenMcpServer {
         }
     }
 
-    fn cached_index(&self, root: &PathBuf) -> Result<Option<Arc<MavenIndex>>, ErrorData> {
-        let result = self
-            .indexes
-            .lock()
-            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))
-            .map(|mut cache| cache.get(root));
-        self.publish_runtime_status();
-        result
-    }
-
-    fn invalidate_index(&self, root: &PathBuf) -> Result<(), ErrorData> {
-        self.indexes
-            .lock()
-            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))?
-            .remove(root);
-        self.publish_runtime_status();
-        Ok(())
-    }
-
-    fn store_index(&self, root: PathBuf, index: Arc<MavenIndex>) -> Result<(), ErrorData> {
-        self.indexes
-            .lock()
-            .map_err(|_| ErrorData::internal_error("project index cache is poisoned", None))?
-            .insert(root, index, self.config.max_project_indexes);
-        self.publish_runtime_status();
-        Ok(())
-    }
-
     fn publish_runtime_status(&self) {
-        let Ok(cache) = self.indexes.lock() else {
+        let Ok(projects) = self.projects.lock() else {
             return;
         };
         let _ = self
             .runtime_status
-            .update_cache(cache.runtime_cache(), cache.runtime_projects());
-    }
-}
-
-#[derive(Debug, Default)]
-struct ProjectIndexCache {
-    indexes: HashMap<PathBuf, Arc<MavenIndex>>,
-    order: VecDeque<PathBuf>,
-    hits: u64,
-    misses: u64,
-    evictions: u64,
-    last_used: HashMap<PathBuf, u128>,
-}
-
-impl ProjectIndexCache {
-    fn get(&mut self, root: &PathBuf) -> Option<Arc<MavenIndex>> {
-        let Some(index) = self.indexes.get(root).cloned() else {
-            self.misses += 1;
-            return None;
-        };
-        self.hits += 1;
-        self.touch(root);
-        Some(index)
-    }
-
-    fn insert(&mut self, root: PathBuf, index: Arc<MavenIndex>, limit: usize) {
-        self.indexes.insert(root.clone(), index);
-        self.touch(&root);
-        while self.indexes.len() > limit {
-            let Some(evicted) = self.order.pop_front() else {
-                break;
-            };
-            if evicted != root && self.indexes.remove(&evicted).is_some() {
-                self.evictions += 1;
-                self.last_used.remove(&evicted);
-            }
-        }
-    }
-
-    fn touch(&mut self, root: &PathBuf) {
-        self.order.retain(|candidate| candidate != root);
-        self.order.push_back(root.clone());
-        self.last_used.insert(root.clone(), unix_ms());
-    }
-
-    fn runtime_cache(&self) -> RuntimeCacheStatus {
-        RuntimeCacheStatus {
-            entries: self.indexes.len(),
-            hits: self.hits,
-            misses: self.misses,
-            evictions: self.evictions,
-        }
-    }
-
-    fn remove(&mut self, root: &PathBuf) {
-        self.indexes.remove(root);
-        self.order.retain(|candidate| candidate != root);
-        self.last_used.remove(root);
-    }
-
-    fn runtime_projects(&self) -> Vec<ProjectIndexStatus> {
-        let mut projects = self
-            .indexes
-            .iter()
-            .map(|(root, index)| ProjectIndexStatus {
-                project_path: root.display().to_string(),
-                last_used_unix_ms: self.last_used.get(root).copied().unwrap_or_default(),
-                index: index.stats(),
-            })
-            .collect::<Vec<_>>();
-        projects.sort_by(|left, right| left.project_path.cmp(&right.project_path));
-        projects
+            .update_cache(projects.runtime_cache(), projects.runtime_projects());
     }
 }
 
@@ -682,15 +754,19 @@ fn maven_failure_detail(build: &MavenBuildResult) -> String {
     bounded
 }
 
-fn repository_root_for(paths: &[PathBuf], config: &Config) -> Option<PathBuf> {
+fn repository_root_for(paths: &[PathBuf], project_root: &Path, config: &Config) -> Option<PathBuf> {
     if let Some(repository) = config.execution.execution_repository.as_ref()
         && paths.iter().any(|path| path.starts_with(repository))
     {
         return Some(repository.clone());
     }
     paths.iter().find_map(|path| {
-        let mut root = PathBuf::new();
-        for component in path.components() {
+        // Directory names above the project root say nothing about the repository layout.
+        let (mut root, relative) = match path.strip_prefix(project_root) {
+            Ok(relative) => (project_root.to_owned(), relative),
+            Err(_) => (PathBuf::new(), path.as_path()),
+        };
+        for component in relative.components() {
             root.push(component.as_os_str());
             if component.as_os_str() == "repository" {
                 return Some(root);
@@ -698,6 +774,48 @@ fn repository_root_for(paths: &[PathBuf], config: &Config) -> Option<PathBuf> {
         }
         None
     })
+}
+
+/// A classpath is indexable when it names repository artifacts below a recognized repository
+/// root, or reactor outputs of the project. Entries that are neither fail the build later.
+fn has_indexable_jars(paths: &[PathBuf], project_root: &Path, has_repository: bool) -> bool {
+    has_repository || paths.iter().any(|path| path.starts_with(project_root))
+}
+
+const MAX_REPORTED_UNINDEXED_ENTRIES: usize = 3;
+
+/// Explains why a classpath could not be indexed completely: counts per reason and the file
+/// names, not the full local paths, of the first entries.
+fn unindexed_classpath_message(unindexed: &[UnindexedClasspathEntry]) -> String {
+    let mut counts = BTreeMap::<UnindexedReason, usize>::new();
+    for entry in unindexed {
+        *counts.entry(entry.reason).or_default() += 1;
+    }
+    let reasons = counts
+        .iter()
+        .map(|(reason, count)| format!("{count} {}", reason.description()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let names = unindexed
+        .iter()
+        .take(MAX_REPORTED_UNINDEXED_ENTRIES)
+        .map(|entry| {
+            entry.path.file_name().map_or_else(
+                || "?".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if unindexed.len() > MAX_REPORTED_UNINDEXED_ENTRIES {
+        ", …"
+    } else {
+        ""
+    };
+    format!(
+        "{} selected classpath entries cannot be indexed ({reasons}: {names}{more}); the project index was not built because it would be incomplete",
+        unindexed.len()
+    )
 }
 
 #[tool_router(router = tool_router)]
@@ -1060,7 +1178,7 @@ impl MavenMcpServer {
             .await
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         // Arbitrary goals may change dependencies, sources or classpath.
-        self.invalidate_index(&self.validate_project_path(&request.project_path)?)?;
+        self.invalidate_project(&request.project_path)?;
         Ok(Json(result))
     }
 
@@ -1079,6 +1197,8 @@ impl MavenMcpServer {
                 also_make: request.also_make,
             })
             .await;
+        // Packaging and verification change the reactor outputs on the classpath.
+        self.invalidate_project(&request.project_path)?;
         Ok(Json(MavenBuildResult::from_run(run)))
     }
 

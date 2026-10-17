@@ -4,7 +4,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -401,6 +404,10 @@ pub struct MavenClasspathPaths {
     pub artifacts: Vec<String>,
     pub paths: Vec<PathBuf>,
     pub incomplete: bool,
+    /// Set when the classpath file list itself is unreliable (truncated stdout, a missing
+    /// classpath marker, or a relative entry), unlike `incomplete`, which also reports
+    /// entries that are not Maven-repository coordinates, such as reactor outputs.
+    pub paths_incomplete: bool,
     pub build: MavenBuildResult,
 }
 
@@ -547,6 +554,8 @@ pub struct MavenRunner {
     execution_repository: Option<PathBuf>,
     permit: Arc<Semaphore>,
     last_test_result: Arc<RwLock<Option<FocusedTestResult>>>,
+    /// Estimated heap size of `last_test_result`, readable without awaiting its lock.
+    last_test_result_bytes: Arc<AtomicU64>,
 }
 
 impl MavenRunner {
@@ -603,11 +612,65 @@ impl MavenRunner {
             execution_repository,
             permit,
             last_test_result: Arc::new(RwLock::new(None)),
+            last_test_result_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub fn project(&self) -> &MavenProject {
         &self.project
+    }
+
+    /// Re-reads the reactor model and executable selection from disk. The result shares this
+    /// runner's last focused-test state, so a POM edit does not discard earlier failures.
+    pub fn rediscover(
+        &self,
+        config: &MavenExecutionConfig,
+        permit: Arc<Semaphore>,
+    ) -> Result<Self> {
+        let mut runner = Self::discover_canonical_with_permit(self.root.clone(), config, permit)?;
+        runner.last_test_result = Arc::clone(&self.last_test_result);
+        runner.last_test_result_bytes = Arc::clone(&self.last_test_result_bytes);
+        Ok(runner)
+    }
+
+    /// Estimated heap retained by the last focused-test result this runner keeps.
+    pub fn retained_test_result_bytes(&self) -> u64 {
+        self.last_test_result_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Directories of the root project and every discovered reactor module.
+    pub fn module_directories(&self) -> Vec<PathBuf> {
+        let mut directories = vec![self.root.clone()];
+        directories.extend(self.project.modules.iter().map(|module| {
+            let directory = self.root.join(&module.selector);
+            directory.canonicalize().unwrap_or(directory)
+        }));
+        directories.sort();
+        directories.dedup();
+        directories
+    }
+
+    /// Files whose content defines the reactor model and the Maven invocation: every module
+    /// POM, the selected executable, the Maven Wrapper and the `.mvn` project configuration.
+    pub fn fingerprint_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.root.join("pom.xml"),
+            self.executable.path().to_owned(),
+            self.root.join("mvnw"),
+            self.root.join(".mvn/wrapper/maven-wrapper.properties"),
+            self.root.join(".mvn/maven.config"),
+            self.root.join(".mvn/jvm.config"),
+            self.root.join(".mvn/extensions.xml"),
+        ];
+        paths.extend(
+            self.project
+                .modules
+                .iter()
+                .map(|module| self.root.join(&module.selector).join("pom.xml")),
+        );
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     pub async fn run(&self, invocation: &MavenInvocation) -> MavenRunResult {
@@ -703,7 +766,11 @@ impl MavenRunner {
         {
             result.build.outcome = MavenBuildOutcome::TestFailure;
         }
-        *self.last_test_result.write().await = Some(result.clone());
+        let mut last_test_result = self.last_test_result.write().await;
+        self.last_test_result_bytes
+            .store(focused_test_result_bytes(&result), Ordering::Relaxed);
+        *last_test_result = Some(result.clone());
+        drop(last_test_result);
         result
     }
 
@@ -997,6 +1064,7 @@ impl MavenRunner {
                     artifacts: Vec::new(),
                     paths: Vec::new(),
                     incomplete: false,
+                    paths_incomplete: false,
                     build: MavenBuildResult::from_run(
                         self.runner_error(started, error.to_string()),
                     ),
@@ -1016,6 +1084,7 @@ impl MavenRunner {
             artifacts,
             paths,
             incomplete: run.stdout_truncated || normalization_incomplete || path_incomplete,
+            paths_incomplete: run.stdout_truncated || path_incomplete,
             build: MavenBuildResult::from_run(run),
         }
     }
@@ -1458,6 +1527,40 @@ async fn resolve_jenv_java_home(jenv_root: &Path, project_root: &Path) -> Result
 struct ExecutedMaven {
     result: MavenRunResult,
     raw_stdout: String,
+}
+
+/// Payload bytes of a retained focused-test result plus a fixed share per heap string.
+fn focused_test_result_bytes(result: &FocusedTestResult) -> u64 {
+    const STRING_OVERHEAD: usize = std::mem::size_of::<String>() + 16;
+    let build = &result.build;
+    let total = std::mem::size_of::<FocusedTestResult>()
+        + result.report_error.as_deref().map_or(0, str::len)
+        + result
+            .failures
+            .iter()
+            .map(|failure| {
+                std::mem::size_of::<TestFailureDetail>()
+                    + failure.class_name.len()
+                    + failure.test_name.len()
+                    + failure.message.len()
+                    + 3 * STRING_OVERHEAD
+            })
+            .sum::<usize>()
+        + build.policy_notice.as_deref().map_or(0, str::len)
+        + build
+            .compiler_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.len() + STRING_OVERHEAD)
+            .sum::<usize>()
+        + build
+            .reactor_summary
+            .iter()
+            .map(|module| module.module.len() + module.status.len() + 2 * STRING_OVERHEAD)
+            .sum::<usize>()
+        + build.run.stdout.len()
+        + build.run.stderr.len()
+        + 2 * STRING_OVERHEAD;
+    total as u64
 }
 
 pub fn canonical_project_root(project_path: &Path) -> Result<PathBuf> {

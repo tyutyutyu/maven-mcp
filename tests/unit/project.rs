@@ -558,6 +558,7 @@ async fn discovers_and_runs_focused_tests_with_structured_surefire_results() {
         runner.test_classes().unwrap(),
         vec!["org.example.FooTest", "org.example.WebTest"]
     );
+    assert_eq!(runner.retained_test_result_bytes(), 0);
     let result = runner
         .run_focused_test(&FocusedTestInvocation {
             test_class: "org.example.FooTest".to_owned(),
@@ -584,6 +585,16 @@ async fn discovers_and_runs_focused_tests_with_structured_surefire_results() {
     let last = runner.last_test_failures().await;
     assert!(last.available);
     assert_eq!(last.failures, result.failures);
+    // The retained result is charged to the runner's share of the project cache budget.
+    let retained = runner.retained_test_result_bytes();
+    let payload = result.build.run.stdout.len()
+        + result.build.run.stderr.len()
+        + result
+            .failures
+            .iter()
+            .map(|failure| failure.message.len())
+            .sum::<usize>();
+    assert!(retained >= payload as u64, "{retained} < {payload}");
 }
 
 #[tokio::test]
@@ -1281,5 +1292,58 @@ fn effective_pom_root_is_detected_from_xml_events() {
     ] {
         fs::write(&path, bad).unwrap();
         assert!(parse_effective_pom(&path).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn rediscovery_rereads_the_reactor_and_keeps_the_last_focused_test_state() {
+    let (root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
+    let runner = MavenRunner::discover(&config).unwrap();
+    let before = runner.fingerprint_paths();
+    write_pom(&root.path().join("extra/pom.xml"), "extra", "jar", &[]);
+    write_pom(
+        &root.path().join("pom.xml"),
+        "root",
+        "pom",
+        &["core", "apps", "extra"],
+    );
+
+    let refreshed = runner
+        .rediscover(
+            &MavenExecutionConfig {
+                trusted_project_directories: Vec::new(),
+                maven_executable: config.maven_executable.clone(),
+                execution_repository: config.execution_repository.clone(),
+                timeout: config.timeout,
+                max_output_bytes: config.max_output_bytes,
+                max_results: config.max_results,
+                network_enabled: config.network_enabled,
+                java_environment: config.java_environment.clone(),
+            },
+            Arc::new(Semaphore::new(1)),
+        )
+        .unwrap();
+
+    assert!(
+        refreshed
+            .project()
+            .modules
+            .iter()
+            .any(|module| module.selector == "extra")
+    );
+    assert!(Arc::ptr_eq(
+        &runner.last_test_result,
+        &refreshed.last_test_result
+    ));
+    let after = refreshed.fingerprint_paths();
+    assert!(!before.contains(&refreshed.root.join("extra/pom.xml")));
+    assert!(after.contains(&refreshed.root.join("extra/pom.xml")));
+    for expected in [
+        "pom.xml",
+        "mvnw",
+        ".mvn/wrapper/maven-wrapper.properties",
+        "apps/web/pom.xml",
+    ] {
+        assert!(after.contains(&refreshed.root.join(expected)), "{expected}");
     }
 }

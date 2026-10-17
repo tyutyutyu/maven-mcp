@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -24,6 +24,14 @@ struct ArtifactKey {
     group_id: String,
     artifact_id: String,
     version: String,
+}
+
+/// Where a JAR is located and which Maven artifact it represents.
+#[derive(Debug, Clone)]
+struct JarIdentity {
+    key: ArtifactKey,
+    classifier: Option<String>,
+    relative_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -488,46 +496,66 @@ pub struct MavenIndex {
 
 impl MavenIndex {
     pub fn build(root: &Path, max_results: usize, max_source_bytes: usize) -> Result<Self> {
-        let jar_paths = collect_repository_jars(root);
-        Self::build_from_jars(root, &jar_paths, max_results, max_source_bytes)
+        let jars = collect_repository_jars(root)
+            .into_iter()
+            .filter_map(|path| repository_identity(root, &path).map(|identity| (path, identity)))
+            .collect::<Vec<_>>();
+        Self::build_from_jars(root, jars, max_results, max_source_bytes)
     }
 
+    /// Builds an index limited to the effective classpath of one project: artifacts below
+    /// `repository_root` and the outputs of the reactor modules in `reactor.modules`, both
+    /// packaged JARs and class directories such as `target/classes`. A selected entry that
+    /// is missing, outside both, or a reactor output without resolvable module coordinates
+    /// is not indexed and is reported in [`ScopedIndex::unindexed`], never dropped silently.
     pub fn build_scoped(
-        repository_root: &Path,
-        classpath_jars: &[PathBuf],
+        repository_root: Option<&Path>,
+        reactor: &ReactorLayout<'_>,
+        classpath: &[PathBuf],
         max_results: usize,
         max_source_bytes: usize,
-    ) -> Result<Self> {
-        let mut jar_paths = BTreeSet::new();
-        for path in classpath_jars {
+    ) -> Result<ScopedIndex> {
+        let mut jars = BTreeMap::new();
+        let mut unindexed = Vec::new();
+        for path in classpath {
             let path = match path.canonicalize() {
-                Ok(path) if path.starts_with(repository_root) => path,
-                Ok(path) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "skipping classpath jar outside repository root"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "skipping unreadable classpath jar");
+                Ok(path) => path,
+                Err(_) => {
+                    unindexed.push(UnindexedClasspathEntry {
+                        path: path.clone(),
+                        reason: UnindexedReason::Missing,
+                    });
                     continue;
                 }
             };
-            jar_paths.insert(path.clone());
+            let identity = match scoped_identity(repository_root, reactor, &path) {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    unindexed.push(UnindexedClasspathEntry { path, reason });
+                    continue;
+                }
+            };
             if let Some(source_path) = source_jar_path(&path)
                 && source_path.is_file()
+                && let Ok(source_identity) = scoped_identity(repository_root, reactor, &source_path)
             {
-                jar_paths.insert(source_path);
+                jars.insert(source_path, source_identity);
             }
+            jars.insert(path, identity);
         }
-        let jar_paths = jar_paths.into_iter().collect::<Vec<_>>();
-        Self::build_from_jars(repository_root, &jar_paths, max_results, max_source_bytes)
+        let root = repository_root.unwrap_or(reactor.root);
+        let index = Self::build_from_jars(
+            root,
+            jars.into_iter().collect(),
+            max_results,
+            max_source_bytes,
+        )?;
+        Ok(ScopedIndex { index, unindexed })
     }
 
     fn build_from_jars(
         root: &Path,
-        jar_paths: &[PathBuf],
+        jars: Vec<(PathBuf, JarIdentity)>,
         max_results: usize,
         max_source_bytes: usize,
     ) -> Result<Self> {
@@ -543,14 +571,16 @@ impl MavenIndex {
 
         // Preflight sequentially, before ZIP metadata or class facts are allocated.
         let mut budget = ArchiveBudget::configured();
-        let mut paths = jar_paths.iter().collect::<Vec<_>>();
-        paths.sort();
+        let mut jars = jars;
+        jars.sort_by(|left, right| left.0.cmp(&right.0));
         let mut records = Vec::new();
-        for path in paths {
-            if parse_coordinate(root, path).is_none() {
-                continue;
-            }
-            match preflight_archive(path, &mut budget) {
+        for (path, identity) in &jars {
+            let preflight = if path.is_dir() {
+                preflight_directory(path, &mut budget)
+            } else {
+                preflight_archive(path, &mut budget)
+            };
+            match preflight {
                 Ok(()) => {}
                 Err(error) if error.is::<ArchiveLimit>() => return Err(error),
                 Err(error) => {
@@ -558,7 +588,7 @@ impl MavenIndex {
                     continue;
                 }
             }
-            if let Some(record) = load_jar_record(root, path, max_source_bytes) {
+            if let Some(record) = load_jar_record(path, identity.clone(), max_source_bytes) {
                 records.push(record);
             }
         }
@@ -604,6 +634,83 @@ impl MavenIndex {
             unique_class_count: self.class_locations.len(),
             artifact_count: self.artifacts.len(),
         }
+    }
+
+    /// Deterministic estimate of the heap retained by this index: string payloads plus fixed
+    /// per-container overheads. It is a budgeting figure, not an allocator measurement.
+    pub fn estimated_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        // Header plus a typical hash/B-tree node share for one map or set element.
+        const NODE_OVERHEAD: usize = 32;
+        // Allocator header and size-class rounding of one heap string.
+        const ALLOCATION_OVERHEAD: usize = 16;
+        let text = |value: &str| size_of::<String>() + value.len() + ALLOCATION_OVERHEAD;
+        let mut total = size_of::<Self>() + self.root.as_os_str().len();
+        for jar in &self.jars {
+            total += size_of::<JarRecord>()
+                + jar.key.group_id.len()
+                + jar.key.artifact_id.len()
+                + jar.key.version.len()
+                + jar.classifier.as_deref().map_or(0, str::len)
+                + jar.relative_path.len()
+                + jar.path.as_os_str().len();
+            total += jar.classes.iter().map(|name| text(name)).sum::<usize>();
+            total += jar.entries.iter().map(|name| text(name)).sum::<usize>();
+            total += jar
+                .class_entries
+                .iter()
+                .map(|(logical, physical)| text(logical) + text(physical) + NODE_OVERHEAD)
+                .sum::<usize>();
+            total += jar
+                .fact_strings
+                .iter()
+                .map(|value| {
+                    size_of::<Arc<str>>()
+                        + value.len()
+                        + 2 * size_of::<usize>()
+                        + ALLOCATION_OVERHEAD
+                })
+                .sum::<usize>();
+            total += jar
+                .class_facts
+                .iter()
+                .map(|facts| {
+                    size_of::<IndexedClassFacts>()
+                        + facts.parents.len() * size_of::<IndexedTypeParent>()
+                        + facts.references.len() * size_of::<IndexedReference>()
+                })
+                .sum::<usize>();
+            total += jar
+                .providers
+                .iter()
+                .map(|provider| {
+                    size_of::<IndexedProvider>()
+                        + provider.service.len()
+                        + provider.provider.as_deref().map_or(0, str::len)
+                        + provider.entry.len()
+                })
+                .sum::<usize>();
+        }
+        total += self.source_jars.len() * (size_of::<ArtifactKey>() + NODE_OVERHEAD);
+        total += self
+            .class_locations
+            .iter()
+            .map(|(name, jars)| text(name) + jars.len() * size_of::<usize>() + NODE_OVERHEAD)
+            .sum::<usize>();
+        total += self
+            .artifacts
+            .iter()
+            .map(|((group, artifact), versions)| {
+                text(group)
+                    + text(artifact)
+                    + versions
+                        .iter()
+                        .map(|version| text(version) + NODE_OVERHEAD)
+                        .sum::<usize>()
+                    + NODE_OVERHEAD
+            })
+            .sum::<usize>();
+        total as u64
     }
 
     pub fn search_classes(&self, query: &str, limit: Option<usize>) -> Vec<ClassLocation> {
@@ -1130,9 +1237,9 @@ impl MavenIndex {
             .into_iter()
             .filter(|jar| jar.classifier.as_deref() != Some("sources"))
         {
-            let mut archive = ZipArchive::new(File::open(&jar.path)?)?;
+            let mut archive = ClassArchive::open(&jar.path)?;
             for entry_path in jar.entries.iter().filter(|entry| is_text_resource(entry)) {
-                let mut entry = archive.by_name(entry_path)?;
+                let mut entry = archive.indexed_entry(entry_path)?;
                 let declared_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
                 if declared_size > self.max_source_bytes
                     || scanned_bytes.saturating_add(declared_size) > total_budget
@@ -1863,16 +1970,16 @@ pub fn validate_exact_coordinate(coordinate: &str) -> Result<()> {
     parse_exact_coordinate(coordinate).map(|_| ())
 }
 
-fn load_jar_record(root: &Path, path: &Path, max_entry_bytes: usize) -> Option<JarRecord> {
-    let Some((key, classifier)) = parse_coordinate(root, path) else {
-        tracing::debug!(path = %path.display(), "skipping jar outside Maven layout");
-        return None;
-    };
-    let relative_path = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+fn load_jar_record(
+    path: &Path,
+    identity: JarIdentity,
+    max_entry_bytes: usize,
+) -> Option<JarRecord> {
+    let JarIdentity {
+        key,
+        classifier,
+        relative_path,
+    } = identity;
     let JarIndex {
         classes,
         entries,
@@ -1924,7 +2031,304 @@ fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
     jar_paths
 }
 
-fn source_jar_path(binary_jar: &Path) -> Option<PathBuf> {
+fn repository_identity(root: &Path, path: &Path) -> Option<JarIdentity> {
+    let Some((key, classifier)) = parse_coordinate(root, path) else {
+        tracing::debug!(path = %path.display(), "skipping jar outside Maven layout");
+        return None;
+    };
+    Some(JarIdentity {
+        key,
+        classifier,
+        relative_path: relative_slash_path(root, path),
+    })
+}
+
+fn relative_slash_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn scoped_identity(
+    repository_root: Option<&Path>,
+    reactor: &ReactorLayout<'_>,
+    path: &Path,
+) -> Result<JarIdentity, UnindexedReason> {
+    if let Some(repository_root) = repository_root
+        && path.starts_with(repository_root)
+    {
+        return repository_identity(repository_root, path)
+            .ok_or(UnindexedReason::NotMavenRepositoryLayout);
+    }
+    let Some(module_directory) = reactor.output_module(path) else {
+        return Err(UnindexedReason::OutsideRepositoryAndReactor);
+    };
+    reactor_identity(reactor.root, module_directory, path)
+        .ok_or(UnindexedReason::UnresolvedReactorCoordinate)
+}
+
+/// The project root and its reactor module directories, as discovered from the POMs.
+#[derive(Debug, Clone, Copy)]
+pub struct ReactorLayout<'a> {
+    pub root: &'a Path,
+    pub modules: &'a [PathBuf],
+}
+
+impl ReactorLayout<'_> {
+    /// The innermost module whose `target` build directory contains `path`.
+    fn output_module(&self, path: &Path) -> Option<&Path> {
+        self.modules
+            .iter()
+            .filter(|module| {
+                module.starts_with(self.root) && path.starts_with(module.join("target"))
+            })
+            .max_by_key(|module| module.components().count())
+            .map(PathBuf::as_path)
+    }
+}
+
+/// A project index together with the selected classpath entries it could not include.
+#[derive(Debug)]
+pub struct ScopedIndex {
+    pub index: MavenIndex,
+    pub unindexed: Vec<UnindexedClasspathEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnindexedClasspathEntry {
+    pub path: PathBuf,
+    pub reason: UnindexedReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnindexedReason {
+    /// The selected file or directory does not exist.
+    Missing,
+    /// Below the local repository but not at an `group/artifact/version/file` location.
+    NotMavenRepositoryLayout,
+    /// Neither below the local repository nor below a reactor module build directory.
+    OutsideRepositoryAndReactor,
+    /// A reactor output whose module groupId, artifactId or version cannot be resolved.
+    UnresolvedReactorCoordinate,
+}
+
+impl UnindexedReason {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::NotMavenRepositoryLayout => "not in Maven repository layout",
+            Self::OutsideRepositoryAndReactor => {
+                "outside the local repository and the reactor build directories"
+            }
+            Self::UnresolvedReactorCoordinate => {
+                "reactor output without resolvable module coordinates"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ReactorPom {
+    group_id: Option<String>,
+    artifact_id: Option<String>,
+    version: Option<String>,
+    parent: Option<ReactorPomParent>,
+    #[serde(default)]
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ReactorPomParent {
+    group_id: Option<String>,
+    artifact_id: Option<String>,
+    version: Option<String>,
+    relative_path: Option<String>,
+}
+
+const MAX_REACTOR_PARENT_DEPTH: usize = 16;
+const MAX_INTERPOLATION_DEPTH: usize = 8;
+
+fn read_reactor_pom(path: &Path) -> Option<ReactorPom> {
+    let xml = crate::config::read_bounded_xml(path).ok()?;
+    quick_xml::de::from_str(&xml).ok()
+}
+
+/// Properties visible to a module POM: its own over those of its parents inside the reactor.
+fn inherited_properties(
+    reactor_root: &Path,
+    module_pom: &Path,
+    pom: &ReactorPom,
+) -> BTreeMap<String, String> {
+    let mut chain = Vec::new();
+    let mut current = module_pom.to_owned();
+    let mut parent = pom
+        .parent
+        .as_ref()
+        .map(|parent| parent.relative_path.clone());
+    while let Some(relative_path) = parent
+        && chain.len() < MAX_REACTOR_PARENT_DEPTH
+    {
+        let relative_path = relative_path.unwrap_or_else(|| "../pom.xml".to_owned());
+        if relative_path.trim().is_empty() {
+            break;
+        }
+        let Some(directory) = current.parent() else {
+            break;
+        };
+        let mut candidate = directory.join(relative_path.trim());
+        if candidate.is_dir() {
+            candidate.push("pom.xml");
+        }
+        let Ok(candidate) = candidate.canonicalize() else {
+            break;
+        };
+        if !candidate.starts_with(reactor_root) || candidate == current {
+            break;
+        }
+        let Some(parent_pom) = read_reactor_pom(&candidate) else {
+            break;
+        };
+        parent = parent_pom
+            .parent
+            .as_ref()
+            .map(|parent| parent.relative_path.clone());
+        chain.push(parent_pom.properties);
+        current = candidate;
+    }
+    let mut properties = BTreeMap::new();
+    for inherited in chain.into_iter().rev() {
+        properties.extend(inherited);
+    }
+    properties.extend(pom.properties.clone());
+    properties
+}
+
+/// `-Dname=value` user properties from `.mvn/maven.config`; they override POM properties.
+fn maven_config_properties(reactor_root: &Path) -> BTreeMap<String, String> {
+    let Ok(config) = fs::read_to_string(reactor_root.join(".mvn/maven.config")) else {
+        return BTreeMap::new();
+    };
+    let mut properties = BTreeMap::new();
+    let mut tokens = config.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let definition = match token {
+            "-D" | "--define" => tokens.next(),
+            _ => token
+                .strip_prefix("--define=")
+                .or_else(|| token.strip_prefix("-D")),
+        };
+        if let Some((name, value)) = definition.and_then(|definition| definition.split_once('=')) {
+            properties.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    properties
+}
+
+fn interpolate(value: &str, lookup: &BTreeMap<String, String>, depth: usize) -> Option<String> {
+    let mut resolved = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let end = rest[start..].find('}')? + start;
+        let name = &rest[start + 2..end];
+        if depth == 0 {
+            return None;
+        }
+        let replacement = interpolate(lookup.get(name)?, lookup, depth - 1)?;
+        resolved.push_str(&rest[..start]);
+        resolved.push_str(&replacement);
+        rest = &rest[end + 1..];
+    }
+    resolved.push_str(rest);
+    Some(resolved)
+}
+
+/// Resolves a module's coordinate the way Maven interpolates it for CI-friendly versions:
+/// inherited groupId/version, POM properties of the module and its in-reactor parents, and
+/// `.mvn/maven.config` user properties.
+fn reactor_module_coordinate(reactor_root: &Path, module_directory: &Path) -> Option<ArtifactKey> {
+    let module_pom = module_directory.join("pom.xml");
+    let pom = read_reactor_pom(&module_pom)?;
+    let parent = pom.parent.as_ref();
+    let raw_group = pom
+        .group_id
+        .clone()
+        .or_else(|| parent.and_then(|parent| parent.group_id.clone()))?;
+    let raw_version = pom
+        .version
+        .clone()
+        .or_else(|| parent.and_then(|parent| parent.version.clone()))?;
+    let raw_artifact = pom.artifact_id.clone()?;
+    let mut lookup = inherited_properties(reactor_root, &module_pom, &pom);
+    for (name, value) in [
+        ("groupId", &raw_group),
+        ("artifactId", &raw_artifact),
+        ("version", &raw_version),
+    ] {
+        for prefix in ["project", "pom"] {
+            lookup.insert(format!("{prefix}.{name}"), value.clone());
+        }
+    }
+    if let Some(parent) = parent {
+        for (name, value) in [
+            ("groupId", &parent.group_id),
+            ("artifactId", &parent.artifact_id),
+            ("version", &parent.version),
+        ] {
+            if let Some(value) = value {
+                lookup.insert(format!("project.parent.{name}"), value.clone());
+                lookup.insert(format!("parent.{name}"), value.clone());
+            }
+        }
+    }
+    lookup.extend(maven_config_properties(reactor_root));
+    let resolve = |value: &str| {
+        interpolate(value.trim(), &lookup, MAX_INTERPOLATION_DEPTH)
+            .filter(|value| !value.is_empty() && !value.contains("${"))
+    };
+    Some(ArtifactKey {
+        group_id: resolve(&raw_group)?,
+        artifact_id: resolve(&raw_artifact)?,
+        version: resolve(&raw_version)?,
+    })
+}
+
+/// Classifiers recognized at the end of a custom `finalName` archive.
+const OUTPUT_CLASSIFIER_SUFFIXES: [&str; 3] = ["test-sources", "sources", "tests"];
+
+/// Identifies a reactor module output: a JAR (conventionally or `finalName`-named) or a
+/// class directory below the module build directory. `test-classes` maps to `tests`.
+fn reactor_identity(
+    reactor_root: &Path,
+    module_directory: &Path,
+    path: &Path,
+) -> Option<JarIdentity> {
+    let key = reactor_module_coordinate(reactor_root, module_directory)?;
+    let file_name = path.file_name()?.to_str()?;
+    let classifier = if path.is_dir() {
+        (file_name == "test-classes").then(|| "tests".to_owned())
+    } else {
+        let stem = file_name.strip_suffix(".jar").filter(|_| path.is_file())?;
+        let conventional = format!("{}-{}", key.artifact_id, key.version);
+        match stem.strip_prefix(&conventional) {
+            Some("") => None,
+            Some(suffix) if suffix.starts_with('-') => Some(suffix[1..].to_owned()),
+            _ => OUTPUT_CLASSIFIER_SUFFIXES
+                .iter()
+                .find(|classifier| stem.ends_with(&format!("-{classifier}")))
+                .map(|classifier| (*classifier).to_owned()),
+        }
+    };
+    Some(JarIdentity {
+        key,
+        classifier,
+        relative_path: relative_slash_path(reactor_root, path),
+    })
+}
+
+pub(crate) fn source_jar_path(binary_jar: &Path) -> Option<PathBuf> {
     let file_name = binary_jar.file_name()?.to_str()?;
     if file_name.ends_with("-sources.jar") {
         return None;
@@ -1939,17 +2343,14 @@ fn collect_jar_facts(
     class_entries: &BTreeMap<String, String>,
     max_entry_bytes: usize,
 ) -> (Vec<IndexedClassFacts>, Vec<IndexedProvider>, Vec<Arc<str>>) {
-    let Ok(file) = File::open(path) else {
-        return (Vec::new(), Vec::new(), Vec::new());
-    };
-    let Ok(mut archive) = ZipArchive::new(file) else {
+    let Ok(mut archive) = ClassArchive::open(path) else {
         return (Vec::new(), Vec::new(), Vec::new());
     };
     let mut class_facts = Vec::new();
     let mut providers = BTreeSet::new();
     let mut strings = FactStringPool::default();
     for entry_path in class_entries.values() {
-        let Ok(mut entry) = archive.by_name(entry_path) else {
+        let Ok(Some(mut entry)) = archive.by_name(entry_path) else {
             continue;
         };
         if entry.size() > max_entry_bytes as u64 {
@@ -2007,7 +2408,7 @@ fn collect_jar_facts(
         }
     }
     for entry_path in entries.iter().filter(|entry| is_provider_descriptor(entry)) {
-        let Ok(mut entry) = archive.by_name(entry_path) else {
+        let Ok(Some(mut entry)) = archive.by_name(entry_path) else {
             continue;
         };
         if entry.size() > max_entry_bytes as u64 {
@@ -2458,6 +2859,163 @@ fn preflight_archive(path: &Path, budget: &mut ArchiveBudget) -> Result<()> {
     Ok(())
 }
 
+/// A class archive: a JAR or a reactor output directory such as `target/classes`. Entry
+/// names always use `/` and are relative to the archive root.
+enum ClassArchive {
+    Zip(ZipArchive<File>),
+    Directory(PathBuf),
+}
+
+enum ArchiveEntry<'a> {
+    Zip(zip::read::ZipFile<'a, File>),
+    File { file: File, size: u64 },
+}
+
+impl ArchiveEntry<'_> {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Zip(entry) => entry.size(),
+            Self::File { size, .. } => *size,
+        }
+    }
+}
+
+impl Read for ArchiveEntry<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Zip(entry) => entry.read(buffer),
+            Self::File { file, .. } => file.read(buffer),
+        }
+    }
+}
+
+impl ClassArchive {
+    fn open(path: &Path) -> Result<Self> {
+        if path.is_dir() {
+            let root = path
+                .canonicalize()
+                .with_context(|| format!("cannot open class directory {}", path.display()))?;
+            return Ok(Self::Directory(root));
+        }
+        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let archive = ZipArchive::new(file)
+            .with_context(|| format!("invalid ZIP/JAR: {}", path.display()))?;
+        Ok(Self::Zip(archive))
+    }
+
+    /// Sorted names of the regular files in the archive. Directories and, for class
+    /// directories, symbolic links are not entries.
+    fn file_names(&mut self) -> Result<Vec<String>> {
+        let mut names = match self {
+            Self::Zip(archive) => {
+                let mut names = Vec::with_capacity(archive.len());
+                for index in 0..archive.len() {
+                    let entry = archive.by_index_raw(index)?;
+                    if entry.is_dir() {
+                        continue;
+                    }
+                    let name = entry.name().context("cannot decode JAR entry name")?;
+                    names.push(name.replace('\\', "/"));
+                }
+                names
+            }
+            Self::Directory(root) => directory_file_names(root)?,
+        };
+        names.sort();
+        Ok(names)
+    }
+
+    /// Opens a regular file entry; `None` when the archive has no such file.
+    fn by_name(&mut self, name: &str) -> Result<Option<ArchiveEntry<'_>>> {
+        match self {
+            Self::Zip(archive) => match archive.by_name(name) {
+                Ok(entry) if entry.is_dir() => Ok(None),
+                Ok(entry) => Ok(Some(ArchiveEntry::Zip(entry))),
+                Err(zip::result::ZipError::FileNotFound) => Ok(None),
+                Err(error) => Err(error.into()),
+            },
+            Self::Directory(root) => {
+                let Some(path) = directory_entry_path(root, name) else {
+                    return Ok(None);
+                };
+                let file = File::open(&path)
+                    .with_context(|| format!("cannot open class directory entry {name}"))?;
+                let size = file.metadata()?.len();
+                Ok(Some(ArchiveEntry::File { file, size }))
+            }
+        }
+    }
+
+    /// Opens an entry the index recorded; its absence means the archive changed.
+    fn indexed_entry(&mut self, name: &str) -> Result<ArchiveEntry<'_>> {
+        self.by_name(name)?
+            .with_context(|| format!("indexed entry {name} is no longer present"))
+    }
+}
+
+fn directory_file_names(root: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
+        let entry = entry.context("cannot read class directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .context("class directory entry escaped its root")?;
+        let name = relative
+            .to_str()
+            .context("cannot decode class directory entry name")?;
+        names.push(name.replace('\\', "/"));
+    }
+    Ok(names)
+}
+
+/// Resolves an entry name inside a class directory without leaving it: every component must
+/// be a plain name, and the resolved file must still be a regular file below the root.
+fn directory_entry_path(root: &Path, name: &str) -> Option<PathBuf> {
+    let relative = Path::new(name);
+    if name.is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    canonical.starts_with(root).then_some(canonical)
+}
+
+/// Applies the archive budget to a class directory before its names are collected.
+fn preflight_directory(path: &Path, budget: &mut ArchiveBudget) -> Result<()> {
+    let mut entries = 0usize;
+    for entry in WalkDir::new(path).follow_links(false).min_depth(1) {
+        let entry = entry.context("cannot read class directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        entries += 1;
+        if entries > budget.jar_entries {
+            return Err(ArchiveLimit("MAX_JAR_ENTRIES").into());
+        }
+        let name_bytes = entry
+            .path()
+            .strip_prefix(path)
+            .map_or(0, |relative| relative.as_os_str().len());
+        if name_bytes > crate::config::MAX_ENTRY_NAME_BYTES {
+            return Err(ArchiveLimit("MAX_ENTRY_NAME_BYTES").into());
+        }
+        budget.reserve(name_bytes)?;
+    }
+    Ok(())
+}
+
 struct JarIndex {
     classes: Vec<String>,
     entries: Vec<String>,
@@ -2465,19 +3023,8 @@ struct JarIndex {
 }
 
 fn read_jar_index(path: &Path) -> Result<JarIndex> {
-    let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let mut archive =
-        ZipArchive::new(file).with_context(|| format!("invalid ZIP/JAR: {}", path.display()))?;
-    let mut entries = Vec::with_capacity(archive.len());
-    for index in 0..archive.len() {
-        let entry = archive.by_index_raw(index)?;
-        if entry.is_dir() {
-            continue;
-        }
-        let name = entry.name().context("cannot decode JAR entry name")?;
-        entries.push(name.replace('\\', "/"));
-    }
-    entries.sort();
+    let mut archive = ClassArchive::open(path)?;
+    let entries = archive.file_names()?;
     let multi_release = read_multi_release_flag(&mut archive, &entries);
     let class_entries = effective_class_entries(&entries, multi_release);
     let classes = class_entries
@@ -2493,14 +3040,14 @@ fn read_jar_index(path: &Path) -> Result<JarIndex> {
     })
 }
 
-fn read_multi_release_flag(archive: &mut ZipArchive<File>, entries: &[String]) -> bool {
+fn read_multi_release_flag(archive: &mut ClassArchive, entries: &[String]) -> bool {
     let Some(manifest_path) = entries
         .iter()
         .find(|entry| entry.eq_ignore_ascii_case("META-INF/MANIFEST.MF"))
     else {
         return false;
     };
-    let Ok(entry) = archive.by_name(manifest_path) else {
+    let Ok(Some(entry)) = archive.by_name(manifest_path) else {
         return false;
     };
     let mut bytes = Vec::new();
@@ -2611,18 +3158,15 @@ fn read_jar_entry(
     entry_path: &str,
     max_bytes: usize,
 ) -> Result<Option<BoundedEntryContent>> {
-    let file =
-        File::open(path).with_context(|| format!("cannot open indexed JAR {}", path.display()))?;
-    let mut archive = ZipArchive::new(file)
-        .with_context(|| format!("indexed JAR is no longer a valid ZIP: {}", path.display()))?;
-    let mut entry = match archive.by_name(entry_path) {
-        Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if entry.is_dir() {
+    let mut archive = ClassArchive::open(path).with_context(|| {
+        format!(
+            "indexed JAR is no longer a valid ZIP or class directory: {}",
+            path.display()
+        )
+    })?;
+    let Some(mut entry) = archive.by_name(entry_path)? else {
         return Ok(None);
-    }
+    };
 
     let original_size = entry.size();
     let mut bytes = Vec::with_capacity(
@@ -2681,10 +3225,10 @@ fn declaration_candidates(
             descriptor: None,
         }]);
     };
-    let mut archive = ZipArchive::new(File::open(&jar.path)?)?;
+    let mut archive = ClassArchive::open(&jar.path)?;
     let entry_path = select_class_entry(jar, class_name)
         .with_context(|| format!("indexed class entry is missing for {class_name}"))?;
-    let mut entry = archive.by_name(entry_path)?;
+    let mut entry = archive.indexed_entry(entry_path)?;
     if entry.size() > max_bytes as u64 {
         bail!("class entry exceeds configured MAX_SOURCE_BYTES limit");
     }
@@ -2840,10 +3384,10 @@ fn read_class_description(
     max_bytes: usize,
     public_only: bool,
 ) -> Result<ClassDescription> {
-    let mut archive = ZipArchive::new(File::open(&jar.path)?)?;
+    let mut archive = ClassArchive::open(&jar.path)?;
     let entry_path = select_class_entry(jar, class_name)
         .with_context(|| format!("indexed class entry is missing for {class_name}"))?;
-    let mut entry = archive.by_name(entry_path)?;
+    let mut entry = archive.indexed_entry(entry_path)?;
     if entry.size() > max_bytes as u64 {
         bail!("class entry exceeds configured MAX_SOURCE_BYTES limit");
     }

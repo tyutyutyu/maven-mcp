@@ -2129,3 +2129,321 @@ fn flagged_jar_without_base_entry_uses_highest_versioned_entry() {
             .is_empty()
     );
 }
+
+fn write_module_pom(directory: &Path, artifact_id: &str, version: &str) {
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join("pom.xml"),
+        format!(
+            "<project><parent><groupId>org.reactor</groupId><artifactId>parent</artifactId><version>{version}</version></parent><artifactId>{artifact_id}</artifactId></project>"
+        ),
+    )
+    .unwrap();
+}
+
+fn write_class_directory(directory: &Path, entries: &[(&str, &[u8])]) {
+    for (name, content) in entries {
+        let path = directory.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+}
+
+fn build_reactor_index(
+    repository: Option<&Path>,
+    root: &Path,
+    modules: &[&str],
+    classpath: &[PathBuf],
+) -> ScopedIndex {
+    let root = root.canonicalize().unwrap();
+    let modules = modules
+        .iter()
+        .map(|module| root.join(module).canonicalize().unwrap())
+        .collect::<Vec<_>>();
+    MavenIndex::build_scoped(
+        repository,
+        &ReactorLayout {
+            root: &root,
+            modules: &modules,
+        },
+        classpath,
+        50,
+        1024,
+    )
+    .unwrap()
+}
+
+fn unindexed_reasons(scoped: &ScopedIndex) -> Vec<(String, UnindexedReason)> {
+    scoped
+        .unindexed
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                entry.reason,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn scoped_index_contains_only_classpath_repository_and_reactor_outputs() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><groupId>org.reactor</groupId><artifactId>parent</artifactId><version>3.0</version></project>",
+    )
+    .unwrap();
+    let repository = project.path().join("repo");
+    let selected = repository.join("org/libs/selected/1.0/selected-1.0.jar");
+    let other_version = repository.join("org/libs/selected/2.0/selected-2.0.jar");
+    let unrelated = repository.join("org/libs/unrelated/1.0/unrelated-1.0.jar");
+    write_jar(&selected, &[("org/libs/Selected.class", b"x")]);
+    write_jar(&other_version, &[("org/libs/Selected.class", b"x")]);
+    write_jar(&unrelated, &[("org/libs/Unrelated.class", b"x")]);
+    write_jar(
+        &repository.join("org/libs/selected/1.0/selected-1.0-sources.jar"),
+        &[(
+            "org/libs/Selected.java",
+            b"package org.libs; class Selected {}",
+        )],
+    );
+    let module = project.path().join("core");
+    write_module_pom(&module, "core", "3.0");
+    let reactor_jar = module.join("target/core-3.0.jar");
+    write_jar(&reactor_jar, &[("org/reactor/Core.class", b"x")]);
+    write_jar(
+        &module.join("target/core-3.0-sources.jar"),
+        &[(
+            "org/reactor/Core.java",
+            b"package org.reactor; class Core {}",
+        )],
+    );
+    // A custom finalName archive is still the module's output.
+    let final_name = module.join("target/app.jar");
+    write_jar(&final_name, &[("org/reactor/Renamed.class", b"x")]);
+    // A compiled but unpackaged module contributes its class directory.
+    let api = project.path().join("api");
+    write_module_pom(&api, "api", "3.0");
+    let api_classes = api.join("target/classes");
+    write_class_directory(
+        &api_classes,
+        &[
+            ("org/reactor/Api.class", b"x"),
+            (
+                "META-INF/services/org.reactor.Spi",
+                b"org.reactor.ApiProvider\n",
+            ),
+        ],
+    );
+    let outside = TempDir::new().unwrap();
+    let foreign = outside.path().join("foreign/foreign/1.0/foreign-1.0.jar");
+    write_jar(&foreign, &[("org/foreign/Foreign.class", b"x")]);
+    // A JAR in the project but outside every module build directory is not an output.
+    let library = project.path().join("lib/system.jar");
+    write_jar(&library, &[("org/system/System.class", b"x")]);
+
+    let classpath = [
+        selected,
+        reactor_jar,
+        final_name,
+        api_classes,
+        module.join("target/missing.jar"),
+        library,
+        foreign,
+    ]
+    .map(|path| path.canonicalize().unwrap_or(path));
+    let repository = repository.canonicalize().unwrap();
+    let scoped = build_reactor_index(
+        Some(&repository),
+        project.path(),
+        &[".", "core", "api"],
+        &classpath,
+    );
+
+    assert_eq!(
+        unindexed_reasons(&scoped),
+        vec![
+            ("missing.jar".to_owned(), UnindexedReason::Missing),
+            (
+                "system.jar".to_owned(),
+                UnindexedReason::OutsideRepositoryAndReactor
+            ),
+            (
+                "foreign-1.0.jar".to_owned(),
+                UnindexedReason::OutsideRepositoryAndReactor
+            ),
+        ]
+    );
+    let index = scoped.index;
+    let stats = index.stats();
+    assert_eq!((stats.jar_count, stats.source_jar_count), (4, 2));
+    for (query, expected) in [
+        ("Selected", 1),
+        ("Core", 1),
+        ("Renamed", 1),
+        ("org.reactor.Api", 1),
+        ("Unrelated", 0),
+        ("Foreign", 0),
+        ("org.system", 0),
+    ] {
+        assert_eq!(index.search_classes(query, None).len(), expected, "{query}");
+    }
+    assert_eq!(
+        index.artifact_versions("selected", Some("org.libs"))["org.libs:selected"],
+        vec!["1.0".to_owned()]
+    );
+    let core = index
+        .search_jars("core", None)
+        .into_iter()
+        .find(|jar| jar.path == "core/target/core-3.0.jar")
+        .expect("the reactor JAR is indexed under its module coordinate");
+    assert_eq!(core.coordinate, "org.reactor:core:3.0");
+    assert!(
+        index.search_jars("core", None).iter().any(
+            |jar| jar.path == "core/target/app.jar" && jar.coordinate == "org.reactor:core:3.0"
+        )
+    );
+    assert_eq!(
+        index
+            .class_source("org.reactor.Core", None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let classes = index
+        .search_jars("api", None)
+        .into_iter()
+        .find(|jar| jar.path == "api/target/classes")
+        .expect("the class directory is indexed as a reactor output");
+    assert_eq!(classes.coordinate, "org.reactor:api:3.0");
+    let entry = index
+        .jar_entry("api/target/classes", "org/reactor/Api.class")
+        .unwrap();
+    assert_eq!(entry[0].text.as_deref(), Some("x"));
+    for escape in [
+        "../pom.xml",
+        "../../pom.xml",
+        "/etc/passwd",
+        "org/../../pom.xml",
+    ] {
+        assert!(
+            index
+                .jar_entry("api/target/classes", escape)
+                .unwrap()
+                .is_empty(),
+            "{escape}"
+        );
+    }
+    let providers = index
+        .search_jar_content("ApiProvider", Some("api/target/classes"), None)
+        .unwrap();
+    assert_eq!(providers.results.len(), 1);
+}
+
+#[test]
+fn reactor_coordinates_resolve_ci_friendly_versions_and_class_directories() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><groupId>org.reactor</groupId><artifactId>parent</artifactId><version>${revision}</version><properties><revision>4.1</revision><suffix>-x</suffix></properties></project>",
+    )
+    .unwrap();
+    let service = project.path().join("svc");
+    write_module_pom(&service, "svc", "${revision}");
+    let test_classes = service.join("target/test-classes");
+    write_class_directory(&test_classes, &[("org/reactor/SvcTest.class", b"x")]);
+    let unresolved = project.path().join("broken");
+    write_module_pom(&unresolved, "broken", "${undefined}");
+    let broken_jar = unresolved.join("target/broken.jar");
+    write_jar(&broken_jar, &[("org/reactor/Broken.class", b"x")]);
+
+    let scoped = build_reactor_index(
+        None,
+        project.path(),
+        &[".", "svc", "broken"],
+        &[test_classes.clone(), broken_jar.clone()],
+    );
+    assert_eq!(
+        unindexed_reasons(&scoped),
+        vec![(
+            "broken.jar".to_owned(),
+            UnindexedReason::UnresolvedReactorCoordinate
+        )]
+    );
+    assert_eq!(
+        scoped.index.search_jars("svc", None)[0].coordinate,
+        "org.reactor:svc:4.1:tests"
+    );
+
+    // `.mvn/maven.config` user properties override POM properties, as on the command line.
+    std::fs::create_dir_all(project.path().join(".mvn")).unwrap();
+    std::fs::write(
+        project.path().join(".mvn/maven.config"),
+        "-B -Drevision=5.0${suffix}\n--define undefined=1\n",
+    )
+    .unwrap();
+    let scoped = build_reactor_index(
+        None,
+        project.path(),
+        &[".", "svc", "broken"],
+        &[test_classes, broken_jar],
+    );
+    assert!(scoped.unindexed.is_empty());
+    let mut coordinates = scoped
+        .index
+        .search_jars("org.reactor", None)
+        .into_iter()
+        .map(|jar| jar.coordinate)
+        .collect::<Vec<_>>();
+    coordinates.sort();
+    assert_eq!(
+        coordinates,
+        ["org.reactor:broken:1", "org.reactor:svc:5.0-x:tests"]
+    );
+}
+
+#[test]
+fn scoped_index_without_a_repository_indexes_reactor_outputs_only() {
+    let project = TempDir::new().unwrap();
+    let module = project.path().join("api");
+    write_module_pom(&module, "api", "1.5");
+    let jar = module.join("target/api-1.5-tests.jar");
+    write_jar(&jar, &[("org/reactor/ApiTest.class", b"x")]);
+
+    let scoped = build_reactor_index(None, project.path(), &[".", "api"], &[jar]);
+
+    assert!(scoped.unindexed.is_empty());
+    assert_eq!(scoped.index.stats().jar_count, 1);
+    assert_eq!(
+        scoped.index.search_jars("api", None)[0].coordinate,
+        "org.reactor:api:1.5:tests"
+    );
+}
+
+#[test]
+fn estimated_index_bytes_grow_with_indexed_content() {
+    let empty = TempDir::new().unwrap();
+    let (_root, small) = fixture();
+    let (many_root, _) = fixture();
+    for number in 0..20 {
+        write_jar(
+            &many_root
+                .path()
+                .join(format!("org/example/lib{number}/1.0/lib{number}-1.0.jar")),
+            &[("org/example/Extra.class", b"bytecode")],
+        );
+    }
+    let many = build_index(&many_root, 50, 1024);
+
+    let empty = build_index(&empty, 50, 1024).estimated_bytes();
+    assert!(empty > 0);
+    assert!(small.estimated_bytes() > empty);
+    assert!(many.estimated_bytes() > small.estimated_bytes());
+}
