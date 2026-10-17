@@ -634,6 +634,76 @@ fn write_jar(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
     Ok(())
 }
 
+/// Wrapper whose `dependency:build-classpath` output and timing are driven by marker files in
+/// the project: `classpath.txt` (the printed classpath), `fail-classpath` (fail the run), `gate`
+/// (block until removed) and `slow` (sleep). Every classpath run appends a line to
+/// `classpath-runs` and creates `classpath-started`.
+#[allow(dead_code)]
+pub const CONTROLLED_WRAPPER: &str = r#"#!/bin/sh
+case " $* " in
+  *" dependency:build-classpath "*)
+    echo run >> "$PWD/classpath-runs"
+    if [ -f "$PWD/fail-classpath" ]; then
+      printf '%s\n' '[ERROR] classpath resolution failed on purpose' >&2
+      exit 1
+    fi
+    classpath=$(cat "$PWD/classpath.txt")
+    : > "$PWD/classpath-started"
+    while [ -f "$PWD/gate" ]; do sleep 0.05; done
+    if [ -f "$PWD/slow" ]; then sleep 0.5; fi
+    printf '%s\n' 'Dependencies classpath:' "$classpath"
+    ;;
+  *) printf '%s\n' '[INFO] BUILD SUCCESS' ;;
+esac
+"#;
+
+#[allow(dead_code)]
+pub fn install_controlled_wrapper(project: &Path, classpath: &[PathBuf]) -> Result<()> {
+    write_executable(&project.join("mvnw"), CONTROLLED_WRAPPER)?;
+    set_controlled_classpath(project, classpath)
+}
+
+#[allow(dead_code)]
+pub fn set_controlled_classpath(project: &Path, classpath: &[PathBuf]) -> Result<()> {
+    let classpath = classpath
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    std::fs::write(project.join("classpath.txt"), classpath)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn controlled_classpath_runs(project: &Path) -> usize {
+    std::fs::read_to_string(project.join("classpath-runs")).map_or(0, |runs| runs.lines().count())
+}
+
+/// Writes a JAR with one public empty class per name (`org/example/Name`).
+#[allow(dead_code)]
+pub fn write_class_jar(path: &Path, class_names: &[String]) -> Result<()> {
+    let classes = class_names
+        .iter()
+        .map(|name| (format!("{name}.class"), minimal_class(name)))
+        .collect::<Vec<_>>();
+    let entries = classes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    write_jar(path, &entries)
+}
+
+/// Writes one public empty class file per name (`org/example/Name`) below a class directory.
+#[allow(dead_code)]
+pub fn write_class_directory(directory: &Path, class_names: &[String]) -> Result<()> {
+    for name in class_names {
+        let path = directory.join(format!("{name}.class"));
+        std::fs::create_dir_all(path.parent().context("class file has a parent")?)?;
+        std::fs::write(path, minimal_class(name))?;
+    }
+    Ok(())
+}
+
 /// A project whose classpath holds `org.slf4j:slf4j-api:2.0.9` followed by an
 /// unrelated `org.example:unrelated:1.0` without a sources JAR, next to a control
 /// `slf4j-api:9.9` in the same local repository but outside the classpath.

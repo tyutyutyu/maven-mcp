@@ -1,6 +1,9 @@
 mod support;
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use rmcp::model::CallToolRequestParams;
@@ -1912,6 +1915,793 @@ async fn classfile_tools_agree_on_the_effective_multi_release_variant() -> Resul
     )
     .await?;
     assert_eq!(count(&version_only), 0);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+async fn call(client: &Client, tool: &str, value: Value) -> Result<Value> {
+    Ok(structured(
+        client
+            .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments(value)))
+            .await?,
+    ))
+}
+
+async fn call_error(client: &Client, tool: &str, value: Value) -> String {
+    client
+        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments(value)))
+        .await
+        .expect_err("the tool call must fail")
+        .to_string()
+}
+
+async fn class_names(client: &Client, project: &Path, query: &str) -> Result<BTreeSet<String>> {
+    let found = call(
+        client,
+        "search_classes",
+        json!({ "project_path": project.display().to_string(), "query": query }),
+    )
+    .await?;
+    Ok(found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["class_name"].as_str().unwrap().to_owned())
+        .collect())
+}
+
+fn names(values: &[&str]) -> BTreeSet<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn repository_jar(project: &Path, artifact: &str) -> PathBuf {
+    project.join(format!(
+        "execution-repository/org/t/{artifact}/1.0/{artifact}-1.0.jar"
+    ))
+}
+
+fn class_list(classes: &[&str]) -> Vec<String> {
+    classes.iter().map(|name| (*name).to_owned()).collect()
+}
+
+fn runtime_status(runtime_dir: &Path, pid: u32) -> Result<Value> {
+    Ok(serde_json::from_slice(&std::fs::read(
+        runtime_dir.join(format!("{pid}.json")),
+    )?)?)
+}
+
+/// A project driven by [`support::CONTROLLED_WRAPPER`] whose classpath holds `alpha`.
+async fn controlled_project() -> Result<(TestServer, PathBuf)> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().unwrap().to_owned();
+    support::write_class_jar(
+        &repository_jar(&project, "alpha"),
+        &class_list(&["org/t/AlphaOne"]),
+    )?;
+    support::write_class_jar(
+        &repository_jar(&project, "beta"),
+        &class_list(&["org/t/BetaOne"]),
+    )?;
+    support::install_controlled_wrapper(&project, &[repository_jar(&project, "alpha")])?;
+    Ok((server, project))
+}
+
+/// Extra trusted projects whose classpath is the shared execution repository's `alpha` JAR.
+fn extra_projects(server: &TestServer, count: usize) -> Result<Vec<PathBuf>> {
+    let first = server.project_path().unwrap();
+    support::write_class_jar(
+        &repository_jar(first, "alpha"),
+        &class_list(&["org/t/AlphaOne"]),
+    )?;
+    let mut projects = vec![first.to_owned()];
+    for number in 1..count {
+        projects.push(server.add_trusted_project(&format!("p{number}"))?);
+    }
+    for project in &projects {
+        support::install_controlled_wrapper(project, &[repository_jar(first, "alpha")])?;
+    }
+    Ok(projects)
+}
+
+const LONG_MAVEN: &[(&str, &str)] = &[("MAVEN_TIMEOUT_SECONDS", "30")];
+
+#[tokio::test]
+async fn scoped_index_is_reused_until_a_relevant_file_or_maven_run_changes_it() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 1, "reuse");
+
+    // A changed classpath JAR is detected without any Maven execution.
+    support::write_class_jar(
+        &repository_jar(&project, "alpha"),
+        &class_list(&["org/t/AlphaOne", "org/t/AlphaTwo"]),
+    )?;
+    assert_eq!(
+        class_names(&client, &project, "Alpha").await?,
+        names(&["org.t.AlphaOne", "org.t.AlphaTwo"])
+    );
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        2,
+        "JAR change"
+    );
+
+    // A POM edit invalidates the index and re-reads the model.
+    let pom = project.join("pom.xml");
+    let edited = std::fs::read_to_string(&pom)?.replace("</project>", "<!-- edit --></project>");
+    std::fs::write(&pom, edited)?;
+    class_names(&client, &project, "Alpha").await?;
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        3,
+        "POM change"
+    );
+
+    // So does a wrapper change, and the new classpath is what gets indexed.
+    support::set_controlled_classpath(
+        &project,
+        &[
+            repository_jar(&project, "alpha"),
+            repository_jar(&project, "beta"),
+        ],
+    )?;
+    let wrapper = project.join("mvnw");
+    let script = std::fs::read_to_string(&wrapper)?;
+    std::fs::write(&wrapper, format!("{script}# edited wrapper\n"))?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne", "org.t.BetaOne"])
+    );
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        4,
+        "wrapper change"
+    );
+
+    // Files Maven itself rewrites never change a stamp we track, so run_maven is explicit.
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "beta")])?;
+    assert_eq!(class_names(&client, &project, "One").await?.len(), 2);
+    assert_eq!(support::controlled_classpath_runs(&project), 4);
+    call(
+        &client,
+        "run_maven",
+        json!({ "project_path": project.display().to_string(), "arguments": ["-v"] }),
+    )
+    .await?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.BetaOne"])
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 5, "run_maven");
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pom_reactor_changes_reach_the_next_inspection_with_and_without_run_maven() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let client = server.connect().await?;
+    let inspect = || {
+        call(
+            &client,
+            "inspect_maven_project",
+            json!({ "project_path": project.display().to_string() }),
+        )
+    };
+    let modules = |inspected: &Value| -> Vec<String> {
+        inspected["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|module| module["selector"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(modules(&inspect().await?).is_empty());
+
+    let add_module = |name: &str, existing: &str| -> Result<()> {
+        std::fs::create_dir_all(project.join(name))?;
+        std::fs::write(
+            project.join(name).join("pom.xml"),
+            format!("<project><artifactId>{name}</artifactId></project>"),
+        )?;
+        std::fs::write(
+            project.join("pom.xml"),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>pom</packaging><modules>{existing}<module>{name}</module></modules></project>"
+            ),
+        )?;
+        Ok(())
+    };
+    add_module("first", "")?;
+    call(
+        &client,
+        "run_maven",
+        json!({ "project_path": project.display().to_string(), "arguments": ["-v"] }),
+    )
+    .await?;
+    assert_eq!(modules(&inspect().await?), ["first"]);
+
+    // A further edit is picked up on its own, without any Maven run.
+    add_module("second", "<module>first</module>")?;
+    assert_eq!(modules(&inspect().await?), ["first", "second"]);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_cold_requests_share_one_build_and_one_failure() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    std::fs::write(project.join("slow"), "")?;
+
+    let (first, second, third, fourth) = tokio::join!(
+        class_names(&client, &project, "One"),
+        class_names(&client, &project, "One"),
+        class_names(&client, &project, "alpha"),
+        class_names(&client, &project, "One"),
+    );
+    for found in [first?, second?, fourth?] {
+        assert_eq!(found, names(&["org.t.AlphaOne"]));
+    }
+    assert_eq!(third?, names(&["org.t.AlphaOne"]));
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+
+    // A failing build is shared by every waiter and does not poison the retry.
+    call(
+        &client,
+        "run_maven",
+        json!({ "project_path": project.display().to_string(), "arguments": ["-v"] }),
+    )
+    .await?;
+    std::fs::write(project.join("fail-classpath"), "")?;
+    let project_path = project.display().to_string();
+    let failures = tokio::join!(
+        call_error(
+            &client,
+            "search_classes",
+            json!({ "project_path": project_path, "query": "One" })
+        ),
+        call_error(
+            &client,
+            "search_classes",
+            json!({ "project_path": project_path, "query": "One" })
+        ),
+        call_error(
+            &client,
+            "search_classes",
+            json!({ "project_path": project_path, "query": "One" })
+        ),
+    );
+    for message in [&failures.0, &failures.1, &failures.2] {
+        assert!(
+            message.contains("classpath resolution failed on purpose"),
+            "{message}"
+        );
+    }
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    std::fs::remove_file(project.join("fail-classpath"))?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 3);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+async fn invalidate_while_building(trigger_with_request: bool) -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    std::fs::write(project.join("gate"), "")?;
+
+    let building = async { class_names(&client, &project, "BetaOne").await };
+    let changing = async {
+        let started = project.join("classpath-started");
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(started.exists(), "the first Maven build never started");
+        support::set_controlled_classpath(
+            &project,
+            &[
+                repository_jar(&project, "alpha"),
+                repository_jar(&project, "beta"),
+            ],
+        )?;
+        let pom = project.join("pom.xml");
+        let edited =
+            std::fs::read_to_string(&pom)?.replace("</project>", "<!-- edit --></project>");
+        std::fs::write(&pom, edited)?;
+        if trigger_with_request {
+            call(
+                &client,
+                "inspect_maven_project",
+                json!({ "project_path": project.display().to_string() }),
+            )
+            .await?;
+        }
+        std::fs::remove_file(project.join("gate"))?;
+        anyhow::Ok(())
+    };
+    let (found, changed) = tokio::join!(building, changing);
+    changed?;
+
+    // The build that started before the edit saw only `alpha`; it must not be published or
+    // returned, so the request completes from the second, fresh build.
+    assert_eq!(found?, names(&["org.t.BetaOne"]));
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne", "org.t.BetaOne"])
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalidation_during_a_build_discards_the_stale_index() -> Result<()> {
+    invalidate_while_building(true).await
+}
+
+#[tokio::test]
+async fn project_files_changing_during_a_build_prevent_stale_publication() -> Result<()> {
+    invalidate_while_building(false).await
+}
+
+#[tokio::test]
+async fn incomplete_classpath_output_is_an_error_and_never_cached_as_complete() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    let project_path = project.display().to_string();
+    std::fs::write(project.join("classpath.txt"), "relative/alpha-1.0.jar")?;
+
+    let message = call_error(
+        &client,
+        "search_classes",
+        json!({ "project_path": project_path, "query": "One" }),
+    )
+    .await;
+    assert!(message.contains("truncated or malformed"), "{message}");
+    let message = call_error(
+        &client,
+        "index_stats",
+        json!({ "project_path": project_path }),
+    )
+    .await;
+    assert!(message.contains("truncated or malformed"), "{message}");
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        2,
+        "nothing was cached"
+    );
+
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha")])?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Turns the controlled project into a CI-friendly reactor: the root POM declares
+/// `${revision}` and the modules `core` and `api`, which inherit it.
+fn write_revision_reactor(project: &Path) -> Result<()> {
+    std::fs::write(
+        project.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>${revision}</version><packaging>pom</packaging><properties><revision>1.0</revision></properties><modules><module>core</module><module>api</module></modules></project>",
+    )?;
+    for module in ["core", "api"] {
+        std::fs::create_dir_all(project.join(module))?;
+        std::fs::write(
+            project.join(module).join("pom.xml"),
+            format!(
+                "<project><parent><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>${{revision}}</version></parent><artifactId>{module}</artifactId></project>"
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reactor_outputs_are_indexed_and_unselected_artifacts_are_not() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    write_revision_reactor(&project)?;
+    let reactor_jar = project.join("core/target/core-1.0.jar");
+    support::write_class_jar(&reactor_jar, &class_list(&["org/example/CoreOne"]))?;
+    // A custom finalName archive and a compiled but unpackaged module are outputs too.
+    let final_name = project.join("core/target/core-app.jar");
+    support::write_class_jar(&final_name, &class_list(&["org/example/RenamedOne"]))?;
+    let api_classes = project.join("api/target/classes");
+    support::write_class_directory(&api_classes, &class_list(&["org/example/ApiOne"]))?;
+    support::write_class_jar(
+        &repository_jar(&project, "unselected"),
+        &class_list(&["org/t/UnselectedOne"]),
+    )?;
+    support::set_controlled_classpath(
+        &project,
+        &[
+            repository_jar(&project, "alpha"),
+            reactor_jar,
+            final_name,
+            api_classes.clone(),
+        ],
+    )?;
+    let client = server.connect().await?;
+
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&[
+            "org.example.ApiOne",
+            "org.example.CoreOne",
+            "org.example.RenamedOne",
+            "org.t.AlphaOne"
+        ])
+    );
+    let jars = call(
+        &client,
+        "search_jars",
+        json!({ "project_path": project.display().to_string(), "query": "org.example" }),
+    )
+    .await?;
+    let mut outputs = jars["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|jar| {
+            (
+                jar["path"].as_str().unwrap().to_owned(),
+                jar["coordinate"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        [
+            ("api/target/classes", "org.example:api:1.0"),
+            ("core/target/core-1.0.jar", "org.example:core:1.0"),
+            ("core/target/core-app.jar", "org.example:core:1.0"),
+        ]
+        .map(|(path, coordinate)| (path.to_owned(), coordinate.to_owned()))
+    );
+    let runs = support::controlled_classpath_runs(&project);
+
+    // Editing a nested class file of an output directory invalidates the cached index.
+    let nested = api_classes.join("org/example/ApiOne.class");
+    let mut bytes = std::fs::read(&nested)?;
+    bytes.extend_from_slice(b"changed");
+    std::fs::write(&nested, bytes)?;
+    class_names(&client, &project, "One").await?;
+    assert_eq!(support::controlled_classpath_runs(&project), runs + 1);
+    class_names(&client, &project, "One").await?;
+    assert_eq!(support::controlled_classpath_runs(&project), runs + 1);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_entries_that_cannot_be_indexed_fail_without_caching() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    let project_path = project.display().to_string();
+    let outside = tempfile::tempdir()?;
+    let outside_jar = outside.path().join("system-lib.jar");
+    support::write_class_jar(&outside_jar, &class_list(&["org/system/SystemOne"]))?;
+
+    for (classpath, expected) in [
+        (
+            vec![
+                repository_jar(&project, "alpha"),
+                repository_jar(&project, "missing"),
+            ],
+            "1 missing: missing-1.0.jar",
+        ),
+        (
+            vec![repository_jar(&project, "alpha"), outside_jar.clone()],
+            "1 outside the local repository and the reactor build directories: system-lib.jar",
+        ),
+    ] {
+        support::set_controlled_classpath(&project, &classpath)?;
+        let runs = support::controlled_classpath_runs(&project);
+        for tool in ["search_classes", "index_stats"] {
+            let message = call_error(
+                &client,
+                tool,
+                json!({ "project_path": project_path, "query": "One" }),
+            )
+            .await;
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("would be incomplete"), "{message}");
+            assert!(
+                !message.contains(&outside.path().display().to_string()),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            support::controlled_classpath_runs(&project),
+            runs + 2,
+            "nothing was cached"
+        );
+    }
+
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha")])?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_cold_builds_do_not_pin_runners_beyond_the_limit() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let runtime = tempfile::tempdir()?;
+    let projects = extra_projects(&server, 7)?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAX_PROJECT_INDEXES", "1"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+        ])
+        .await?;
+
+    for project in &projects {
+        std::fs::write(project.join("gate"), "")?;
+        let handle = client
+            .send_cancellable_request(
+                rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                    CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                        "project_path": project.display().to_string(),
+                        "query": "One",
+                    }))),
+                )),
+                rmcp::service::PeerRequestOptions::no_options(),
+            )
+            .await?;
+        let started = project.join("classpath-started");
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(started.exists(), "the cold build never started");
+        handle.cancel(Some("regression".to_owned())).await?;
+    }
+    for project in &projects {
+        std::fs::remove_file(project.join("gate"))?;
+    }
+
+    // The next request re-applies the limits; cancelled builds no longer hold their runners.
+    assert_eq!(class_names(&client, &projects[0], "One").await?.len(), 1);
+    let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+    assert!(cache["runners"].as_u64().unwrap() <= 4, "{cache}");
+    assert!(cache["entries"].as_u64().unwrap() <= 1, "{cache}");
+    assert!(cache["retained_bytes"].as_u64().unwrap() <= cache["max_bytes"].as_u64().unwrap());
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_and_index_caches_stay_bounded_while_switching_projects() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let runtime = tempfile::tempdir()?;
+    let projects = extra_projects(&server, 7)?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAX_PROJECT_INDEXES", "1"),
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+        ])
+        .await?;
+
+    let mut plateau = Vec::new();
+    for round in 0..4 {
+        for project in &projects {
+            assert_eq!(class_names(&client, project, "One").await?.len(), 1);
+        }
+        let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+        assert!(cache["entries"].as_u64().unwrap() <= 1, "{cache}");
+        assert!(cache["runners"].as_u64().unwrap() <= 4, "{cache}");
+        assert!(cache["retained_bytes"].as_u64().unwrap() <= cache["max_bytes"].as_u64().unwrap());
+        plateau.push((
+            cache["entries"].clone(),
+            cache["runners"].clone(),
+            cache["retained_bytes"].clone(),
+        ));
+        assert!(
+            cache["evictions"].as_u64().unwrap() >= 6 * (round + 1) - 1,
+            "{cache}"
+        );
+    }
+    assert!(
+        plateau.windows(2).all(|pair| pair[0] == pair[1]),
+        "{plateau:?}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn byte_budget_evicts_indexes_and_rejects_builds_that_cannot_fit() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 2)?;
+    let (first, second) = (projects[0].clone(), projects[1].clone());
+    let runtime = tempfile::tempdir()?;
+    let runtime_dir = runtime.path().to_str().unwrap();
+
+    let (client, pid) = server
+        .connect_with_limits(&[("MAVEN_MCP_RUNTIME_DIR", runtime_dir)])
+        .await?;
+    class_names(&client, &first, "One").await?;
+    let one_project = runtime_status(runtime.path(), pid)?["cache"]["retained_bytes"]
+        .as_u64()
+        .unwrap();
+    client.cancel().await?;
+
+    // Room for one project (runner and index) plus slack, not for two.
+    let limit = (one_project + 2_000).to_string();
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAVEN_MCP_RUNTIME_DIR", runtime_dir),
+            ("MAX_PROJECT_INDEX_BYTES", &limit),
+        ])
+        .await?;
+    class_names(&client, &first, "One").await?;
+    class_names(&client, &second, "One").await?;
+    class_names(&client, &first, "One").await?;
+    let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+    assert_eq!(cache["entries"], 1, "{cache}");
+    assert!(cache["evictions"].as_u64().unwrap() >= 2, "{cache}");
+    assert!(
+        cache["retained_bytes"].as_u64().unwrap() <= one_project + 2_000,
+        "{cache}"
+    );
+    client.cancel().await?;
+
+    // A budget below even one runner cannot hold a build: the error names the limit.
+    let (client, _) = server
+        .connect_with_limits(&[("MAX_PROJECT_INDEX_BYTES", "1")])
+        .await?;
+    let message = call_error(
+        &client,
+        "search_classes",
+        json!({ "project_path": first.display().to_string(), "query": "One" }),
+    )
+    .await;
+    assert!(message.contains("MAX_PROJECT_INDEX_BYTES"), "{message}");
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Records the cost profile of a project index on a generated fixture. Run with
+/// `cargo test --test mcp_interface --locked measure_ -- --nocapture` to see the figures.
+#[tokio::test]
+async fn measure_cold_reuse_invalidation_and_eviction_costs() -> Result<()> {
+    const JARS: usize = 3;
+    const CLASSES_PER_JAR: usize = 3_000;
+    const REUSE_REPETITIONS: u32 = 20;
+
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 2)?;
+    let first = projects[0].clone();
+    let classpath = (0..JARS)
+        .map(|jar| {
+            let path = repository_jar(&first, &format!("bulk{jar}"));
+            let classes = (0..CLASSES_PER_JAR)
+                .map(|class| format!("org/t/bulk{jar}/Generated{class}"))
+                .collect::<Vec<_>>();
+            support::write_class_jar(&path, &classes).map(|()| path)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for project in &projects {
+        support::set_controlled_classpath(project, &classpath)?;
+    }
+    let runtime = tempfile::tempdir()?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAX_PROJECT_INDEXES", "1"),
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+        ])
+        .await?;
+    let status = || runtime_status(runtime.path(), pid);
+    let rss = |status: &Value, key: &str| status["memory"][key].as_u64().unwrap_or_default();
+    let timed = |label: &'static str| (label, std::time::Instant::now());
+    let search = |project: &Path| {
+        call(
+            &client,
+            "search_classes",
+            json!({ "project_path": project.display().to_string(), "query": "Generated2999", "limit": 50 }),
+        )
+    };
+
+    call(
+        &client,
+        "inspect_maven_project",
+        json!({ "project_path": first.display().to_string() }),
+    )
+    .await?;
+    let baseline_rss = rss(&status()?, "rss_bytes");
+
+    let (_, started) = timed("cold");
+    assert_eq!(
+        search(&first).await?["results"].as_array().unwrap().len(),
+        JARS
+    );
+    let cold = started.elapsed();
+    let built = status()?;
+    let estimated = built["projects"][0]["estimated_bytes"].as_u64().unwrap();
+    let steady_rss = rss(&built, "rss_bytes");
+    let peak_rss = rss(&built, "peak_rss_bytes");
+
+    let (_, started) = timed("reuse");
+    for _ in 0..REUSE_REPETITIONS {
+        search(&first).await?;
+    }
+    let reuse = started.elapsed() / REUSE_REPETITIONS;
+    assert_eq!(
+        support::controlled_classpath_runs(&first),
+        1,
+        "reuse ran Maven"
+    );
+
+    call(
+        &client,
+        "run_maven",
+        json!({ "project_path": first.display().to_string(), "arguments": ["-v"] }),
+    )
+    .await?;
+    let (_, started) = timed("rebuild");
+    search(&first).await?;
+    let rebuild = started.elapsed();
+    assert_eq!(support::controlled_classpath_runs(&first), 2);
+
+    let (_, started) = timed("evicting");
+    search(&projects[1]).await?;
+    let evicting = started.elapsed();
+    let evicted = status()?;
+    assert_eq!(evicted["cache"]["entries"], 1);
+    assert!(evicted["cache"]["evictions"].as_u64().unwrap() >= 1);
+
+    assert!(estimated > 0 && peak_rss >= steady_rss && steady_rss > 0);
+    eprintln!(
+        "MEASUREMENT fixture_jars={JARS} classes_per_jar={CLASSES_PER_JAR} reuse_repetitions={REUSE_REPETITIONS} \
+         cold_ms={} reuse_ms={:.3} rebuild_after_run_maven_ms={} evicting_build_ms={} \
+         estimated_index_bytes={estimated} baseline_rss_bytes={baseline_rss} steady_rss_bytes={steady_rss} \
+         peak_rss_bytes={peak_rss} retained_bytes_after_eviction={}",
+        cold.as_millis(),
+        reuse.as_secs_f64() * 1000.0,
+        rebuild.as_millis(),
+        evicting.as_millis(),
+        evicted["cache"]["retained_bytes"],
+    );
 
     client.cancel().await?;
     Ok(())
