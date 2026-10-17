@@ -2706,3 +2706,306 @@ async fn measure_cold_reuse_invalidation_and_eviction_costs() -> Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+const LIGHT_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn wait_for_file(path: &Path) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("{} never appeared", path.display()))
+}
+
+/// Gives a request that has no observable marker time to reach the queue of the heavy jobs.
+/// Only the absence of a response or of a build is asserted afterwards, never a deadline.
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+}
+
+/// Sends a `search_classes` request and returns a task awaiting its result. The request is
+/// sent before this returns, so later requests reach the server after it.
+async fn spawn_search(
+    client: &Client,
+    project: &Path,
+) -> Result<tokio::task::JoinHandle<Result<Value>>> {
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                    "project_path": project.display().to_string(),
+                    "query": "One",
+                }))),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await?;
+    Ok(tokio::spawn(async move {
+        match handle.await_response().await? {
+            rmcp::model::ServerResult::CallToolResult(result) => result
+                .structured_content
+                .ok_or_else(|| anyhow::anyhow!("missing structured content")),
+            other => Err(anyhow::anyhow!("unexpected response {other:?}")),
+        }
+    }))
+}
+
+async fn within_budget<T>(what: &str, future: impl std::future::Future<Output = T>) -> Result<T> {
+    tokio::time::timeout(LIGHT_REQUEST_BUDGET, future)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what} did not respond while heavy work was blocked"))
+}
+
+#[tokio::test]
+async fn blocked_heavy_work_is_bounded_and_light_requests_stay_responsive() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 3)?;
+    let blocked = support::install_blocked_classpath(&projects[0])?;
+    // One runtime worker: a blocking call on the async runtime would stall every request.
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("TOKIO_WORKER_THREADS", "1"),
+            ("MAX_HEAVY_JOBS", "1"),
+            ("MAX_QUEUED_HEAVY_JOBS", "1"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+
+    // The first build blocks inside the index work and occupies the only running slot.
+    let running = spawn_search(&client, &projects[0]).await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    // The second build is accepted and waits in the only queue slot.
+    let queued = spawn_search(&client, &projects[1]).await?;
+    wait_for_file(&projects[1].join("classpath-started")).await?;
+    settle().await;
+
+    // The third heavy job exceeds running + queued and is rejected instead of growing a queue.
+    let rejected = within_budget(
+        "the overloaded request",
+        call_error(
+            &client,
+            "search_classes",
+            json!({ "project_path": projects[2].display().to_string(), "query": "One" }),
+        ),
+    )
+    .await?;
+    assert!(rejected.contains("overloaded"), "{rejected}");
+    assert!(rejected.contains("MAX_HEAVY_JOBS"), "{rejected}");
+
+    // Independent light protocol requests are answered while the heavy work is still blocked.
+    for _ in 0..3 {
+        let tools = within_budget("tools/list", client.list_tools(None)).await??;
+        assert!(!tools.tools.is_empty());
+        for project in &projects {
+            let model = within_budget(
+                "inspect_maven_project",
+                call(
+                    &client,
+                    "inspect_maven_project",
+                    json!({ "project_path": project.display().to_string() }),
+                ),
+            )
+            .await??;
+            assert!(model.is_object());
+        }
+    }
+    assert!(!running.is_finished() && !queued.is_finished());
+
+    // Unblocking lets the running and the queued job finish; the rejected one can be retried.
+    blocked.release().await?;
+    for handle in [running, queued] {
+        let found = handle.await??;
+        assert!(
+            found["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|result| result["class_name"] == "org.t.AlphaOne")
+        );
+    }
+    assert_eq!(
+        class_names(&client, &projects[2], "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_heavy_work_is_not_published_and_keeps_its_slot_until_it_stops() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let runtime = tempfile::tempdir()?;
+    let projects = extra_projects(&server, 2)?;
+    let blocked = support::install_blocked_classpath(&projects[0])?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAX_HEAVY_JOBS", "1"),
+            ("MAX_QUEUED_HEAVY_JOBS", "1"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+        ])
+        .await?;
+
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                    "project_path": projects[0].display().to_string(),
+                    "query": "One",
+                }))),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    handle.cancel(Some("regression".to_owned())).await?;
+
+    // The abandoned blocking thread cannot be interrupted inside its system call, so it keeps
+    // the only running slot: the next job waits instead of adding a second thread.
+    let next = spawn_search(&client, &projects[1]).await?;
+    settle().await;
+    assert!(
+        !next.is_finished(),
+        "the cancelled job released its slot early"
+    );
+
+    blocked.release().await?;
+    let found = tokio::time::timeout(std::time::Duration::from_secs(10), next).await???;
+    assert_eq!(found["results"].as_array().unwrap().len(), 1);
+
+    // The cancelled build finished without publishing: only the second project is cached.
+    let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+    assert_eq!(cache["entries"], 1, "{cache}");
+    assert_eq!(support::controlled_classpath_runs(&projects[0]), 1);
+    blocked.replace_with_regular_jar()?;
+    assert_eq!(
+        class_names(&client, &projects[0], "One").await?,
+        names(&["org.t.AlphaOne", "org.t.BlockedOne"])
+    );
+    assert_eq!(
+        support::controlled_classpath_runs(&projects[0]),
+        2,
+        "the cancelled build must not have been cached"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_retry_of_cancelled_heavy_work_waits_for_its_build_to_stop() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = extra_projects(&server, 1)?.remove(0);
+    let blocked = support::install_blocked_classpath(&project)?;
+    // Two running slots: the retry could start a second build beside the abandoned one.
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAX_HEAVY_JOBS", "2"),
+            ("MAX_QUEUED_HEAVY_JOBS", "2"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
+                    "project_path": project.display().to_string(),
+                    "query": "One",
+                }))),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    handle.cancel(Some("regression".to_owned())).await?;
+
+    // The retry joins the same generation and waits for the abandoned work to stop: it runs
+    // neither Maven nor a second index build meanwhile.
+    let retry = spawn_search(&client, &project).await?;
+    within_budget("tools/list", client.list_tools(None)).await??;
+    settle().await;
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+    assert_eq!(support::blocked_fifo_readers(pid)?, 1);
+    assert!(!retry.is_finished());
+
+    blocked.replace_with_regular_jar()?;
+    blocked.release().await?;
+    let found = tokio::time::timeout(std::time::Duration::from_secs(10), retry).await???;
+    let found = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["class_name"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(found, names(&["org.t.AlphaOne", "org.t.BlockedOne"]));
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        2,
+        "exactly one build ran after the cancelled one stopped"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn warm_index_validation_runs_as_heavy_work() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 2)?;
+    let blocked = support::install_blocked_classpath(&projects[0])?;
+    let warm = &projects[1];
+    let gamma = repository_jar(&projects[0], "gamma");
+    support::write_class_jar(&gamma, &class_list(&["org/t/GammaOne"]))?;
+    support::set_controlled_classpath(warm, std::slice::from_ref(&gamma))?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("TOKIO_WORKER_THREADS", "1"),
+            ("MAX_HEAVY_JOBS", "1"),
+            ("MAX_QUEUED_HEAVY_JOBS", "1"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+    assert_eq!(
+        class_names(&client, warm, "One").await?,
+        names(&["org.t.GammaOne"])
+    );
+
+    let running = spawn_search(&client, &projects[0]).await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    // The warm request must validate its cached index in the pool, so it waits in the queue.
+    let validating = spawn_search(&client, warm).await?;
+    within_budget("tools/list", client.list_tools(None)).await??;
+    let rejected = within_budget(
+        "the overloaded request",
+        call_error(
+            &client,
+            "get_jacoco_coverage",
+            json!({ "project_path": warm.display().to_string() }),
+        ),
+    )
+    .await?;
+    assert!(rejected.contains("overloaded"), "{rejected}");
+    let tools = within_budget("tools/list", client.list_tools(None)).await??;
+    assert!(!tools.tools.is_empty());
+
+    // An artifact that changes while the validation waits is seen by that validation.
+    support::write_class_jar(&gamma, &class_list(&["org/t/GammaOne", "org/t/FreshOne"]))?;
+    blocked.release().await?;
+    running.await??;
+    let found = tokio::time::timeout(std::time::Duration::from_secs(10), validating).await???;
+    let found = found["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["class_name"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(found, names(&["org.t.FreshOne", "org.t.GammaOne"]));
+    assert_eq!(support::controlled_classpath_runs(warm), 2);
+
+    client.cancel().await?;
+    Ok(())
+}

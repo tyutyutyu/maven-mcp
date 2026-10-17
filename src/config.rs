@@ -15,6 +15,8 @@ pub const DEFAULT_MAVEN_TIMEOUT_SECONDS: usize = 300;
 pub const DEFAULT_MAX_MAVEN_OUTPUT_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_PROJECT_INDEXES: usize = 4;
 pub const DEFAULT_MAX_PROJECT_INDEX_BYTES: usize = 1_073_741_824;
+pub const DEFAULT_MAX_HEAVY_JOBS: usize = 2;
+pub const DEFAULT_MAX_QUEUED_HEAVY_JOBS: usize = 16;
 pub const DEFAULT_MAX_XML_BYTES: usize = 16_777_216;
 pub const DEFAULT_MAX_JAR_ENTRIES: usize = 200_000;
 pub const DEFAULT_MAX_INDEX_ENTRIES: usize = 20_000_000;
@@ -190,6 +192,10 @@ pub struct Config {
     pub max_source_bytes: usize,
     pub max_project_indexes: usize,
     pub max_project_index_bytes: usize,
+    /// Heavy index, archive and file jobs that may execute at the same time.
+    pub max_heavy_jobs: usize,
+    /// Heavy jobs that may wait for a running slot; further jobs are rejected.
+    pub max_queued_heavy_jobs: usize,
     pub execution: MavenExecutionConfig,
 }
 
@@ -220,6 +226,11 @@ impl Config {
             max_project_index_bytes: positive_env(
                 "MAX_PROJECT_INDEX_BYTES",
                 DEFAULT_MAX_PROJECT_INDEX_BYTES,
+            )?,
+            max_heavy_jobs: positive_env("MAX_HEAVY_JOBS", DEFAULT_MAX_HEAVY_JOBS)?,
+            max_queued_heavy_jobs: positive_env(
+                "MAX_QUEUED_HEAVY_JOBS",
+                DEFAULT_MAX_QUEUED_HEAVY_JOBS,
             )?,
             execution: maven_execution_from_env(use_jenv)?,
         })

@@ -14,7 +14,7 @@ use std::{
 };
 
 use rmcp::ErrorData;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use walkdir::WalkDir;
 
 use crate::{
@@ -152,14 +152,24 @@ pub enum BuildOutcome {
 
 pub type BuildCell = Arc<OnceCell<BuildOutcome>>;
 
+/// Ownership of the single build of one generation. The build's blocking work holds the lock
+/// until it has really stopped, because cancelling the request does not stop that work: a
+/// retry of the same generation waits for it instead of running a second build beside it.
+pub type BuildOwner = Arc<AsyncMutex<()>>;
+
 #[derive(Debug)]
 pub enum IndexLookup {
     Cached {
         entry: Arc<CachedIndex>,
         generation: u64,
     },
-    /// Exactly one caller per generation runs the build inside `cell`; the others await it.
-    Build { cell: BuildCell, generation: u64 },
+    /// Exactly one caller per generation runs the build inside `cell`, holding `owner`; the
+    /// others await it.
+    Build {
+        cell: BuildCell,
+        owner: BuildOwner,
+        generation: u64,
+    },
 }
 
 /// Memory announced by a running build. It is counted while the holder is alive, even after
@@ -226,13 +236,15 @@ impl ReleasedRunner {
 struct InFlight {
     generation: u64,
     cell: BuildCell,
+    owner: BuildOwner,
 }
 
 impl InFlight {
-    /// Whether a request still holds the build cell. A request that was cancelled drops its
-    /// clone, so a marker only the cache references has no build running and nobody waiting.
+    /// Whether a request still holds the build cell or the build's blocking work still holds
+    /// its owner. A request that was cancelled drops its clones, so a marker only the cache
+    /// references has no build running and nobody waiting.
     fn is_live(&self) -> bool {
-        Arc::strong_count(&self.cell) > 1
+        Arc::strong_count(&self.cell) > 1 || Arc::strong_count(&self.owner) > 1
     }
 }
 
@@ -396,19 +408,27 @@ impl ProjectCache {
             .expect("the project state was created above");
         let generation = state.generation;
         // A marker left by a cancelled request is reused: its empty cell lets this caller run
-        // the build, and the generation still allows at most one running build.
-        let cell = match &state.in_flight {
-            Some(in_flight) if in_flight.generation == generation => Arc::clone(&in_flight.cell),
+        // the build, and its owner makes that build wait until the abandoned work has stopped.
+        let (cell, owner) = match &state.in_flight {
+            Some(in_flight) if in_flight.generation == generation => {
+                (Arc::clone(&in_flight.cell), Arc::clone(&in_flight.owner))
+            }
             _ => {
                 let cell = Arc::new(OnceCell::new());
+                let owner = Arc::new(AsyncMutex::new(()));
                 state.in_flight = Some(InFlight {
                     generation,
                     cell: Arc::clone(&cell),
+                    owner: Arc::clone(&owner),
                 });
-                cell
+                (cell, owner)
             }
         };
-        IndexLookup::Build { cell, generation }
+        IndexLookup::Build {
+            cell,
+            owner,
+            generation,
+        }
     }
 
     pub fn record_hit(&mut self, root: &Path) {
