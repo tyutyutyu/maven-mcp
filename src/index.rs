@@ -1061,8 +1061,23 @@ impl MavenIndex {
             .into_iter()
             .filter(|jar| jar.classifier.as_deref() != Some("sources"))
         {
+            if jar.classes.is_empty() {
+                continue;
+            }
+            let mut archive = match ClassArchive::open(&jar.path) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    tracing::warn!(
+                        coordinate = %jar.coordinate(),
+                        %error,
+                        "skipping unreadable class archive"
+                    );
+                    continue;
+                }
+            };
             for class_name in &jar.classes {
-                let description = match read_class_description(
+                let description = match read_class_description_from(
+                    &mut archive,
                     jar,
                     self.summary(jar),
                     class_name,
@@ -1202,8 +1217,13 @@ impl MavenIndex {
 
     fn public_class_api(&self, jar: &JarRecord) -> Result<BTreeMap<String, ClassDescription>> {
         let mut api = BTreeMap::new();
+        if jar.classes.is_empty() {
+            return Ok(api);
+        }
+        let mut archive = ClassArchive::open(&jar.path)?;
         for class_name in &jar.classes {
-            let description = read_class_description(
+            let description = read_class_description_from(
+                &mut archive,
                 jar,
                 self.summary(jar),
                 class_name,
@@ -2875,6 +2895,12 @@ enum ClassArchive {
     Directory(PathBuf),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Number of `ClassArchive::open` calls on this thread, for open-count regressions.
+    static ARCHIVE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 enum ArchiveEntry<'a> {
     Zip(zip::read::ZipFile<'a, File>),
     File { file: File, size: u64 },
@@ -2900,6 +2926,8 @@ impl Read for ArchiveEntry<'_> {
 
 impl ClassArchive {
     fn open(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        ARCHIVE_OPENS.with(|opens| opens.set(opens.get() + 1));
         if path.is_dir() {
             let root = path
                 .canonicalize()
@@ -3394,6 +3422,26 @@ fn read_class_description(
     public_only: bool,
 ) -> Result<ClassDescription> {
     let mut archive = ClassArchive::open(&jar.path)?;
+    read_class_description_from(
+        &mut archive,
+        jar,
+        jar_summary,
+        class_name,
+        max_bytes,
+        public_only,
+    )
+}
+
+/// Describes one class through an already opened archive of `jar`, so a caller that visits
+/// many classes of the same JAR opens it and reads its central directory only once.
+fn read_class_description_from(
+    archive: &mut ClassArchive,
+    jar: &JarRecord,
+    jar_summary: JarSummary,
+    class_name: &str,
+    max_bytes: usize,
+    public_only: bool,
+) -> Result<ClassDescription> {
     let entry_path = select_class_entry(jar, class_name)
         .with_context(|| format!("indexed class entry is missing for {class_name}"))?;
     let mut entry = archive.indexed_entry(entry_path)?;

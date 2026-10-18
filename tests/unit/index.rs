@@ -2527,3 +2527,236 @@ fn cancelled_searches_stop_at_their_entry_checkpoint() {
         }
     });
 }
+
+fn archive_opens() -> usize {
+    ARCHIVE_OPENS.with(std::cell::Cell::get)
+}
+
+/// Member matches computed class by class, each class through its own archive open.
+fn reference_member_matches(index: &MavenIndex, query: &str) -> Vec<ClassMemberMatch> {
+    let mut matches = Vec::new();
+    for jar in &index.jars {
+        for class_name in &jar.classes {
+            let description = read_class_description(
+                jar,
+                index.summary(jar),
+                class_name,
+                index.max_source_bytes,
+                false,
+            )
+            .unwrap();
+            collect_member_matches(&description, query, &mut matches);
+        }
+    }
+    matches.sort_by(|left, right| {
+        (
+            &left.jar.coordinate,
+            &left.class_name,
+            &left.kind,
+            &left.name,
+            &left.signature,
+        )
+            .cmp(&(
+                &right.jar.coordinate,
+                &right.class_name,
+                &right.kind,
+                &right.name,
+                &right.signature,
+            ))
+    });
+    matches
+}
+
+fn many_class_entries(count: usize) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|number| {
+            let class_name = format!("org/example/Generated{number:03}");
+            (format!("{class_name}.class"), inspection_class(&class_name))
+        })
+        .collect()
+}
+
+fn borrowed_entries(entries: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
+    entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect()
+}
+
+#[test]
+fn member_search_and_api_comparison_open_each_jar_once_with_unchanged_results() {
+    const CLASSES: usize = 40;
+    let root = TempDir::new().unwrap();
+    let generated = many_class_entries(CLASSES);
+    let mut entries = borrowed_entries(&generated);
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &entries,
+    );
+    let shape = shape_variant(b"java/lang/Number", b"late7");
+    entries.push(MULTI_RELEASE_MANIFEST);
+    entries.push(("org/example/Shape.class", &shape));
+    entries.push(("META-INF/versions/17/org/example/Shape.class", &shape));
+    write_jar(
+        &root.path().join("org/example/demo/2.0/demo-2.0.jar"),
+        &entries,
+    );
+    write_jar(
+        &root.path().join("org/example/empty/1.0/empty-1.0.jar"),
+        &[("config.txt", b"no classes")],
+    );
+    write_jar(
+        &root
+            .path()
+            .join("org/example/demo/1.0/demo-1.0-sources.jar"),
+        &[("org/example/Generated000.java", b"class Generated000 {}")],
+    );
+    let index = build_index(&root, 10_000, 64 * 1024);
+
+    let before = archive_opens();
+    let found = index.search_class_members("greet", None, Some(10_000));
+    // One open per binary JAR that has classes, not one per class.
+    assert_eq!(archive_opens() - before, 2);
+    assert!(found.len() >= 2 * CLASSES);
+    assert_eq!(found, reference_member_matches(&index, "greet"));
+    assert!(found.windows(2).all(|pair| {
+        (&pair[0].jar.coordinate, &pair[0].class_name)
+            <= (&pair[1].jar.coordinate, &pair[1].class_name)
+    }));
+
+    let before = archive_opens();
+    index.search_class_members("value", Some("org.example:demo:1.0"), Some(5));
+    assert_eq!(archive_opens() - before, 1);
+    assert_eq!(index.search_class_members("late7", None, None).len(), 2);
+
+    let before = archive_opens();
+    let diff = index
+        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
+        .unwrap();
+    assert_eq!(archive_opens() - before, 2);
+    assert_eq!(diff.added_classes, vec!["org.example.Shape"]);
+    assert!(diff.removed_classes.is_empty());
+
+    // Describing a class still opens only the archives that hold it.
+    let before = archive_opens();
+    index
+        .describe_class("org.example.Generated007", None, None, false)
+        .unwrap();
+    assert_eq!(archive_opens() - before, 2);
+}
+
+#[test]
+fn member_search_skips_bad_entries_and_keeps_reading_the_same_archive() {
+    let root = TempDir::new().unwrap();
+    let good = inspection_class("org/example/Good");
+    let later = inspection_class("org/example/Later");
+    let garbage = vec![0u8; 16];
+    let oversized = vec![0u8; 4096];
+    let jar = root.path().join("org/example/demo/1.0/demo-1.0.jar");
+    std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+    let mut writer = ZipWriter::new(File::create(&jar).unwrap());
+    let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in [
+        ("org/example/Broken.class", garbage.as_slice()),
+        ("org/example/Good.class", good.as_slice()),
+        ("org/example/Huge.class", oversized.as_slice()),
+        ("org/example/Later.class", later.as_slice()),
+    ] {
+        writer.start_file(name, stored).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap();
+    // Flip one payload byte of `Good`: its CRC no longer matches, so reading it fails.
+    let mut raw = std::fs::read(&jar).unwrap();
+    let offset = raw
+        .windows(good.len())
+        .position(|window| window == good.as_slice())
+        .unwrap();
+    raw[offset + good.len() - 1] ^= 0xff;
+    std::fs::write(&jar, raw).unwrap();
+    let index = build_index(&root, 10_000, good.len() + 64);
+
+    let before = archive_opens();
+    let found = index.search_class_members("greet", None, None);
+    assert_eq!(archive_opens() - before, 1);
+    let classes = found
+        .iter()
+        .map(|item| item.class_name.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(classes, BTreeSet::from(["org.example.Later"]));
+    assert_eq!(
+        found,
+        reference_member_matches_skipping_errors(&index, "greet")
+    );
+
+    let error = index
+        .compare_artifact_api("org.example", "demo", "1.0", "1.0")
+        .expect_err("an unreadable class must stay an error");
+    assert!(
+        error.to_string().contains("cannot parse classfile")
+            || error.to_string().contains("MAX_SOURCE_BYTES")
+            || error.to_string().contains("checksum"),
+        "{error}"
+    );
+}
+
+/// Like [`reference_member_matches`], but skips classes that cannot be read.
+fn reference_member_matches_skipping_errors(
+    index: &MavenIndex,
+    query: &str,
+) -> Vec<ClassMemberMatch> {
+    let mut matches = Vec::new();
+    for jar in &index.jars {
+        for class_name in &jar.classes {
+            if let Ok(description) = read_class_description(
+                jar,
+                index.summary(jar),
+                class_name,
+                index.max_source_bytes,
+                false,
+            ) {
+                collect_member_matches(&description, query, &mut matches);
+            }
+        }
+    }
+    matches.sort_by(|left, right| {
+        (&left.class_name, &left.kind, &left.name).cmp(&(
+            &right.class_name,
+            &right.kind,
+            &right.name,
+        ))
+    });
+    matches
+}
+
+#[test]
+fn unopenable_archive_is_skipped_by_member_search_and_fails_the_api_comparison() {
+    let root = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Good");
+    for version in ["1.0", "2.0"] {
+        write_jar(
+            &root
+                .path()
+                .join(format!("org/example/demo/{version}/demo-{version}.jar")),
+            &[("org/example/Good.class", &class)],
+        );
+    }
+    let index = build_index(&root, 100, 64 * 1024);
+    std::fs::write(
+        root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        b"not a zip anymore",
+    )
+    .unwrap();
+
+    let found = index.search_class_members("greet", None, None);
+    assert_eq!(found.len(), 2);
+    assert!(
+        found
+            .iter()
+            .all(|item| item.jar.coordinate == "org.example:demo:2.0")
+    );
+    let error = index
+        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
+        .expect_err("an unopenable archive must stay an error");
+    assert!(error.to_string().contains("invalid ZIP/JAR"), "{error:#}");
+}
