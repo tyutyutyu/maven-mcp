@@ -9,13 +9,6 @@
 .DS_Store
 .idea/
 .env
-
-# Claude Code - local configuration
-.claude/settings.local.json
-CLAUDE.local.md
-
-# ECC - temporary files
-.observer-tmp/
-.claude/worktrees/
-.claude/scheduled_tasks.lock
+.claude/
+!.claude/skills/
 # <<< github-manager: gitignore-baseline
