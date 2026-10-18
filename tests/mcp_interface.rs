@@ -2707,6 +2707,80 @@ async fn measure_cold_reuse_invalidation_and_eviction_costs() -> Result<()> {
     Ok(())
 }
 
+/// Member search over a JAR with many classes returns the sorted, limited result and records
+/// its cost. Run with `cargo test --test mcp_interface --locked measure_ -- --nocapture`; the
+/// number of opens of the bulk JAR is counted outside the test (`strace -f -e trace=openat`).
+#[tokio::test]
+async fn measure_member_search_over_a_jar_with_many_classes() -> Result<()> {
+    const CLASSES: usize = 3_000;
+    const LIMIT: usize = 50;
+
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 1)?;
+    let project = projects[0].clone();
+    let bulk = repository_jar(&project, "bulkmembers");
+    let classes = (0..CLASSES)
+        .map(|class| format!("org/t/bulk/Generated{class:04}"))
+        .collect::<Vec<_>>();
+    support::write_class_jar(&bulk, &classes)?;
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha"), bulk])?;
+    let runtime = tempfile::tempdir()?;
+    let (client, pid) = server
+        .connect_with_limits(&[("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap())])
+        .await?;
+    let project_path = project.display().to_string();
+    let members = |query: &str, jar: Option<&str>| {
+        let mut arguments = json!({ "project_path": project_path, "query": query, "limit": LIMIT });
+        if let Some(jar) = jar {
+            arguments["jar"] = json!(jar);
+        }
+        call(&client, "search_class_members", arguments)
+    };
+
+    // Warm the project index so that only the member search is timed.
+    call(
+        &client,
+        "search_classes",
+        json!({ "project_path": project_path, "query": "Generated0000" }),
+    )
+    .await?;
+    let before_rss = runtime_status(runtime.path(), pid)?["memory"]["rss_bytes"]
+        .as_u64()
+        .unwrap_or_default();
+
+    let started = std::time::Instant::now();
+    let found = members("value", Some("org.t:bulkmembers:1.0")).await?;
+    let elapsed = started.elapsed();
+    let results = found["results"].as_array().unwrap();
+    assert_eq!(results.len(), LIMIT);
+    let class_names = results
+        .iter()
+        .map(|result| result["class_name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let expected = (0..LIMIT)
+        .map(|class| format!("org.t.bulk.Generated{class:04}"))
+        .collect::<Vec<_>>();
+    assert_eq!(class_names, expected);
+    assert!(results.iter().all(|result| result["name"] == "value"));
+
+    // Every class of the other JAR is also visited when no JAR is selected, and the bulk JAR
+    // still sorts after the single-class one by coordinate.
+    let all = members("value", None).await?;
+    assert_eq!(all["results"].as_array().unwrap().len(), LIMIT);
+    assert_eq!(all["results"][0]["jar"]["coordinate"], "org.t:alpha:1.0");
+
+    let after = runtime_status(runtime.path(), pid)?;
+    eprintln!(
+        "MEASUREMENT member_search classes={CLASSES} limit={LIMIT} search_ms={} \
+         rss_before_bytes={before_rss} rss_after_bytes={} peak_rss_bytes={}",
+        elapsed.as_millis(),
+        after["memory"]["rss_bytes"],
+        after["memory"]["peak_rss_bytes"],
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
 const LIGHT_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn wait_for_file(path: &Path) -> Result<()> {
