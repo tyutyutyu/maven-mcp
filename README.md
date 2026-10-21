@@ -878,7 +878,7 @@ export OPENAI_API_KEY="..." # or the standard environment secret for your provid
 scripts/run-agent-eval.sh
 ```
 
-The script pins Promptfoo `0.121.19`, regenerates a marker-protected,
+The script pins Promptfoo `0.124.1`, regenerates a marker-protected,
 request-scoped project fixture under `target/promptfoo/fixture` from Rust,
 configures its trusted project directory and local execution repository, and
 passes the generated absolute `project_path` to every MCP request. Promptfoo
