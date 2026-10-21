@@ -35,7 +35,15 @@ fn promptfoo_agent_eval_is_versioned_and_covers_required_request_classes() -> Re
     }));
 
     let script = std::fs::read_to_string("scripts/run-agent-eval.sh")?;
-    assert!(script.contains("PROMPTFOO_VERSION=\"0.121.19\""));
+    let promptfoo_version = script
+        .lines()
+        .find_map(|line| line.strip_prefix("PROMPTFOO_VERSION=\""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("run-agent-eval.sh must pin PROMPTFOO_VERSION");
+    assert!(
+        is_exact_semver(promptfoo_version),
+        "PROMPTFOO_VERSION must be an exact MAJOR.MINOR.PATCH pin, got {promptfoo_version:?}"
+    );
     assert!(script.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"));
     assert!(script.contains("MAVEN_EXECUTION_REPO_PATH"));
     assert!(script.contains("PROMPTFOO_PROJECT_PATH"));
@@ -43,4 +51,12 @@ fn promptfoo_agent_eval_is_versioned_and_covers_required_request_classes() -> Re
     assert!(script.contains("report.html"));
     assert!(script.contains("results.json"));
     Ok(())
+}
+
+fn is_exact_semver(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
