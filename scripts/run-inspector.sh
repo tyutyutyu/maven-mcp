@@ -10,9 +10,9 @@ readonly MCP_COMMAND="${PROJECT_ROOT}/target/debug/maven-mcp"
 echo "MCP Inspector indul STDIO transporttal: ${MCP_COMMAND}"
 if [[ "${1:-}" == "--cli" ]]; then
     shift
-    npx --yes @modelcontextprotocol/inspector@2.1.0 \
+    npx --yes @modelcontextprotocol/inspector@2.12.0 \
         --cli "${MCP_COMMAND}" --transport stdio "$@"
 else
-    npx --yes @modelcontextprotocol/inspector@2.1.0 \
+    npx --yes @modelcontextprotocol/inspector@2.12.0 \
         "${MCP_COMMAND}" --transport stdio "$@"
 fi

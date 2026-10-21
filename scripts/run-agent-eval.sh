@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-PROMPTFOO_VERSION="0.121.19"
+PROMPTFOO_VERSION="0.124.1"
 EVAL_ROOT="target/promptfoo"
 FIXTURE_ROOT="$PROJECT_ROOT/$EVAL_ROOT/fixture"
 FIXTURE_REPOSITORY="$FIXTURE_ROOT/maven-repository"
