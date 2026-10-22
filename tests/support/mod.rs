@@ -807,6 +807,65 @@ pub fn write_class_jar(path: &Path, class_names: &[String]) -> Result<()> {
     write_jar(path, &entries)
 }
 
+/// Writes a JAR with one public class per `(name, super class, interfaces)` entry, all in
+/// internal (slash-separated) form, for type hierarchy fixtures.
+#[allow(dead_code)]
+pub fn write_hierarchy_jar(path: &Path, classes: &[(&str, &str, &[&str])]) -> Result<()> {
+    let classes = classes
+        .iter()
+        .map(|(name, super_class, interfaces)| {
+            (
+                format!("{name}.class"),
+                hierarchy_class(name, super_class, interfaces),
+            )
+        })
+        .collect::<Vec<_>>();
+    let entries = classes
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    write_jar(path, &entries)
+}
+
+/// Public class without members that extends `super_class` and implements `interfaces`.
+fn hierarchy_class(class_name: &str, super_class: &str, interfaces: &[&str]) -> Vec<u8> {
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    fn push_utf8_class(bytes: &mut Vec<u8>, value: &str, utf8_index: u16) {
+        bytes.push(1);
+        push_u16(
+            bytes,
+            u16::try_from(value.len()).expect("test class name should fit in u16"),
+        );
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(7);
+        push_u16(bytes, utf8_index);
+    }
+
+    let interface_count = u16::try_from(interfaces.len()).expect("few test interfaces");
+    let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 61);
+    push_u16(&mut bytes, 5 + interface_count * 2);
+    push_utf8_class(&mut bytes, class_name, 1); // #1 name, #2 class
+    push_utf8_class(&mut bytes, super_class, 3); // #3 name, #4 class
+    for (index, interface) in (0u16..).zip(interfaces) {
+        push_utf8_class(&mut bytes, interface, 5 + index * 2);
+    }
+    push_u16(&mut bytes, 0x0021);
+    push_u16(&mut bytes, 2);
+    push_u16(&mut bytes, 4);
+    push_u16(&mut bytes, interface_count);
+    for index in 0..interface_count {
+        push_u16(&mut bytes, 6 + index * 2);
+    }
+    push_u16(&mut bytes, 0); // fields
+    push_u16(&mut bytes, 0); // methods
+    push_u16(&mut bytes, 0); // attributes
+    bytes
+}
+
 /// Writes one public empty class file per name (`org/example/Name`) below a class directory.
 #[allow(dead_code)]
 pub fn write_class_directory(directory: &Path, class_names: &[String]) -> Result<()> {

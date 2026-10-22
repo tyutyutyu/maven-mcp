@@ -2760,3 +2760,470 @@ fn unopenable_archive_is_skipped_by_member_search_and_fails_the_api_comparison()
         .expect_err("an unopenable archive must stay an error");
     assert!(error.to_string().contains("invalid ZIP/JAR"), "{error:#}");
 }
+
+fn hierarchy_edges_examined() -> usize {
+    HIERARCHY_EDGES_EXAMINED.with(std::cell::Cell::get)
+}
+
+/// The descendant search as it was before the reverse index: every queue step rescans all
+/// class facts of all JARs. It is the oracle for the output of the indexed search.
+fn reference_type_hierarchy(
+    index: &MavenIndex,
+    type_name: &str,
+    transitive: bool,
+    jar_selector: Option<&str>,
+    limit: Option<usize>,
+) -> Vec<TypeHierarchyMatch> {
+    let root = normalize_class_query(type_name);
+    if root.is_empty() {
+        return Vec::new();
+    }
+    let mut queue = VecDeque::from([(root.clone(), vec![root.clone()], 0usize)]);
+    let mut visited_edges = BTreeSet::new();
+    let mut matches = Vec::new();
+    while let Some((parent, path, depth)) = queue.pop_front() {
+        let mut edges = Vec::new();
+        for (jar_index, jar) in index.jars.iter().enumerate() {
+            for class in &jar.class_facts {
+                for fact in class
+                    .parents
+                    .iter()
+                    .filter(|fact| jar.fact_string(fact.parent).eq_ignore_ascii_case(&parent))
+                {
+                    edges.push((jar_index, class, fact));
+                }
+            }
+        }
+        edges.sort_by(
+            |(left_jar, left_class, left), (right_jar, right_class, right)| {
+                (
+                    index.jars[*left_jar].fact_string(left_class.source_class),
+                    &index.jars[*left_jar].relative_path,
+                    left.relation,
+                )
+                    .cmp(&(
+                        index.jars[*right_jar].fact_string(right_class.source_class),
+                        &index.jars[*right_jar].relative_path,
+                        right.relation,
+                    ))
+            },
+        );
+        for (jar_index, class, fact) in edges {
+            let jar = &index.jars[jar_index];
+            let child = jar.fact_string(class.source_class);
+            let fact_parent = jar.fact_string(fact.parent);
+            let edge_key = (
+                child.to_lowercase(),
+                fact_parent.to_lowercase(),
+                jar.coordinate(),
+            );
+            if !visited_edges.insert(edge_key) || path.iter().any(|node| node == child) {
+                continue;
+            }
+            let mut child_path = path.clone();
+            child_path.push(child.to_owned());
+            if jar_selector.is_none_or(|selector| matches_selector(jar, selector)) {
+                matches.push(TypeHierarchyMatch {
+                    type_name: child.to_owned(),
+                    jar: index.summary(jar),
+                    relation: fact.relation,
+                    depth: depth + 1,
+                    path: child_path.clone(),
+                });
+                if matches.len() == index.limit(limit) {
+                    return matches;
+                }
+            }
+            if transitive {
+                queue.push_back((child.to_owned(), child_path, depth + 1));
+            }
+        }
+        if !transitive {
+            break;
+        }
+    }
+    matches
+}
+
+type HierarchyClass<'a> = (&'a str, &'a str, &'a [&'a str]);
+
+fn write_hierarchy_jar(root: &TempDir, artifact: &str, classes: &[HierarchyClass<'_>]) {
+    let entries = classes
+        .iter()
+        .map(|(name, super_class, interfaces)| {
+            (
+                format!("{name}.class"),
+                hierarchy_class(name, super_class, interfaces),
+            )
+        })
+        .collect::<Vec<_>>();
+    let entries = entries
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect::<Vec<_>>();
+    write_jar(
+        &root
+            .path()
+            .join(format!("org/example/{artifact}/1.0/{artifact}-1.0.jar")),
+        &entries,
+    );
+}
+
+/// Asserts that the indexed search equals the scanning oracle for direct and transitive modes
+/// and a range of limits, and returns the transitive result.
+fn assert_hierarchy_matches_reference(
+    index: &MavenIndex,
+    type_name: &str,
+    jar_selector: Option<&str>,
+) -> Vec<TypeHierarchyMatch> {
+    for transitive in [false, true] {
+        for limit in [None, Some(1), Some(2), Some(7)] {
+            assert_eq!(
+                index.search_type_hierarchy(type_name, transitive, jar_selector, limit),
+                reference_type_hierarchy(index, type_name, transitive, jar_selector, limit),
+                "{type_name} transitive={transitive} limit={limit:?}"
+            );
+        }
+    }
+    index.search_type_hierarchy(type_name, true, jar_selector, None)
+}
+
+#[test]
+fn indexed_hierarchy_search_matches_the_scan_on_a_wide_graph() {
+    let root = TempDir::new().unwrap();
+    let names = (0..60)
+        .map(|child| format!("org/example/Wide{child:02}"))
+        .collect::<Vec<_>>();
+    // Interleave two JARs so that the order depends on the child name, then the JAR path.
+    let (left, right): (Vec<_>, Vec<_>) = names.iter().enumerate().partition(|(i, _)| i % 3 == 0);
+    for (artifact, part) in [("zeta", left), ("alpha", right)] {
+        let classes = part
+            .iter()
+            .map(|(_, name)| (name.as_str(), "org/example/WideRoot", &[][..]))
+            .collect::<Vec<_>>();
+        write_hierarchy_jar(&root, artifact, &classes);
+    }
+    let index = build_index(&root, 100, 64 * 1024);
+
+    let all = assert_hierarchy_matches_reference(&index, "org.example.WideRoot", None);
+    assert_eq!(all.len(), 60);
+    assert!(all.iter().all(|found| found.depth == 1));
+    assert_eq!(all[0].type_name, "org.example.Wide00");
+    assert_eq!(all[59].type_name, "org.example.Wide59");
+    // The query case is echoed as the first path element only.
+    let upper = assert_hierarchy_matches_reference(&index, "ORG/EXAMPLE/WIDEROOT", None);
+    let type_names = |matches: &[TypeHierarchyMatch]| {
+        matches
+            .iter()
+            .map(|found| found.type_name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(type_names(&upper), type_names(&all));
+    let selected = assert_hierarchy_matches_reference(
+        &index,
+        "org.example.WideRoot",
+        Some("org.example:zeta:1.0"),
+    );
+    assert_eq!(selected.len(), 20);
+}
+
+#[test]
+fn indexed_hierarchy_search_matches_the_scan_on_a_deep_graph() {
+    let root = TempDir::new().unwrap();
+    let names = (0..80)
+        .map(|level| format!("org/example/Deep{level:02}"))
+        .collect::<Vec<_>>();
+    let classes = names
+        .iter()
+        .enumerate()
+        .map(|(level, name)| {
+            let parent = if level == 0 {
+                "org/example/DeepRoot"
+            } else {
+                names[level - 1].as_str()
+            };
+            (name.as_str(), parent, &[][..])
+        })
+        .collect::<Vec<_>>();
+    write_hierarchy_jar(&root, "deep", &classes);
+    let index = build_index(&root, 100, 64 * 1024);
+
+    let all = assert_hierarchy_matches_reference(&index, "org.example.DeepRoot", None);
+    assert_eq!(all.len(), 80);
+    let last = &all[79];
+    assert_eq!(last.depth, 80);
+    assert_eq!(last.path.len(), 81);
+    assert_eq!(last.path[0], "org.example.DeepRoot");
+    assert_eq!(last.path[80], "org.example.Deep79");
+    let direct = index.search_type_hierarchy("org.example.DeepRoot", false, None, None);
+    assert_eq!(direct.len(), 1);
+    // The result limit still applies to a transitive walk.
+    let limited = index.search_type_hierarchy("org.example.DeepRoot", true, None, Some(5));
+    assert_eq!(limited, all[..5]);
+}
+
+#[test]
+fn indexed_hierarchy_search_matches_the_scan_on_a_diamond_graph() {
+    let root = TempDir::new().unwrap();
+    write_hierarchy_jar(
+        &root,
+        "diamond",
+        &[
+            ("org/example/Left", "java/lang/Object", &["org/example/Top"]),
+            (
+                "org/example/Right",
+                "java/lang/Object",
+                &["org/example/Top"],
+            ),
+            (
+                "org/example/Bottom",
+                "org/example/Left",
+                &["org/example/Right"],
+            ),
+            ("org/example/Leaf", "org/example/Bottom", &[]),
+        ],
+    );
+    let index = build_index(&root, 100, 64 * 1024);
+
+    let all = assert_hierarchy_matches_reference(&index, "org.example.Top", None);
+    let found = all
+        .iter()
+        .map(|found| (found.type_name.as_str(), found.depth, found.path.join(">")))
+        .collect::<Vec<_>>();
+    // Bottom is reached through both of its parents (two distinct edges); the edge below it
+    // is followed once, so Leaf is not duplicated.
+    assert_eq!(
+        found,
+        vec![
+            (
+                "org.example.Left",
+                1,
+                "org.example.Top>org.example.Left".to_owned()
+            ),
+            (
+                "org.example.Right",
+                1,
+                "org.example.Top>org.example.Right".to_owned()
+            ),
+            (
+                "org.example.Bottom",
+                2,
+                "org.example.Top>org.example.Left>org.example.Bottom".to_owned()
+            ),
+            (
+                "org.example.Bottom",
+                2,
+                "org.example.Top>org.example.Right>org.example.Bottom".to_owned()
+            ),
+            (
+                "org.example.Leaf",
+                3,
+                "org.example.Top>org.example.Left>org.example.Bottom>org.example.Leaf".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn indexed_hierarchy_search_terminates_on_cyclic_graphs() {
+    let root = TempDir::new().unwrap();
+    write_hierarchy_jar(
+        &root,
+        "cycle",
+        &[
+            ("org/example/CycleA", "org/example/CycleC", &[]),
+            ("org/example/CycleB", "org/example/CycleA", &[]),
+            (
+                "org/example/CycleC",
+                "org/example/CycleB",
+                &["org/example/CycleC"],
+            ),
+            ("org/example/Tail", "org/example/CycleB", &[]),
+        ],
+    );
+    let index = build_index(&root, 100, 64 * 1024);
+
+    let from_cycle = assert_hierarchy_matches_reference(&index, "org.example.CycleA", None);
+    let names = from_cycle
+        .iter()
+        .map(|found| found.type_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "org.example.CycleB",
+            "org.example.CycleC",
+            "org.example.Tail"
+        ]
+    );
+    // Every path is free of repeated types, including the self-implementing class.
+    for found in &from_cycle {
+        let unique = found.path.iter().collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), found.path.len(), "{:?}", found.path);
+    }
+    assert_hierarchy_matches_reference(&index, "org.example.Tail", None);
+}
+
+#[test]
+fn hierarchy_search_visits_only_reachable_edges_instead_of_rescanning_facts() {
+    const CHAIN: usize = 50;
+    const UNRELATED: usize = 400;
+    let root = TempDir::new().unwrap();
+    let chain = (0..CHAIN)
+        .map(|level| format!("org/example/Chain{level:02}"))
+        .collect::<Vec<_>>();
+    let unrelated = (0..UNRELATED)
+        .map(|class| format!("org/example/Other{class:03}"))
+        .collect::<Vec<_>>();
+    let classes = chain
+        .iter()
+        .enumerate()
+        .map(|(level, name)| {
+            let parent = if level == 0 {
+                "org/example/ChainRoot"
+            } else {
+                chain[level - 1].as_str()
+            };
+            (name.as_str(), parent, &[][..])
+        })
+        .chain(
+            unrelated
+                .iter()
+                .map(|name| (name.as_str(), "org/example/OtherRoot", &[][..])),
+        )
+        .collect::<Vec<_>>();
+    write_hierarchy_jar(&root, "scan", &classes);
+    let index = build_index(&root, 1000, 64 * 1024);
+    let total_facts = index
+        .jars
+        .iter()
+        .flat_map(|jar| &jar.class_facts)
+        .map(|class| class.parents.len())
+        .sum::<usize>();
+    assert_eq!(total_facts, CHAIN + UNRELATED);
+
+    let before = hierarchy_edges_examined();
+    let found = index.search_type_hierarchy("org.example.ChainRoot", true, None, None);
+    let examined = hierarchy_edges_examined() - before;
+
+    assert_eq!(found.len(), CHAIN);
+    // One examination per reachable edge. The scanning search read `total_facts` facts for each
+    // of the CHAIN + 1 queue steps, which is more than 20000 here.
+    assert_eq!(examined, CHAIN);
+    assert!(examined * 100 < total_facts * (CHAIN + 1));
+
+    let before = hierarchy_edges_examined();
+    assert!(
+        index
+            .search_type_hierarchy("org.example.Missing", true, None, None)
+            .is_empty()
+    );
+    assert_eq!(hierarchy_edges_examined(), before);
+}
+
+#[test]
+fn index_size_estimate_includes_the_reverse_hierarchy_index() {
+    let root = TempDir::new().unwrap();
+    write_hierarchy_jar(
+        &root,
+        "sized",
+        &[
+            ("org/example/SizedA", "org/example/SizedBase", &[]),
+            (
+                "org/example/SizedB",
+                "org/example/SizedBase",
+                &["org/example/SizedIface"],
+            ),
+        ],
+    );
+    let mut index = build_index(&root, 10, 64 * 1024);
+    let edge_count = index
+        .children_by_parent
+        .values()
+        .map(Vec::len)
+        .sum::<usize>();
+    // Two superclass edges and one interface edge.
+    assert_eq!(edge_count, 3);
+    let with_index = index.estimated_bytes();
+
+    index.children_by_parent.clear();
+    let without_index = index.estimated_bytes();
+
+    let minimum = edge_count * std::mem::size_of::<HierarchyEdge>();
+    assert!(
+        with_index >= without_index + minimum as u64,
+        "{with_index} vs {without_index} + {minimum}"
+    );
+}
+
+/// Compares the scanning search with the indexed one on a wide and deep graph. Run with
+/// `cargo test --lib --locked --release measure_indexed -- --ignored --nocapture`; it is
+/// ignored in normal runs because the scanning oracle takes seconds on this fixture.
+#[test]
+#[ignore = "measurement; run explicitly with --ignored"]
+fn measure_indexed_versus_scanning_hierarchy_search() {
+    const ROOTS: usize = 40;
+    const DEPTH: usize = 40;
+    const WIDTH: usize = 25;
+    const REPETITIONS: u32 = 5;
+    let root = TempDir::new().unwrap();
+    let mut names = Vec::new();
+    for tree in 0..ROOTS {
+        for level in 0..DEPTH {
+            for leaf in 0..WIDTH {
+                names.push((
+                    tree,
+                    level,
+                    format!("org/example/T{tree:02}L{level:02}N{leaf:02}"),
+                ));
+            }
+        }
+    }
+    let classes = names
+        .iter()
+        .map(|(tree, level, name)| {
+            let parent = if *level == 0 {
+                format!("org/example/T{tree:02}Root")
+            } else {
+                format!("org/example/T{tree:02}L{:02}N00", level - 1)
+            };
+            (name.clone(), parent)
+        })
+        .collect::<Vec<_>>();
+    let classes = classes
+        .iter()
+        .map(|(name, parent)| (name.as_str(), parent.as_str(), &[][..]))
+        .collect::<Vec<_>>();
+    write_hierarchy_jar(&root, "measure", &classes);
+    let mut index = build_index(&root, 100_000, 64 * 1024);
+    let with_index_bytes = index.estimated_bytes();
+    let held = std::mem::take(&mut index.children_by_parent);
+    let without_index_bytes = index.estimated_bytes();
+    index.children_by_parent = held;
+
+    let time = |search: &dyn Fn() -> Vec<TypeHierarchyMatch>| {
+        let started = std::time::Instant::now();
+        let mut found = Vec::new();
+        for _ in 0..REPETITIONS {
+            found = search();
+        }
+        (started.elapsed() / REPETITIONS, found)
+    };
+    let (scan_time, scanned) = time(&|| {
+        reference_type_hierarchy(&index, "org.example.T00Root", true, None, Some(100_000))
+    });
+    let (indexed_time, indexed) =
+        time(&|| index.search_type_hierarchy("org.example.T00Root", true, None, Some(100_000)));
+
+    assert_eq!(indexed, scanned);
+    assert_eq!(indexed.len(), DEPTH * WIDTH);
+    eprintln!(
+        "MEASUREMENT hierarchy_search facts={} tree_matches={} repetitions={REPETITIONS} \
+         scan_ms={} indexed_ms={} estimated_bytes_before={without_index_bytes} \
+         estimated_bytes_after={with_index_bytes}",
+        names.len(),
+        indexed.len(),
+        scan_time.as_millis(),
+        indexed_time.as_millis(),
+    );
+}

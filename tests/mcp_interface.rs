@@ -2781,6 +2781,221 @@ async fn measure_member_search_over_a_jar_with_many_classes() -> Result<()> {
     Ok(())
 }
 
+/// Wide, deep, diamond and cyclic hierarchies in one project index: the public
+/// `search_type_hierarchy` responses over real STDIO carry the documented depth, path, relation
+/// and ordering semantics, and the cycle and the diamond neither loop nor duplicate beyond the
+/// distinct child-to-parent edges.
+#[tokio::test]
+async fn type_hierarchy_search_reports_wide_deep_diamond_and_cyclic_graphs() -> Result<()> {
+    const WIDE: usize = 12;
+    const DEEP: usize = 12;
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 1)?;
+    let project = projects[0].clone();
+    let wide = (0..WIDE)
+        .map(|child| format!("org/t/Wide{child:02}"))
+        .collect::<Vec<_>>();
+    let deep = (0..DEEP)
+        .map(|level| format!("org/t/Deep{level:02}"))
+        .collect::<Vec<_>>();
+    let mut classes = wide
+        .iter()
+        .map(|name| (name.as_str(), "org/t/WideRoot", &[][..]))
+        .collect::<Vec<_>>();
+    classes.extend(deep.iter().enumerate().map(|(level, name)| {
+        let parent = if level == 0 {
+            "org/t/DeepRoot"
+        } else {
+            deep[level - 1].as_str()
+        };
+        (name.as_str(), parent, &[][..])
+    }));
+    classes.extend([
+        ("org/t/Left", "java/lang/Object", &["org/t/Top"][..]),
+        ("org/t/Right", "java/lang/Object", &["org/t/Top"][..]),
+        ("org/t/Bottom", "org/t/Left", &["org/t/Right"][..]),
+        ("org/t/CycleA", "org/t/CycleB", &[][..]),
+        ("org/t/CycleB", "org/t/CycleA", &[][..]),
+    ]);
+    let hierarchy = repository_jar(&project, "hierarchy");
+    support::write_hierarchy_jar(&hierarchy, &classes)?;
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha"), hierarchy])?;
+    let client = server.connect().await?;
+    let project_path = project.display().to_string();
+    let search = |type_name: &str, transitive: bool, limit: Option<usize>| {
+        let mut arguments = json!({
+            "project_path": project_path,
+            "type_name": type_name,
+            "transitive": transitive,
+        });
+        if let Some(limit) = limit {
+            arguments["limit"] = json!(limit);
+        }
+        call(&client, "search_type_hierarchy", arguments)
+    };
+    let summary = |response: &Value| {
+        response["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| {
+                (
+                    found["type_name"].as_str().unwrap().to_owned(),
+                    found["depth"].as_u64().unwrap(),
+                    found["relation"].as_str().unwrap().to_owned(),
+                    found["path"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|node| node.as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(">"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let wide_found = summary(&search("org.t.WideRoot", true, None).await?);
+    assert_eq!(wide_found.len(), WIDE);
+    assert_eq!(wide_found[0].0, "org.t.Wide00");
+    assert_eq!(wide_found[WIDE - 1].0, "org.t.Wide11");
+    assert!(
+        wide_found
+            .iter()
+            .all(|found| found.1 == 1 && found.2 == "extends")
+    );
+
+    let deep_found = summary(&search("org.t.DeepRoot", true, None).await?);
+    assert_eq!(deep_found.len(), DEEP);
+    assert_eq!(deep_found[DEEP - 1].1, DEEP as u64);
+    assert_eq!(deep_found[DEEP - 1].3.split('>').count(), DEEP + 1);
+    assert_eq!(
+        summary(&search("org.t.DeepRoot", false, None).await?).len(),
+        1
+    );
+    assert_eq!(
+        summary(&search("org.t.DeepRoot", true, Some(3)).await?),
+        deep_found[..3]
+    );
+
+    let diamond = summary(&search("org.t.Top", true, None).await?);
+    assert_eq!(
+        diamond,
+        vec![
+            (
+                "org.t.Left".to_owned(),
+                1,
+                "implements".to_owned(),
+                "org.t.Top>org.t.Left".to_owned()
+            ),
+            (
+                "org.t.Right".to_owned(),
+                1,
+                "implements".to_owned(),
+                "org.t.Top>org.t.Right".to_owned()
+            ),
+            (
+                "org.t.Bottom".to_owned(),
+                2,
+                "extends".to_owned(),
+                "org.t.Top>org.t.Left>org.t.Bottom".to_owned()
+            ),
+            (
+                "org.t.Bottom".to_owned(),
+                2,
+                "implements".to_owned(),
+                "org.t.Top>org.t.Right>org.t.Bottom".to_owned()
+            ),
+        ]
+    );
+
+    let cycle = summary(&search("org.t.CycleA", true, None).await?);
+    assert_eq!(
+        cycle,
+        vec![(
+            "org.t.CycleB".to_owned(),
+            1,
+            "extends".to_owned(),
+            "org.t.CycleA>org.t.CycleB".to_owned()
+        )]
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Measures `search_type_hierarchy` over STDIO on one wide and deep project index. Run with
+/// `cargo test --test mcp_interface --locked measure_type_hierarchy -- --nocapture`.
+#[tokio::test]
+async fn measure_type_hierarchy_search_over_a_wide_and_deep_graph() -> Result<()> {
+    const TREES: usize = 20;
+    const DEPTH: usize = 20;
+    const WIDTH: usize = 10;
+    const REPETITIONS: u32 = 5;
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 1)?;
+    let project = projects[0].clone();
+    let mut names = Vec::new();
+    for tree in 0..TREES {
+        for level in 0..DEPTH {
+            for leaf in 0..WIDTH {
+                let parent = if level == 0 {
+                    format!("org/t/T{tree:02}Root")
+                } else {
+                    format!("org/t/T{tree:02}L{:02}N00", level - 1)
+                };
+                names.push((format!("org/t/T{tree:02}L{level:02}N{leaf:02}"), parent));
+            }
+        }
+    }
+    let classes = names
+        .iter()
+        .map(|(name, parent)| (name.as_str(), parent.as_str(), &[][..]))
+        .collect::<Vec<_>>();
+    let measured = repository_jar(&project, "measured");
+    support::write_hierarchy_jar(&measured, &classes)?;
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha"), measured])?;
+    let runtime = tempfile::tempdir()?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+            ("MAX_RESULTS", "100000"),
+        ])
+        .await?;
+    let project_path = project.display().to_string();
+    let search = || {
+        call(
+            &client,
+            "search_type_hierarchy",
+            json!({
+                "project_path": project_path,
+                "type_name": "org.t.T00Root",
+                "transitive": true,
+                "limit": 100_000,
+            }),
+        )
+    };
+    // The first call builds the project index and is not timed.
+    let first = search().await?;
+    assert_eq!(first["results"].as_array().unwrap().len(), DEPTH * WIDTH);
+    let started = std::time::Instant::now();
+    for _ in 0..REPETITIONS {
+        assert_eq!(search().await?, first);
+    }
+    let elapsed = started.elapsed() / REPETITIONS;
+    let status = runtime_status(runtime.path(), pid)?;
+    eprintln!(
+        "MEASUREMENT type_hierarchy classes={} matches={} repetitions={REPETITIONS} \
+         search_ms={} index_estimated_bytes={} rss_bytes={}",
+        names.len(),
+        DEPTH * WIDTH,
+        elapsed.as_millis(),
+        status["projects"][0]["estimated_bytes"],
+        status["memory"]["rss_bytes"],
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
 const LIGHT_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn wait_for_file(path: &Path) -> Result<()> {
