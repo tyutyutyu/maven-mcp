@@ -428,6 +428,14 @@ struct IndexedTypeParent {
     relation: TypeRelation,
 }
 
+/// Position of one child-to-parent fact: `jars[jar].class_facts[class].parents[parent]`.
+#[derive(Debug, Clone, Copy)]
+struct HierarchyEdge {
+    jar: usize,
+    class: usize,
+    parent: usize,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct IndexedReference {
     target_owner: FactStringId,
@@ -489,6 +497,9 @@ pub struct MavenIndex {
     jars: Vec<JarRecord>,
     source_jars: HashMap<ArtifactKey, usize>,
     class_locations: HashMap<String, Vec<usize>>,
+    /// ASCII-lowercased parent type name to its direct children in the deterministic search
+    /// order (child name, JAR path, relation); see [`build_children_by_parent`].
+    children_by_parent: HashMap<String, Vec<HierarchyEdge>>,
     artifacts: BTreeMap<(String, String), BTreeSet<String>>,
     max_results: usize,
     max_source_bytes: usize,
@@ -565,6 +576,7 @@ impl MavenIndex {
             jars: Vec::new(),
             source_jars: HashMap::new(),
             class_locations: HashMap::new(),
+            children_by_parent: HashMap::new(),
             artifacts: BTreeMap::new(),
             max_results,
             max_source_bytes,
@@ -621,6 +633,7 @@ impl MavenIndex {
             }
             index.jars.push(record);
         }
+        index.children_by_parent = build_children_by_parent(&index.jars);
 
         Ok(index)
     }
@@ -700,6 +713,16 @@ impl MavenIndex {
             .class_locations
             .iter()
             .map(|(name, jars)| text(name) + jars.len() * size_of::<usize>() + NODE_OVERHEAD)
+            .sum::<usize>();
+        total += self
+            .children_by_parent
+            .iter()
+            .map(|(parent, edges)| {
+                text(parent)
+                    + size_of::<Vec<HierarchyEdge>>()
+                    + edges.len() * size_of::<HierarchyEdge>()
+                    + NODE_OVERHEAD
+            })
             .sum::<usize>();
         total += self
             .artifacts
@@ -1313,38 +1336,17 @@ impl MavenIndex {
         if root.is_empty() {
             return Vec::new();
         }
+        let limit = self.limit(limit);
         let mut queue = VecDeque::from([(root.clone(), vec![root.clone()], 0usize)]);
         let mut visited_edges = BTreeSet::new();
         let mut matches = Vec::new();
         while let Some((parent, path, depth)) = queue.pop_front() {
-            let mut edges = Vec::new();
-            for (jar_index, jar) in self.jars.iter().enumerate() {
-                for class in &jar.class_facts {
-                    for fact in class
-                        .parents
-                        .iter()
-                        .filter(|fact| jar.fact_string(fact.parent).eq_ignore_ascii_case(&parent))
-                    {
-                        edges.push((jar_index, class, fact));
-                    }
-                }
-            }
-            edges.sort_by(
-                |(left_jar, left_class, left), (right_jar, right_class, right)| {
-                    (
-                        self.jars[*left_jar].fact_string(left_class.source_class),
-                        &self.jars[*left_jar].relative_path,
-                        left.relation,
-                    )
-                        .cmp(&(
-                            self.jars[*right_jar].fact_string(right_class.source_class),
-                            &self.jars[*right_jar].relative_path,
-                            right.relation,
-                        ))
-                },
-            );
-            for (jar_index, class, fact) in edges {
-                let jar = &self.jars[jar_index];
+            for edge in self.children_of(&parent) {
+                #[cfg(test)]
+                HIERARCHY_EDGES_EXAMINED.with(|examined| examined.set(examined.get() + 1));
+                let jar = &self.jars[edge.jar];
+                let class = &jar.class_facts[edge.class];
+                let fact = &class.parents[edge.parent];
                 let child = jar.fact_string(class.source_class);
                 let fact_parent = jar.fact_string(fact.parent);
                 let edge_key = (
@@ -1365,7 +1367,7 @@ impl MavenIndex {
                         depth: depth + 1,
                         path: child_path.clone(),
                     });
-                    if matches.len() == self.limit(limit) {
+                    if matches.len() == limit {
                         return matches;
                     }
                 }
@@ -1378,6 +1380,12 @@ impl MavenIndex {
             }
         }
         matches
+    }
+
+    fn children_of(&self, parent: &str) -> &[HierarchyEdge] {
+        self.children_by_parent
+            .get(&parent.to_ascii_lowercase())
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn search_source(
@@ -2888,6 +2896,40 @@ fn preflight_archive(path: &Path, budget: &mut ArchiveBudget) -> Result<()> {
     Ok(())
 }
 
+/// Groups every child-to-parent fact by its ASCII-lowercased parent name. Each group is sorted
+/// by child name, JAR path, and relation (stable, so equal keys keep JAR and class order),
+/// which is the order a hierarchy search reports children in.
+fn build_children_by_parent(jars: &[JarRecord]) -> HashMap<String, Vec<HierarchyEdge>> {
+    let mut children: HashMap<String, Vec<HierarchyEdge>> = HashMap::new();
+    for (jar_index, jar) in jars.iter().enumerate() {
+        for (class_index, class) in jar.class_facts.iter().enumerate() {
+            for (parent_index, fact) in class.parents.iter().enumerate() {
+                children
+                    .entry(jar.fact_string(fact.parent).to_ascii_lowercase())
+                    .or_default()
+                    .push(HierarchyEdge {
+                        jar: jar_index,
+                        class: class_index,
+                        parent: parent_index,
+                    });
+            }
+        }
+    }
+    let sort_key = |edge: &HierarchyEdge| {
+        let jar = &jars[edge.jar];
+        let class = &jar.class_facts[edge.class];
+        (
+            jar.fact_string(class.source_class),
+            jar.relative_path.as_str(),
+            class.parents[edge.parent].relation,
+        )
+    };
+    for edges in children.values_mut() {
+        edges.sort_by_key(sort_key);
+    }
+    children
+}
+
 /// A class archive: a JAR or a reactor output directory such as `target/classes`. Entry
 /// names always use `/` and are relative to the archive root.
 enum ClassArchive {
@@ -2899,6 +2941,12 @@ enum ClassArchive {
 thread_local! {
     /// Number of `ClassArchive::open` calls on this thread, for open-count regressions.
     static ARCHIVE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of hierarchy edges a search examined on this thread, for scan-free regressions.
+    static HIERARCHY_EDGES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 enum ArchiveEntry<'a> {

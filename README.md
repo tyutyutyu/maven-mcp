@@ -40,7 +40,10 @@ The server exposes the following MCP tools:
   annotation name, with an optional JAR filter.
 - `search_type_hierarchy` – finds direct or transitive implementations and
   descendants of interfaces and base classes, including relationship type,
-  depth, and hierarchy path.
+  depth, and hierarchy path. A prebuilt parent-to-child
+  index serves the walk, so deep or wide hierarchies need no repeated fact
+  scans; a class reached through two parents is reported once per parent, and
+  cycles end.
 - `search_class_references` – searches inbound or outbound class, field, and
   method references from the classfile constant pool; a result is a reference,
   not proof of a runtime call site.
