@@ -1,52 +1,147 @@
 use super::{
-    CommandCategory, CommandEvent, EventLog, LogSource, normalize_timestamp, parse_maven_command,
+    CommandCategory, CommandEvent, ENTRY_OVERHEAD_BYTES, EventLog, LimitExceeded, LogSource,
+    ResourceLimits, StateBudget, limits, normalize_timestamp, parse_maven_command,
     shell::repository_category,
 };
-use anyhow::{Result, bail};
-use rusqlite::{Connection, OpenFlags, types::ValueRef};
+use anyhow::{Result, anyhow, bail};
+use rusqlite::{Connection, OpenFlags, Row, types::ValueRef};
 use serde_json::{Map, Value};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 type Object = Map<String, Value>;
 
-pub(super) fn read(path: &Path, source: LogSource) -> Result<EventLog> {
+pub(super) fn read(
+    path: &Path,
+    source: LogSource,
+    limits: &ResourceLimits,
+    budget: &mut StateBudget,
+) -> Result<EventLog> {
+    let charged_before = budget.used();
+    let result = read_source(path, source, limits, budget);
+    if result.is_err() {
+        // A failed file contributes no events, so it must not keep its charges.
+        budget.restore(charged_before);
+    }
+    result
+}
+
+fn read_source(
+    path: &Path,
+    source: LogSource,
+    limits: &ResourceLimits,
+    budget: &mut StateBudget,
+) -> Result<EventLog> {
     let source = if source == LogSource::Auto {
         infer_source(path)?
     } else {
         source
     };
     let mut log = match source {
-        LogSource::Kilo => read_kilo(path)?,
-        LogSource::IntelliJ => read_intellij(path)?,
-        LogSource::Codex => read_codex(path)?,
+        LogSource::Kilo => read_kilo(path, limits, budget)?,
+        LogSource::IntelliJ => read_intellij(path, limits, budget)?,
+        LogSource::Codex => read_codex(path, limits, budget)?,
         LogSource::VsCode | LogSource::VsCodeInsiders => {
-            let value: Value = serde_json::from_reader(File::open(path)?)?;
-            let mut log = EventLog::default();
-            let metadata = workspace_metadata(path);
-            extract(
-                &value,
-                if source == LogSource::VsCode {
-                    "vscode"
-                } else {
-                    "vscode-insiders"
-                },
-                &metadata,
-                &mut log,
-                true,
-            );
-            log
+            read_document(path, source, limits, budget)?
         }
         LogSource::Auto => unreachable!("source resolved above"),
     };
+    let provenance: Arc<str> = Arc::from(source_identity(path, source));
     for event in &mut log.events {
-        event.provenance = source_identity(path, source);
+        event.provenance = provenance.clone();
     }
     Ok(log)
+}
+
+fn read_document(
+    path: &Path,
+    source: LogSource,
+    limits: &ResourceLimits,
+    budget: &mut StateBudget,
+) -> Result<EventLog> {
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > limits.max_input_bytes {
+        return Err(LimitExceeded::Input.into());
+    }
+    // The parsed tree is transient but several times larger than the text.
+    let tree_bytes = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(limits::JSON_TREE_FACTOR);
+    budget.charge(tree_bytes)?;
+    let value: Value = serde_json::from_reader(BufReader::new(file))?;
+    let mut log = EventLog::default();
+    let (metadata, oversized_workspace) = workspace_metadata(path, limits);
+    log.oversized_records += usize::from(oversized_workspace);
+    extract(
+        &value,
+        if source == LogSource::VsCode {
+            "vscode"
+        } else {
+            "vscode-insiders"
+        },
+        &metadata,
+        &mut log,
+        budget,
+        true,
+    )?;
+    budget.release(tree_bytes);
+    Ok(log)
+}
+
+fn push_event(
+    log: &mut EventLog,
+    budget: &mut StateBudget,
+    event: CommandEvent,
+) -> Result<(), LimitExceeded> {
+    budget.charge(event.retained_bytes())?;
+    log.events.push(event);
+    Ok(())
+}
+
+/// Visit each line without ever holding more than `max_record_bytes` of it;
+/// returns the number of oversized lines that were skipped.
+fn for_each_line(
+    path: &Path,
+    max_record_bytes: usize,
+    mut visit: impl FnMut(&str) -> Result<()>,
+) -> Result<usize> {
+    // Room for the longest terminator ("\r\n") plus one byte proving the overrun.
+    let read_cap = max_record_bytes as u64 + 3;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut buffer = Vec::new();
+    let mut oversized = 0;
+    loop {
+        buffer.clear();
+        let read = (&mut reader)
+            .take(read_cap)
+            .read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            return Ok(oversized);
+        }
+        if buffer.last() == Some(&b'\n') {
+            buffer.pop();
+            if buffer.last() == Some(&b'\r') {
+                buffer.pop();
+            }
+        } else if read as u64 == read_cap {
+            reader.skip_until(b'\n')?;
+            oversized += 1;
+            continue;
+        }
+        if buffer.len() > max_record_bytes {
+            oversized += 1;
+            continue;
+        }
+        let line = std::str::from_utf8(&buffer).map_err(|_| anyhow!("input is not valid UTF-8"))?;
+        visit(line)?;
+    }
 }
 
 fn source_identity(path: &Path, source: LogSource) -> String {
@@ -111,6 +206,20 @@ fn field(object: &Object, names: &[&str]) -> Option<String> {
 }
 
 impl Metadata {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + [
+                &self.timestamp,
+                &self.agent,
+                &self.project,
+                &self.session,
+                &self.cwd,
+            ]
+            .into_iter()
+            .map(limits::optional_len)
+            .sum::<usize>()
+    }
+
     fn merge(&self, object: &Object) -> Self {
         Self {
             timestamp: field(
@@ -149,38 +258,46 @@ impl Metadata {
     }
 }
 
-fn workspace_metadata(path: &Path) -> Metadata {
+/// Returns the workspace metadata and whether a workspace.json was skipped
+/// because it exceeded `max_record_bytes` (its project is then unknown).
+fn workspace_metadata(path: &Path, limits: &ResourceLimits) -> (Metadata, bool) {
     // VS Code keeps the workspace URI beside chatSessions, outside the session.
+    let mut oversized = false;
     let workspace = path.ancestors().take(4).find_map(|parent| {
-        let value: Value =
-            serde_json::from_reader(File::open(parent.join("workspace.json")).ok()?).ok()?;
+        let file = File::open(parent.join("workspace.json")).ok()?;
+        if file.metadata().ok()?.len() > limits.max_record_bytes as u64 {
+            oversized = true;
+            return None;
+        }
+        let value: Value = serde_json::from_reader(BufReader::new(file)).ok()?;
         value
             .get("folder")
             .and_then(Value::as_str)
             .map(|s| s.strip_prefix("file://").unwrap_or(s).to_owned())
     });
-    Metadata {
+    let metadata = Metadata {
         project: workspace,
         ..Metadata::default()
-    }
+    };
+    let skipped = oversized && metadata.project.is_none();
+    (metadata, skipped)
 }
 
-fn read_codex(path: &Path) -> Result<EventLog> {
+fn read_codex(path: &Path, limits: &ResourceLimits, budget: &mut StateBudget) -> Result<EventLog> {
     let mut log = EventLog::default();
     let mut context = Metadata {
         agent: Some("codex".to_owned()),
         ..Metadata::default()
     };
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
+    let oversized = for_each_line(path, limits.max_record_bytes, |line| {
         if line.trim().is_empty() {
-            continue;
+            return Ok(());
         }
-        let value: Value = match serde_json::from_str(&line) {
+        let value: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => {
                 log.skipped_records += 1;
-                continue;
+                return Ok(());
             }
         };
         if matches!(
@@ -190,15 +307,16 @@ fn read_codex(path: &Path) -> Result<EventLog> {
             if let Some(payload) = value.get("payload").and_then(Value::as_object) {
                 context = context.merge(payload);
                 if value["type"] == "session_meta" {
-                    context.session = field(payload, &["id"]).or(context.session);
-                    context.project = context.project.or_else(|| context.cwd.clone());
+                    context.session = field(payload, &["id"]).or(context.session.take());
+                    context.project = context.project.take().or_else(|| context.cwd.clone());
                 }
                 context.timestamp = None;
             }
-            continue;
+            return Ok(());
         }
-        extract(&value, "codex", &context, &mut log, true);
-    }
+        extract(&value, "codex", &context, &mut log, budget, true)
+    })?;
+    log.oversized_records = oversized;
     Ok(log)
 }
 
@@ -231,19 +349,26 @@ fn excluded_record(object: &Object) -> bool {
         })
 }
 
-fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, bare: bool) {
+fn extract(
+    value: &Value,
+    ide: &str,
+    inherited: &Metadata,
+    log: &mut EventLog,
+    budget: &mut StateBudget,
+    bare: bool,
+) -> Result<()> {
     if let Some(array) = value.as_array() {
         for child in array {
-            extract(child, ide, inherited, log, bare);
+            extract(child, ide, inherited, log, budget, bare)?;
         }
-        return;
+        return Ok(());
     }
     let Some(object) = value.as_object() else {
-        return;
+        return Ok(());
     };
     let kind = field(object, &["type", "kind"]).unwrap_or_default();
     if excluded_record(object) {
-        return;
+        return Ok(());
     }
     let mut metadata = inherited.merge(object);
     let function = object.get("function").and_then(Value::as_object);
@@ -264,7 +389,7 @@ fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, b
     if invocation {
         // Never look inside the arguments/output of a different tool (e.g. a patch).
         let Some(tool) = tool.filter(|tool| is_shell_tool(tool)) else {
-            return;
+            return Ok(());
         };
         let state = object.get("state").and_then(Value::as_object);
         if object.get("isCanceled") == Some(&Value::Bool(true))
@@ -274,7 +399,7 @@ fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, b
                 .and_then(Value::as_str)
                 .is_some_and(|s| matches!(s, "pending" | "cancelled" | "rejected"))
         {
-            return;
+            return Ok(());
         }
         let arguments = arguments(function.unwrap_or(object)).or_else(|| state.and_then(arguments));
         let terminal = object
@@ -290,15 +415,15 @@ fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, b
             .map(str::to_owned)
             .or_else(|| {
                 arguments
-                    .as_ref()
+                    .as_deref()
                     .and_then(|a| field(a, &["command", "cmd"]))
             })
             .or_else(|| field(object, &["command", "cmd"]));
         let Some(command) = command.filter(|s| !s.trim().is_empty()) else {
             log.skipped_records += 1;
-            return;
+            return Ok(());
         };
-        if let Some(args) = &arguments {
+        if let Some(args) = arguments.as_deref() {
             metadata = metadata.merge(args);
         }
         if let Some(terminal) = terminal.and_then(Value::as_object) {
@@ -313,9 +438,12 @@ fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, b
             object,
             &["call_id", "toolCallId", "tool_call_id", "callID", "id"],
         );
-        log.events
-            .push(make_event(ide, &tool, command, metadata, call_id));
-        return;
+        push_event(
+            log,
+            budget,
+            make_event(ide, &tool, command, metadata, call_id),
+        )?;
+        return Ok(());
     }
     // Traverse only schema containers. Text, documents, patches and tool outputs
     // are deliberately absent; strings are never reparsed as embedded records.
@@ -330,21 +458,22 @@ fn extract(value: &Value, ide: &str, inherited: &Metadata, log: &mut EventLog, b
         "content",
     ] {
         if let Some(child) = object.get(key) {
-            extract(child, ide, &metadata, log, false);
+            extract(child, ide, &metadata, log, budget, false)?;
         }
     }
+    Ok(())
 }
 
-fn arguments(object: &Object) -> Option<Object> {
+fn arguments(object: &Object) -> Option<Cow<'_, Object>> {
     ["arguments", "input", "params", "parameters"]
         .iter()
         .find_map(|key| {
             let value = object.get(*key)?;
-            value.as_object().cloned().or_else(|| {
-                serde_json::from_str::<Value>(value.as_str()?)
-                    .ok()?
-                    .as_object()
-                    .cloned()
+            value.as_object().map(Cow::Borrowed).or_else(|| {
+                match serde_json::from_str::<Value>(value.as_str()?).ok()? {
+                    Value::Object(parsed) => Some(Cow::Owned(parsed)),
+                    _ => None,
+                }
             })
         })
 }
@@ -393,23 +522,26 @@ fn make_event(
         category,
         maven,
         call_id,
-        provenance: String::new(),
+        provenance: Arc::default(),
     }
 }
 
-fn read_intellij(path: &Path) -> Result<EventLog> {
+fn read_intellij(
+    path: &Path,
+    limits: &ResourceLimits,
+    budget: &mut StateBudget,
+) -> Result<EventLog> {
     let mut log = EventLog::default();
     // Anchor at the log header: a marker quoted in chat/tool output is not a call.
     let header = regex::Regex::new(
         r"^(\d{4}-\d{2}-\d{2}[T ][0-9:.,]+(?:Z|[+-]\d{2}:\d{2})?)\s+(?:\[[^\]]*\]\s+)?(?:INFO|DEBUG|TRACE)\s+(?:-\s+[^\s]+\s+-\s+)?(.*)$",
     )?;
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
-        let Some(captures) = header.captures(&line) else {
-            continue;
+    let oversized = for_each_line(path, limits.max_record_bytes, |line| {
+        let Some(captures) = header.captures(line) else {
+            return Ok(());
         };
         let Some(mut rest) = captures.get(2).map(|m| m.as_str()) else {
-            continue;
+            return Ok(());
         };
         let mut metadata = Metadata {
             timestamp: captures
@@ -434,19 +566,25 @@ fn read_intellij(path: &Path) -> Result<EventLog> {
             .iter()
             .find_map(|marker| rest.strip_prefix(marker));
         if let Some(command) = command.filter(|s| !s.trim().is_empty()) {
-            log.events.push(make_event(
-                "intellij",
-                "terminal",
-                command.trim().to_owned(),
-                metadata,
-                None,
-            ));
+            push_event(
+                &mut log,
+                budget,
+                make_event(
+                    "intellij",
+                    "terminal",
+                    command.trim().to_owned(),
+                    metadata,
+                    None,
+                ),
+            )?;
         }
-    }
+        Ok(())
+    })?;
+    log.oversized_records = oversized;
     Ok(log)
 }
 
-fn read_kilo(path: &Path) -> Result<EventLog> {
+fn read_kilo(path: &Path, limits: &ResourceLimits, budget: &mut StateBudget) -> Result<EventLog> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -456,38 +594,48 @@ fn read_kilo(path: &Path) -> Result<EventLog> {
     let names = tables
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut sessions = BTreeMap::new();
-    let mut messages = BTreeMap::new();
+    let mut log = EventLog::default();
+    let mut sessions: BTreeMap<String, Metadata> = BTreeMap::new();
+    // Only the message agent is consulted later, so only it is retained.
+    let mut messages: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let charged_before_metadata = budget.used();
     for name in &names {
-        if matches!(
+        if !matches!(
             name.as_str(),
             "session" | "sessions" | "message" | "messages"
         ) {
-            for row in database_rows(&connection, name)? {
-                let mut meta = Metadata {
-                    agent: Some("kilo".to_owned()),
-                    ..Metadata::default()
-                }
-                .merge(&row);
-                if let Some(data) = row.get("data").and_then(Value::as_object) {
-                    meta = meta.merge(data);
-                }
-                if let Some(id) = field(&row, &["id"]) {
-                    if name.starts_with("session") {
-                        meta.session = Some(id.clone());
-                        sessions.insert(id, meta);
-                    } else {
-                        messages.insert(id, meta);
-                    }
-                }
-            }
+            continue;
         }
+        let oversized = for_each_database_row(&connection, name, limits, |row| {
+            let mut meta = Metadata {
+                agent: Some("kilo".to_owned()),
+                ..Metadata::default()
+            }
+            .merge(&row);
+            if let Some(data) = row.get("data").and_then(Value::as_object) {
+                meta = meta.merge(data);
+            }
+            let Some(id) = field(&row, &["id"]) else {
+                return Ok(());
+            };
+            if name.starts_with("session") {
+                meta.session = Some(id.clone());
+                remember(&mut sessions, budget, id, meta, Metadata::retained_bytes)?;
+            } else {
+                remember(&mut messages, budget, id, meta.agent, |agent| {
+                    std::mem::size_of::<Option<String>>() + limits::optional_len(agent)
+                })?;
+            }
+            Ok(())
+        })?;
+        log.oversized_records += oversized;
     }
-    let mut log = EventLog::default();
+    // The metadata maps are dropped on return; only the events keep their charges.
+    let metadata_charge = budget.used().saturating_sub(charged_before_metadata);
     for name in names {
-        for row in database_rows(&connection, &name)? {
+        let oversized = for_each_database_row(&connection, &name, limits, |row| {
             if excluded_record(&row) {
-                continue;
+                return Ok(());
             }
             let session = field(&row, &["session_id", "sessionID"]);
             let mut metadata = session
@@ -501,27 +649,25 @@ fn read_kilo(path: &Path) -> Result<EventLog> {
             if let Some(message) =
                 field(&row, &["message_id", "messageID"]).and_then(|id| messages.get(&id))
             {
-                metadata.agent = message.agent.clone().or(metadata.agent);
+                metadata.agent = message.clone().or(metadata.agent);
             }
             metadata.timestamp = None;
             metadata = metadata.merge(&row);
+            let row = Value::Object(row);
+            let Some(object) = row.as_object() else {
+                return Ok(());
+            };
             // A bare command column is not evidence that a tool ran.
             if ["tool", "tool_name", "toolName", "toolId"]
                 .iter()
-                .any(|key| row.contains_key(*key))
+                .any(|key| object.contains_key(*key))
             {
-                extract(
-                    &Value::Object(row.clone()),
-                    "kilo",
-                    &metadata,
-                    &mut log,
-                    true,
-                );
+                extract(&row, "kilo", &metadata, &mut log, budget, true)?;
             }
             for key in ["payload", "data", "json", "content", "value"] {
-                if let Some(value) = row.get(key) {
+                if let Some(value) = object.get(key) {
                     if value.is_object() || value.is_array() {
-                        extract(value, "kilo", &metadata, &mut log, true);
+                        extract(value, "kilo", &metadata, &mut log, budget, true)?;
                     } else if value
                         .as_str()
                         .is_some_and(|s| s.starts_with('{') || s.starts_with('['))
@@ -530,45 +676,114 @@ fn read_kilo(path: &Path) -> Result<EventLog> {
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
+        log.oversized_records += oversized;
     }
+    drop((sessions, messages));
+    budget.release(metadata_charge);
     Ok(log)
 }
 
-fn database_rows(connection: &Connection, table: &str) -> Result<Vec<Object>> {
-    let mut statement =
-        connection.prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))?;
-    let columns = statement
+/// Insert a keyed entry after charging it; a replaced entry's charge is returned.
+fn remember<V>(
+    map: &mut BTreeMap<String, V>,
+    budget: &mut StateBudget,
+    id: String,
+    value: V,
+    size: impl Fn(&V) -> usize,
+) -> Result<(), LimitExceeded> {
+    let key_length = id.len();
+    budget.charge(key_length + size(&value) + ENTRY_OVERHEAD_BYTES)?;
+    if let Some(previous) = map.insert(id, value) {
+        budget.release(key_length + size(&previous) + ENTRY_OVERHEAD_BYTES);
+    }
+    Ok(())
+}
+
+/// Stream one table row at a time; returns the number of oversized rows skipped.
+fn for_each_database_row(
+    connection: &Connection,
+    table: &str,
+    limits: &ResourceLimits,
+    mut visit: impl FnMut(Object) -> Result<()>,
+) -> Result<usize> {
+    let table = quote_identifier(table);
+    let columns = connection
+        .prepare(&format!("SELECT * FROM {table}"))?
         .column_names()
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
-    let rows = statement
-        .query_map([], |row| {
-            let mut object = Map::new();
-            for (i, column) in columns.iter().enumerate() {
-                let value = match row.get_ref(i)? {
-                    ValueRef::Text(s) => {
-                        let text = String::from_utf8_lossy(s);
-                        if matches!(
-                            column.as_str(),
-                            "payload" | "data" | "json" | "content" | "value"
-                        ) {
-                            serde_json::from_str(&text)
-                                .unwrap_or_else(|_| Value::String(text.into_owned()))
-                        } else {
-                            Value::String(text.into_owned())
-                        }
-                    }
-                    ValueRef::Integer(n) => Value::from(n),
-                    _ => Value::Null,
-                };
-                object.insert(column.clone(), value);
+    let mut statement = connection.prepare(&guarded_row_query(&table, &columns))?;
+    let mut rows = statement.query([i64::try_from(limits.max_record_bytes).unwrap_or(i64::MAX)])?;
+    let mut oversized = 0;
+    while let Some(row) = rows.next()? {
+        match row_object(row, &columns, limits.max_record_bytes)? {
+            Some(object) => visit(object)?,
+            None => oversized += 1,
+        }
+    }
+    Ok(oversized)
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Select the row size first and every column only when the row fits.
+/// `octet_length` of a column reads only the record header, so an oversized
+/// TEXT/BLOB value is never loaded from its overflow pages.
+fn guarded_row_query(table: &str, columns: &[String]) -> String {
+    let size = if columns.is_empty() {
+        "0".to_owned()
+    } else {
+        columns
+            .iter()
+            .map(|column| format!("coalesce(octet_length({}), 0)", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    };
+    let guarded = columns.iter().map(|column| {
+        format!(
+            ", CASE WHEN {size} <= ?1 THEN {} END",
+            quote_identifier(column)
+        )
+    });
+    format!("SELECT {size}{} FROM {table}", guarded.collect::<String>())
+}
+
+/// Convert a guarded row (size first, then the columns), or return `None`
+/// without having loaded any value when it is oversized.
+fn row_object(
+    row: &Row<'_>,
+    columns: &[String],
+    max_record_bytes: usize,
+) -> rusqlite::Result<Option<Object>> {
+    let size = usize::try_from(row.get::<_, i64>(0)?).unwrap_or(usize::MAX);
+    if size > max_record_bytes {
+        return Ok(None);
+    }
+    let mut object = Map::new();
+    for (i, column) in columns.iter().enumerate() {
+        let value = match row.get_ref(i + 1)? {
+            ValueRef::Text(s) => {
+                let text = String::from_utf8_lossy(s);
+                if matches!(
+                    column.as_str(),
+                    "payload" | "data" | "json" | "content" | "value"
+                ) {
+                    serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.into_owned()))
+                } else {
+                    Value::String(text.into_owned())
+                }
             }
-            Ok(object)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+            ValueRef::Integer(n) => Value::from(n),
+            _ => Value::Null,
+        };
+        object.insert(column.clone(), value);
+    }
+    Ok(Some(object))
 }
 
 pub fn discover_default_sources() -> Vec<PathBuf> {

@@ -1,5 +1,7 @@
 //! Secret-free fixtures exercise the real standalone process, never the MCP server.
-use maven_mcp::log_analysis::{LogSource, read_event_log, read_events};
+use maven_mcp::log_analysis::{
+    ENTRY_OVERHEAD_BYTES, LogSource, read_event_log, read_events, retained_bytes,
+};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -595,4 +597,307 @@ fn overlapping_intellij_rotations_merge_without_merging_unrelated_logs() {
         json_output(&[root.path()], &["--group-by", "category"]),
         json!([{"group":"maven","count":4}])
     );
+}
+
+fn codex_call(id: usize, session: &str, command: &str) -> String {
+    json!({
+        "type": "function_call", "name": "shell", "call_id": format!("call-{id}"),
+        "session_id": session, "arguments": json!({"command": command}).to_string()
+    })
+    .to_string()
+}
+
+fn write_jsonl(path: &Path, lines: &[String]) {
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn a_giant_record_is_skipped_and_the_result_is_indicated_as_partial() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.jsonl");
+    let giant = json!({"type": "message", "text": "x".repeat(200_000)}).to_string();
+    write_jsonl(
+        &path,
+        &[
+            codex_call(1, "s", "mvn test"),
+            giant.clone(),
+            codex_call(2, "s", "mvn verify"),
+        ],
+    );
+    let output = run(
+        &[&path],
+        &["--max-record-bytes", "4096", "--format", "json"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report.as_array().unwrap().len(), 2);
+    let diagnostics = stderr(&output);
+    assert!(
+        diagnostics.contains("1 records over --max-record-bytes"),
+        "{diagnostics}"
+    );
+    assert!(diagnostics.contains("report is partial"));
+    assert!(!diagnostics.contains("xxxx"));
+
+    // Only oversized input: no silent empty success.
+    write_jsonl(&path, &[giant]);
+    let output = run(&[&path], &["--max-record-bytes", "4096"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("report is partial"));
+
+    // Below the limit the same file is processed completely and silently.
+    let output = run(&[&path], &["--format", "json"]);
+    assert!(output.status.success());
+    assert!(!stderr(&output).contains("partial"));
+}
+
+#[test]
+fn an_oversized_whole_document_input_is_rejected_by_the_input_limit() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.json");
+    std::fs::write(
+        &path,
+        json!({"requests": [], "padding": "x".repeat(50_000)}).to_string(),
+    )
+    .unwrap();
+    let output = run(
+        &[&path],
+        &["--max-input-bytes", "1024", "--source", "vs-code"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--max-input-bytes"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn many_unique_dedup_and_group_keys_fail_before_exceeding_the_state_budget() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.jsonl");
+    let lines: Vec<String> = (0..400)
+        .map(|id| {
+            codex_call(
+                id,
+                &format!("unique-session-{id}"),
+                &format!("mvn test -Dn={id}"),
+            )
+        })
+        .collect();
+    write_jsonl(&path, &lines);
+    // The event state alone is what reading charges; leave only a sliver spare.
+    let retained: usize = read_event_log(&path, LogSource::Codex)
+        .unwrap()
+        .events
+        .iter()
+        .map(|event| event.retained_bytes())
+        .sum();
+    let budget = (retained + 1_024).to_string();
+
+    let kept = run(
+        &[&path],
+        &[
+            "--max-state-bytes",
+            &budget,
+            "--keep-duplicates",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(kept.status.success(), "{}", stderr(&kept));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&kept.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        400
+    );
+
+    for extra in [&[][..], &["--keep-duplicates", "--group-by", "session"][..]] {
+        let mut arguments = vec!["--max-state-bytes", budget.as_str(), "--format", "json"];
+        arguments.extend(extra);
+        let output = run(&[&path], &arguments);
+        assert!(!output.status.success(), "{extra:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "no partial report on budget exhaustion"
+        );
+        assert!(stderr(&output).contains("--max-state-bytes"));
+    }
+
+    let reading = run(&[&path], &["--max-state-bytes", "20000"]);
+    assert!(!reading.status.success());
+    assert!(reading.stdout.is_empty());
+    assert!(stderr(&reading).contains("--max-state-bytes"));
+    assert!(!run(&[&path], &["--max-state-bytes", "0"]).status.success());
+}
+
+fn large_kilo_database(path: &Path, rows: usize) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session(id TEXT, directory TEXT); CREATE TABLE part(id TEXT, session_id TEXT, data TEXT);",
+    )
+    .unwrap();
+    let transaction = conn.unchecked_transaction().unwrap();
+    for session in 0..3 {
+        transaction
+            .execute(
+                "INSERT INTO session VALUES (?1, ?2)",
+                (
+                    format!("session-{session}"),
+                    format!("/home/jane-doe/work/app-{session}"),
+                ),
+            )
+            .unwrap();
+    }
+    for row in 0..rows {
+        let data = json!({"type": "tool", "tool": "bash", "callID": format!("c{row}"), "state": {
+            "input": {"command": format!("./mvnw test -Dtoken={} -Dn={}", "hunter2", row % 7),
+                      "cwd": "/home/jane-doe/work/app"},
+            "time": {"start": 1767225600000i64 + row as i64}}});
+        transaction
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3)",
+                (
+                    format!("p{row}"),
+                    format!("session-{}", row % 3),
+                    data.to_string(),
+                ),
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn large_sqlite_reports_group_dedupe_and_redact_like_small_ones() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("kilo.db");
+    large_kilo_database(&path, 6_000);
+    let before = std::fs::read(&path).unwrap();
+    let events = json_output(&[&path], &[]);
+    assert_eq!(events.as_array().unwrap().len(), 6_000);
+    let report = events.to_string();
+    for forbidden in ["hunter2", "jane-doe", "/home/"] {
+        assert!(!report.contains(forbidden), "{forbidden}");
+    }
+    assert!(report.contains("<REDACTED>"));
+
+    let groups = json_output(&[&path], &["--group-by", "session"]);
+    assert_eq!(
+        groups,
+        json!([
+            {"group": "session-0", "count": 2_000},
+            {"group": "session-1", "count": 2_000},
+            {"group": "session-2", "count": 2_000}
+        ])
+    );
+    let by_project = json_output(&[&path], &["--group-by", "project"]);
+    let counts: Vec<u64> = by_project
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["count"].as_u64().unwrap())
+        .collect();
+    assert_eq!(counts, vec![2_000; 3]);
+    assert!(by_project.to_string().contains("<WORKSPACE> [1]"));
+    assert!(!by_project.to_string().contains("jane-doe"));
+
+    // A tight row limit drops the rows loudly instead of reading them.
+    let output = run(&[&path], &["--max-record-bytes", "64", "--format", "json"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("records over --max-record-bytes"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn redaction_growth_over_the_state_budget_fails_without_a_report() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.jsonl");
+    // Every control character becomes a five-byte escape when redacted.
+    let command = format!("echo {}", "\u{1}".repeat(20_000));
+    write_jsonl(&path, &[codex_call(1, "s", &command)]);
+    let retained = retained_bytes(&read_event_log(&path, LogSource::Codex).unwrap().events);
+    let run_with = |budget: usize| {
+        run(
+            &[&path],
+            &[
+                "--max-state-bytes",
+                &budget.to_string(),
+                "--keep-duplicates",
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let grown = run_with(retained + 4_096);
+    assert!(!grown.status.success());
+    assert!(grown.stdout.is_empty(), "no report on budget exhaustion");
+    assert!(stderr(&grown).contains("--max-state-bytes"));
+    // Unredacted, the same budget holds the event.
+    let mut raw_arguments = vec!["--unsafe-no-redact"];
+    let budget = (retained + 4_096).to_string();
+    raw_arguments.extend(["--max-state-bytes", &budget, "--keep-duplicates"]);
+    assert!(run(&[&path], &raw_arguments).status.success());
+    let roomy = run_with(retained + 200_000);
+    assert!(roomy.status.success(), "{}", stderr(&roomy));
+}
+
+#[test]
+fn the_grouping_workspace_is_charged_before_counting() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("session.jsonl");
+    // Long keys make collecting cost more than the later label-suffix tables.
+    let lines: Vec<String> = (0..400)
+        .map(|id| codex_call(id, &format!("{id:0>100}"), "mvn test"))
+        .collect();
+    write_jsonl(&path, &lines);
+    let events = read_event_log(&path, LogSource::Codex).unwrap().events;
+    let sessions: Vec<usize> = events
+        .iter()
+        .map(|event| event.session.as_deref().unwrap().len())
+        .collect();
+    // Collecting the raw identities: one index per event plus one entry per key.
+    let collect: usize = events.len() * std::mem::size_of::<usize>()
+        + sessions
+            .iter()
+            .map(|key| key + std::mem::size_of::<usize>() + ENTRY_OVERHEAD_BYTES)
+            .sum::<usize>();
+    // The kept result: one redacted label and one (label, count) row per group.
+    let result: usize = sessions
+        .iter()
+        .map(|label| label + ENTRY_OVERHEAD_BYTES + std::mem::size_of::<(String, usize)>())
+        .sum();
+    // Enough for everything except the per-identity label and count slots that
+    // counting allocates; 512 bytes cover the redaction tables.
+    let collected = retained_bytes(&events) + collect + result + 512;
+    let run_with = |budget: usize| {
+        run(
+            &[&path],
+            &[
+                "--max-state-bytes",
+                &budget.to_string(),
+                "--keep-duplicates",
+                "--group-by",
+                "session",
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let counting = run_with(collected);
+    assert!(!counting.status.success());
+    assert!(counting.stdout.is_empty(), "no report on budget exhaustion");
+    assert!(stderr(&counting).contains("--max-state-bytes"));
+    let counted = run_with(collected + 400 * 400);
+    assert!(counted.status.success(), "{}", stderr(&counted));
+    let groups: Value = serde_json::from_slice(&counted.stdout).unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 400);
 }

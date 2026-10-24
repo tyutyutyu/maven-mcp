@@ -1,17 +1,23 @@
 //! Offline extraction of recorded shell invocations. No command is executed.
+mod limits;
 mod privacy;
 mod shell;
 mod sources;
 mod time;
 
 use anyhow::Result;
-pub use privacy::redact_events;
+pub use limits::{
+    DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_STATE_BYTES,
+    ENTRY_OVERHEAD_BYTES, LimitExceeded, ResourceLimits, StateBudget,
+};
+pub use privacy::{redact_events, redact_events_within};
 use serde::{Deserialize, Serialize};
 pub use shell::parse_maven_command;
 pub use sources::{discover_default_sources, supported_file};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 pub use time::normalize_timestamp;
 
@@ -42,7 +48,7 @@ pub struct CommandEvent {
     pub maven: Option<MavenCommand>,
     // Disambiguates records without a session; never appears in a report.
     #[serde(skip)]
-    provenance: String,
+    provenance: Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,15 +106,50 @@ pub struct EventFilter {
 pub struct EventLog {
     pub events: Vec<CommandEvent>,
     pub skipped_records: usize,
+    /// Records skipped because they exceeded the record size limit.
+    pub oversized_records: usize,
 }
 
 /// Read without deduplication so callers can combine mirrored files first.
 pub fn read_event_log(path: &Path, source: LogSource) -> Result<EventLog> {
-    sources::read(path, source)
+    read_event_log_limited(
+        path,
+        source,
+        &ResourceLimits::default(),
+        &mut StateBudget::unlimited(),
+    )
+}
+
+/// Read under explicit limits; retained events are charged to the shared budget.
+/// A [`LimitExceeded`] error is downcastable from the returned error.
+pub fn read_event_log_limited(
+    path: &Path,
+    source: LogSource,
+    limits: &ResourceLimits,
+    budget: &mut StateBudget,
+) -> Result<EventLog> {
+    sources::read(path, source, limits, budget)
 }
 
 pub fn read_events(path: &Path, source: LogSource) -> Result<Vec<CommandEvent>> {
     Ok(deduplicate_events(read_event_log(path, source)?.events))
+}
+
+/// Filter like [`filter_events`] and give the charges of dropped events back to `budget`.
+pub fn filter_events_within(
+    events: Vec<CommandEvent>,
+    filter: &EventFilter,
+    budget: &mut StateBudget,
+) -> Vec<CommandEvent> {
+    let before = retained_bytes(&events);
+    let kept = filter_events(events, filter);
+    budget.release(before.saturating_sub(retained_bytes(&kept)));
+    kept
+}
+
+/// Total estimated bytes the events retain; see [`CommandEvent::retained_bytes`].
+pub fn retained_bytes(events: &[CommandEvent]) -> usize {
+    events.iter().map(CommandEvent::retained_bytes).sum()
 }
 
 pub fn filter_events(events: Vec<CommandEvent>, filter: &EventFilter) -> Vec<CommandEvent> {
@@ -144,8 +185,41 @@ fn matches_filter(expected: &Option<String>, actual: Option<&String>) -> bool {
 /// Call IDs identify progressive updates; without one, require a timestamp and
 /// all identity fields to agree. Never collapse legitimate untimed repetitions.
 pub fn deduplicate_events(events: Vec<CommandEvent>) -> Vec<CommandEvent> {
-    let mut calls = BTreeMap::new();
+    deduplicate_events_within(events, &mut StateBudget::unlimited())
+        .unwrap_or_else(|_| unreachable!("an unlimited budget cannot be exceeded"))
+}
+
+type DedupKey = (
+    String,
+    Option<String>,
+    Option<String>,
+    Arc<str>,
+    String,
+    (&'static str, String),
+);
+
+fn dedup_key_bytes(key: &DedupKey) -> usize {
+    std::mem::size_of::<DedupKey>()
+        + ENTRY_OVERHEAD_BYTES
+        + key.0.len()
+        + limits::optional_len(&key.1)
+        + limits::optional_len(&key.2)
+        + key.3.len()
+        + key.4.len()
+        + (key.5).1.len()
+}
+
+/// Deduplicate while charging the identity keys to `budget`; the keys are
+/// released again before returning. The events are expected to be charged to
+/// `budget` already: a merged-away event gives its charge back, so afterwards
+/// the budget holds only the surviving events.
+pub fn deduplicate_events_within(
+    events: Vec<CommandEvent>,
+    budget: &mut StateBudget,
+) -> Result<Vec<CommandEvent>, LimitExceeded> {
+    let mut calls: BTreeMap<DedupKey, usize> = BTreeMap::new();
     let mut result: Vec<CommandEvent> = Vec::new();
+    let mut charged = 0;
     for event in events {
         let identity = event.call_id.clone().map(|id| ("id", id)).or_else(|| {
             event.timestamp.as_ref().map(|time| {
@@ -169,14 +243,15 @@ pub fn deduplicate_events(events: Vec<CommandEvent>) -> Vec<CommandEvent> {
             event.project.clone(),
             event
                 .session
-                .clone()
-                .unwrap_or_else(|| event.provenance.clone()),
+                .as_deref()
+                .map_or_else(|| event.provenance.clone(), Arc::from),
             event.tool.clone(),
             identity,
         );
         if let Some(&index) = calls.get(&key) {
             // Prefer the most complete progressive command, independent of input order.
             let previous: &mut CommandEvent = &mut result[index];
+            let merged_bytes = previous.retained_bytes() + event.retained_bytes();
             let earliest = match (&previous.timestamp, &event.timestamp) {
                 (Some(a), Some(b)) => Some(a.min(b).clone()),
                 (a, b) => a.clone().or_else(|| b.clone()),
@@ -185,13 +260,27 @@ pub fn deduplicate_events(events: Vec<CommandEvent>) -> Vec<CommandEvent> {
                 *previous = event;
             }
             previous.timestamp = earliest;
+            // The survivor never exceeds the two merged events, so this cannot fail.
+            budget.release(merged_bytes);
+            let survivor = previous.retained_bytes();
+            if let Err(error) = budget.charge(survivor) {
+                budget.release(charged);
+                return Err(error);
+            }
         } else {
+            let bytes = dedup_key_bytes(&key);
+            if let Err(error) = budget.charge(bytes) {
+                budget.release(charged);
+                return Err(error);
+            }
+            charged += bytes;
             calls.insert(key, result.len());
             result.push(event);
         }
     }
+    budget.release(charged);
     sort_events(&mut result);
-    result
+    Ok(result)
 }
 
 pub fn sort_events(events: &mut [CommandEvent]) {
