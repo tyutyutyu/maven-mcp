@@ -318,6 +318,7 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "list_artifact_versions",
         "list_jar_classes",
         "list_maven_test_classes",
+        "refresh_maven_project",
         "run_maven",
         "run_maven_lifecycle",
         "run_maven_test",
@@ -373,6 +374,23 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
             Some("object"),
             "{} output schema must be an object",
             tool.name
+        );
+    }
+    let refresh_schema = tools
+        .iter()
+        .find(|tool| tool.name == "refresh_maven_project")
+        .and_then(|tool| tool.output_schema.as_ref())
+        .expect("refresh_maven_project must publish an output schema");
+    for field in [
+        "status",
+        "invalidated",
+        "model_reloaded",
+        "index_rebuilt",
+        "index",
+    ] {
+        assert!(
+            refresh_schema["properties"].get(field).is_some(),
+            "refresh_maven_project schema missing {field}"
         );
     }
     let lifecycle_schema = tools
@@ -1400,6 +1418,7 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
         "get_maven_classpath",
         "inspect_maven_project",
         "list_maven_test_classes",
+        "refresh_maven_project",
         "run_maven",
         "run_maven_lifecycle",
         "run_maven_test",
@@ -2267,6 +2286,301 @@ async fn invalidation_during_a_build_discards_the_stale_index() -> Result<()> {
 #[tokio::test]
 async fn project_files_changing_during_a_build_prevent_stale_publication() -> Result<()> {
     invalidate_while_building(false).await
+}
+
+/// The refresh outcome flags that distinguish a finished rebuild from a mere invalidation.
+fn assert_refreshed(result: &Value) {
+    assert_eq!(result["status"], "refreshed", "{result}");
+    for flag in ["invalidated", "model_reloaded", "index_rebuilt"] {
+        assert_eq!(result[flag], true, "{flag} in {result}");
+    }
+}
+
+/// Every entry of the project's execution repository (the server's `MAVEN_EXECUTION_REPO_PATH`)
+/// with its relative path, contents (a symlink's target) and modification time, sorted, so a
+/// created, modified or deleted file or directory changes the snapshot.
+fn repository_snapshot(project: &Path) -> Result<Vec<(PathBuf, Vec<u8>, std::time::SystemTime)>> {
+    let repository = project.join("execution-repository");
+    let mut pending = vec![repository.clone()];
+    let mut entries = Vec::new();
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let contents = if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+            Vec::new()
+        } else if metadata.file_type().is_symlink() {
+            std::fs::read_link(&path)?
+                .into_os_string()
+                .into_encoded_bytes()
+        } else {
+            std::fs::read(&path)?
+        };
+        let relative = path.strip_prefix(&repository)?.to_owned();
+        entries.push((relative, contents, metadata.modified()?));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+#[tokio::test]
+async fn refresh_rebuilds_from_the_current_project_without_touching_the_repository() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    let project_path = project.display().to_string();
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+
+    // Maven rewrote the classpath without changing any file the cache stamps.
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "beta")])?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"]),
+        "the cache cannot see the change on its own"
+    );
+    let repository_before = repository_snapshot(&project)?;
+
+    let refreshed = call(
+        &client,
+        "refresh_maven_project",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
+    assert_refreshed(&refreshed);
+    assert_eq!(refreshed["index"]["jar_count"], 1, "{refreshed}");
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.BetaOne"])
+    );
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        2,
+        "the refreshed index is cached"
+    );
+    assert_eq!(repository_snapshot(&project)?, repository_before);
+
+    // The model is re-read too, even though no stamped file changed.
+    std::fs::create_dir_all(project.join("late"))?;
+    std::fs::write(
+        project.join("late/pom.xml"),
+        "<project><artifactId>late</artifactId></project>",
+    )?;
+    let pom = project.join("pom.xml");
+    let original = std::fs::read(&pom)?;
+    std::fs::write(
+        &pom,
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>fixture-project</artifactId><version>1.0</version><packaging>pom</packaging><modules><module>late</module></modules></project>",
+    )?;
+    assert_refreshed(
+        &call(
+            &client,
+            "refresh_maven_project",
+            json!({ "project_path": project_path }),
+        )
+        .await?,
+    );
+    let inspected = call(
+        &client,
+        "inspect_maven_project",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
+    assert_eq!(inspected["modules"][0]["selector"], "late");
+    std::fs::write(&pom, original)?;
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_requires_a_trusted_project_and_changes_nothing_otherwise() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let other_server = TestServer::start_with_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    class_names(&client, &project, "One").await?;
+
+    let untrusted = call_error(
+        &client,
+        "refresh_maven_project",
+        json!({ "project_path": other_server.project_path().unwrap().display().to_string() }),
+    )
+    .await;
+    assert!(
+        untrusted.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"),
+        "{untrusted}"
+    );
+    let relative = call_error(
+        &client,
+        "refresh_maven_project",
+        json!({ "project_path": "relative/project" }),
+    )
+    .await;
+    assert!(relative.contains("absolute"), "{relative}");
+    for error in [&untrusted, &relative] {
+        assert!(
+            !error.contains("invalidated but the refresh did not complete"),
+            "a rejected path invalidates nothing: {error}"
+        );
+    }
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refreshing_one_project_leaves_another_projects_cache_alone() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, 2)?;
+    let (first, second) = (&projects[0], &projects[1]);
+    support::write_class_jar(
+        &repository_jar(first, "beta"),
+        &class_list(&["org/t/BetaOne"]),
+    )?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    for project in [first, second] {
+        assert_eq!(
+            class_names(&client, project, "One").await?,
+            names(&["org.t.AlphaOne"])
+        );
+    }
+    let repository_before = repository_snapshot(first)?;
+
+    for project in [first, second] {
+        support::set_controlled_classpath(project, &[repository_jar(first, "beta")])?;
+    }
+    assert_refreshed(
+        &call(
+            &client,
+            "refresh_maven_project",
+            json!({ "project_path": first.display().to_string() }),
+        )
+        .await?,
+    );
+
+    assert_eq!(
+        class_names(&client, first, "One").await?,
+        names(&["org.t.BetaOne"])
+    );
+    assert_eq!(
+        class_names(&client, second, "One").await?,
+        names(&["org.t.AlphaOne"]),
+        "the other project keeps its cached index"
+    );
+    assert_eq!(support::controlled_classpath_runs(first), 2);
+    assert_eq!(support::controlled_classpath_runs(second), 1);
+    assert_eq!(repository_snapshot(first)?, repository_before);
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_during_a_running_build_prevents_the_old_build_from_publishing() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    let project_path = project.display().to_string();
+    std::fs::write(project.join("gate"), "")?;
+
+    let building = class_names(&client, &project, "One");
+    let refreshing = async {
+        let started = project.join("classpath-started");
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(started.exists(), "the first Maven build never started");
+        // The running build already read the old classpath.
+        support::set_controlled_classpath(
+            &project,
+            &[
+                repository_jar(&project, "alpha"),
+                repository_jar(&project, "beta"),
+            ],
+        )?;
+        let refresh = call(
+            &client,
+            "refresh_maven_project",
+            json!({ "project_path": project_path }),
+        );
+        let release = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            std::fs::remove_file(project.join("gate"))?;
+            anyhow::Ok(())
+        };
+        let (refreshed, released) = tokio::join!(refresh, release);
+        released?;
+        refreshed
+    };
+    let (found, refreshed) = tokio::join!(building, refreshing);
+    assert_refreshed(&refreshed?);
+    found?;
+
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne", "org.t.BetaOne"]),
+        "the build that started before the refresh must not have been published"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_refresh_is_an_error_and_leaves_the_project_invalidated() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    let project_path = project.display().to_string();
+    class_names(&client, &project, "One").await?;
+
+    std::fs::write(project.join("fail-classpath"), "")?;
+    let failure = call_error(
+        &client,
+        "refresh_maven_project",
+        json!({ "project_path": project_path }),
+    )
+    .await;
+    assert!(
+        failure.contains("invalidated but the refresh did not complete"),
+        "{failure}"
+    );
+    assert!(
+        failure.contains("classpath resolution failed on purpose"),
+        "{failure}"
+    );
+    let search = call_error(
+        &client,
+        "search_classes",
+        json!({ "project_path": project_path, "query": "One" }),
+    )
+    .await;
+    assert!(
+        search.contains("classpath resolution failed on purpose"),
+        "the old index must not be served after a failed refresh: {search}"
+    );
+
+    std::fs::remove_file(project.join("fail-classpath"))?;
+    assert_refreshed(
+        &call(
+            &client,
+            "refresh_maven_project",
+            json!({ "project_path": project_path }),
+        )
+        .await?,
+    );
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+
+    client.cancel().await?;
+    Ok(())
 }
 
 #[tokio::test]

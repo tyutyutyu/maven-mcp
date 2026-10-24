@@ -93,6 +93,9 @@ Project inspection and execution use the same request `project_path`:
 
 - `inspect_maven_project` – models the root project, Maven Wrapper, and recursive
   reactor modules.
+- `refresh_maven_project` – explicitly refreshes one project: drops its cached
+  model and index, abandons a running index build, re-reads the POMs, wrapper and
+  Maven configuration, and rebuilds the index (see [Explicit refresh](#explicit-refresh)).
 - `run_maven` – runs any Maven phases, plugin goals and options from an exact
   argument list, returning execution status and bounded, redacted output.
 - `run_maven_lifecycle` – runs the allowlisted `compile`, `test-compile`, or
@@ -169,6 +172,43 @@ always re-read the model and drop the index afterwards, because Maven may have
 changed POMs, dependencies or reactor outputs. Parent POMs outside the project,
 `settings.xml` and the contents of the local repository beyond the classpath JARs
 are not watched; use `run_maven` (or restart the server) after changing them.
+
+### Explicit refresh
+
+`refresh_maven_project` (input: `project_path` only) is the manual counterpart of
+the automatic invalidation above, for changes the stamps cannot see (a parent POM
+outside the project, `settings.xml`, a dependency re-resolved by another tool).
+It requires the same trusted canonical `project_path` as every other project
+operation and then, for that project only:
+
+1. drops the cached model and index and abandons a running index build, so a build
+   that started earlier can never publish (the project gets a new generation);
+2. re-discovers the runner (POMs, reactor modules, Maven Wrapper or `mvn`
+   selection, `.mvn` configuration);
+3. rebuilds the index. This **starts Maven** (`dependency:build-classpath`)
+   through the shared execution permit, so it waits behind a running Maven
+   process like any cold request and uses the same Java selection, timeout and
+   output limits. It never touches any other project's cached state.
+
+The refresh itself never deletes, purges or rewrites local Maven repository
+content. Its classpath goal follows the same network policy as a cold request:
+by default it runs `--offline` and only reads artifacts already in the
+repository; with `MAVEN_EXECUTION_NETWORK=true` Maven may download missing
+artifacts into the configured repository (`MAVEN_EXECUTION_REPO_PATH` or
+`$HOME/.m2/repository`), exactly as any cold request would.
+
+The response is `{ "status": "refreshed", "invalidated": true,
+"model_reloaded": true, "index_rebuilt": true, "index": { ...index_stats } }` and
+is returned only after the new index exists. Failures come in two kinds:
+
+- A `project_path` that fails validation (relative, missing, not a Maven project,
+  or outside `MAVEN_TRUSTED_PROJECT_DIRECTORIES`) is a plain MCP error raised
+  before anything is invalidated; no cache state changes.
+- Any failure after the invalidation (a Maven or classpath failure, an
+  unindexable classpath entry, a project that keeps changing) is an MCP error
+  whose message starts with "the project cache was invalidated but the refresh
+  did not complete"; the project then stays invalidated and the next request
+  retries, so an invalidation is never reported as a refresh.
 
 Concurrent cold requests for one project share a single Maven classpath run and
 index build and receive the same result or the same error; after a failure the
