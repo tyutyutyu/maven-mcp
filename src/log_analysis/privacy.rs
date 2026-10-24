@@ -1,6 +1,6 @@
-use super::CommandEvent;
+use super::{CommandEvent, ENTRY_OVERHEAD_BYTES, LimitExceeded, StateBudget};
 use regex::Regex;
-use std::{path::Path, sync::LazyLock};
+use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 // These constant expressions are tested below. Neither errors nor raw logs are
 // included in diagnostics; redaction is applied to every exported string field.
@@ -25,67 +25,154 @@ pub fn redact_events(
     workspace: Option<&Path>,
     extra_patterns: &[String],
 ) {
-    let mut replacements: Vec<(String, String)> = Vec::new();
-    let mut users = Vec::new();
-    for name in ["USER", "USERNAME"] {
-        if let Ok(user) = std::env::var(name)
-            && !user.is_empty()
-        {
-            users.push(user);
-        }
-    }
-    for name in ["HOME", "USERPROFILE"] {
-        if let Ok(home) = std::env::var(name)
-            && home.len() > 1
-        {
-            replacements.push((home, "<HOME>".to_owned()));
-        }
-    }
-    // Discover foreign usernames too: archived logs need not belong to this user.
-    for event in events.iter() {
-        for text in [
-            &event.command,
-            event.cwd.as_deref().unwrap_or(""),
-            event.project.as_deref().unwrap_or(""),
-        ] {
-            users.extend(
-                HOME_PATH
-                    .captures_iter(text)
-                    .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned())),
-            );
-        }
-        for path in [event.project.as_deref(), event.cwd.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if is_path(path) && path.len() > 1 {
-                replacements.push((path.to_owned(), "<WORKSPACE>".to_owned()));
+    redact_events_within(
+        events,
+        workspace,
+        extra_patterns,
+        &mut StateBudget::unlimited(),
+    )
+    .unwrap_or_else(|_| unreachable!("an unlimited budget cannot be exceeded"));
+}
+
+/// Redact like [`redact_events`] while keeping `budget` equal to the retained
+/// state: the events are expected to be charged already, the discovered
+/// replacement tables are charged while they exist, and each event's growth is
+/// charged (or its shrinkage released) as soon as that event is redacted.
+pub fn redact_events_within(
+    events: &mut [CommandEvent],
+    workspace: Option<&Path>,
+    extra_patterns: &[String],
+    budget: &mut StateBudget,
+) -> Result<(), LimitExceeded> {
+    let mut tables = Tables::default();
+    let result = tables
+        .discover(events, workspace, extra_patterns, budget)
+        .and_then(|()| tables.redact_each(events, budget));
+    budget.release(tables.charged);
+    result
+}
+
+#[derive(Default)]
+struct Tables {
+    replacements: Vec<(String, String)>,
+    usernames: Vec<Regex>,
+    charged: usize,
+}
+
+impl Tables {
+    fn discover(
+        &mut self,
+        events: &[CommandEvent],
+        workspace: Option<&Path>,
+        extra_patterns: &[String],
+        budget: &mut StateBudget,
+    ) -> Result<(), LimitExceeded> {
+        let mut replacements: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut users: BTreeSet<String> = BTreeSet::new();
+        let mut add_replacement =
+            |pattern: String, replacement: &str, charged: &mut usize, budget: &mut StateBudget| {
+                let entry = (pattern, replacement.to_owned());
+                if replacements.contains(&entry) {
+                    return Ok(());
+                }
+                let bytes = entry.0.len() + entry.1.len() + ENTRY_OVERHEAD_BYTES;
+                budget.charge(bytes)?;
+                *charged += bytes;
+                replacements.insert(entry);
+                Ok::<(), LimitExceeded>(())
+            };
+        for name in ["HOME", "USERPROFILE"] {
+            if let Ok(home) = std::env::var(name)
+                && home.len() > 1
+            {
+                add_replacement(home, "<HOME>", &mut self.charged, budget)?;
             }
         }
+        // Discover foreign usernames too: archived logs need not belong to this user.
+        let mut found_users = Vec::new();
+        for name in ["USER", "USERNAME"] {
+            if let Ok(user) = std::env::var(name)
+                && !user.is_empty()
+            {
+                found_users.push(user);
+            }
+        }
+        for event in events {
+            for text in [
+                &event.command,
+                event.cwd.as_deref().unwrap_or(""),
+                event.project.as_deref().unwrap_or(""),
+            ] {
+                found_users.extend(
+                    HOME_PATH
+                        .captures_iter(text)
+                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_owned())),
+                );
+            }
+            for user in found_users.drain(..) {
+                if !users.contains(&user) {
+                    let bytes = user.len() + ENTRY_OVERHEAD_BYTES;
+                    budget.charge(bytes)?;
+                    self.charged += bytes;
+                    users.insert(user);
+                }
+            }
+            for path in [event.project.as_deref(), event.cwd.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if is_path(path) && path.len() > 1 {
+                    add_replacement(path.to_owned(), "<WORKSPACE>", &mut self.charged, budget)?;
+                }
+            }
+        }
+        if let Some(workspace) = workspace {
+            add_replacement(
+                workspace.to_string_lossy().into_owned(),
+                "<WORKSPACE>",
+                &mut self.charged,
+                budget,
+            )?;
+        }
+        for pattern in extra_patterns.iter().filter(|s| !s.is_empty()) {
+            add_replacement(pattern.clone(), "<REDACTED>", &mut self.charged, budget)?;
+        }
+        self.replacements = replacements.into_iter().collect();
+        self.replacements
+            .sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.cmp(b)));
+        self.usernames = users
+            .iter()
+            .map(|user| {
+                Regex::new(&format!(r"\b{}\b", regex::escape(user)))
+                    .expect("escaped username expression")
+            })
+            .collect();
+        Ok(())
     }
-    if let Some(workspace) = workspace {
-        replacements.push((
-            workspace.to_string_lossy().into_owned(),
-            "<WORKSPACE>".to_owned(),
-        ));
+
+    fn redact_each(
+        &self,
+        events: &mut [CommandEvent],
+        budget: &mut StateBudget,
+    ) -> Result<(), LimitExceeded> {
+        for event in events {
+            let before = event.retained_bytes();
+            self.redact_event(event);
+            let after = event.retained_bytes();
+            if after > before {
+                budget.charge(after - before)?;
+            } else {
+                budget.release(before - after);
+            }
+        }
+        Ok(())
     }
-    for pattern in extra_patterns.iter().filter(|s| !s.is_empty()) {
-        replacements.push((pattern.clone(), "<REDACTED>".to_owned()));
-    }
-    replacements.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.cmp(b)));
-    replacements.dedup();
-    users.sort();
-    users.dedup();
-    let usernames = users
-        .iter()
-        .map(|user| {
-            Regex::new(&format!(r"\b{}\b", regex::escape(user)))
-                .expect("escaped username expression")
-        })
-        .collect::<Vec<_>>();
-    for event in events {
+
+    fn redact_event(&self, event: &mut CommandEvent) {
+        let replacements = self.replacements.as_slice();
+        let usernames = self.usernames.as_slice();
         for text in [&mut event.ide, &mut event.tool, &mut event.command] {
-            redact(text, &replacements, &usernames);
+            redact(text, replacements, usernames);
         }
         for text in [
             &mut event.timestamp,
@@ -98,10 +185,10 @@ pub fn redact_events(
         .into_iter()
         .flatten()
         {
-            redact(text, &replacements, &usernames);
+            redact(text, replacements, usernames);
         }
         if let Some(maven) = &mut event.maven {
-            redact(&mut maven.executable, &replacements, &usernames);
+            redact(&mut maven.executable, replacements, usernames);
             for text in maven
                 .lifecycle_goals
                 .iter_mut()
@@ -112,7 +199,7 @@ pub fn redact_events(
                 .chain(maven.resume_from.iter_mut())
                 .chain(maven.pom_file.iter_mut())
             {
-                redact(text, &replacements, &usernames);
+                redact(text, replacements, usernames);
             }
             maven.properties = std::mem::take(&mut maven.properties)
                 .into_iter()
@@ -133,9 +220,9 @@ pub fn redact_events(
                     {
                         value = "<REDACTED>".to_owned();
                     } else {
-                        redact(&mut value, &replacements, &usernames);
+                        redact(&mut value, replacements, usernames);
                     }
-                    redact(&mut key, &replacements, &usernames);
+                    redact(&mut key, replacements, usernames);
                     (key, value)
                 })
                 .collect();

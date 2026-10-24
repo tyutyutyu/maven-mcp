@@ -3,8 +3,10 @@ use std::{collections::BTreeMap, path::PathBuf};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use maven_mcp::log_analysis::{
-    CommandCategory, CommandEvent, EventFilter, LogSource, deduplicate_events,
-    discover_default_sources, filter_events, normalize_timestamp, read_event_log, redact_events,
+    CommandCategory, CommandEvent, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_RECORD_BYTES,
+    DEFAULT_MAX_STATE_BYTES, ENTRY_OVERHEAD_BYTES, EventFilter, LimitExceeded, LogSource,
+    ResourceLimits, StateBudget, deduplicate_events_within, discover_default_sources,
+    filter_events_within, normalize_timestamp, read_event_log_limited, redact_events_within,
     sort_events, source_paths,
 };
 use serde::Serialize;
@@ -59,6 +61,37 @@ struct Cli {
     /// Emit paths and credentials without the default privacy redaction.
     #[arg(long)]
     unsafe_no_redact: bool,
+    /// Skip a whole-document JSON input (VS Code) larger than this many bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_INPUT_BYTES, value_parser = clap::value_parser!(u64).range(1..))]
+    max_input_bytes: u64,
+    /// Skip a JSONL/IntelliJ line or SQLite row larger than this many bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_RECORD_BYTES as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    max_record_bytes: u64,
+    /// Fail when the estimated retained state (events, session/message metadata,
+    /// deduplication and grouping keys) would exceed this many bytes.
+    #[arg(long, value_name = "BYTES", default_value_t = DEFAULT_MAX_STATE_BYTES as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    max_state_bytes: u64,
+}
+
+impl Cli {
+    fn limits(&self) -> ResourceLimits {
+        ResourceLimits {
+            max_input_bytes: self.max_input_bytes,
+            max_record_bytes: saturating_usize(self.max_record_bytes),
+            max_state_bytes: saturating_usize(self.max_state_bytes),
+        }
+    }
+}
+
+fn saturating_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn state_budget_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "retained state exceeds the --max-state-bytes budget; no report was produced. \
+         Narrow the inputs or filters, or raise the budget"
+    )
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -144,32 +177,46 @@ fn main() -> Result<()> {
     {
         bail!("output must not overwrite an input log");
     }
+    let limits = cli.limits();
+    let mut budget = StateBudget::new(limits.max_state_bytes);
     let mut events = Vec::new();
     let mut failed_files = 0;
     let mut skipped_records = 0;
+    let mut oversized_files = 0;
+    let mut oversized_records = 0;
     for path in paths {
-        match read_event_log(&path, cli.source.into()) {
+        match read_event_log_limited(&path, cli.source.into(), &limits, &mut budget) {
             Ok(mut parsed) => {
                 events.append(&mut parsed.events);
                 skipped_records += parsed.skipped_records;
+                oversized_records += parsed.oversized_records;
             }
-            Err(_) => {
-                failed_files += 1;
-            }
+            Err(error) => match error.downcast_ref::<LimitExceeded>() {
+                Some(LimitExceeded::State) => return Err(state_budget_error()),
+                Some(LimitExceeded::Input) => oversized_files += 1,
+                None => failed_files += 1,
+            },
         }
     }
+    let limited = oversized_files + oversized_records;
     if failed_files > 0 || skipped_records > 0 {
         eprintln!(
             "Skipped {failed_files} unreadable/unsupported files and {skipped_records} malformed/incomplete records; report may be partial."
         );
-        if events.is_empty() {
-            bail!("no command records could be recovered from the incomplete input");
-        }
+    }
+    if limited > 0 {
+        eprintln!(
+            "Skipped {oversized_files} inputs over --max-input-bytes and {oversized_records} records over --max-record-bytes; report is partial."
+        );
+    }
+    if (failed_files > 0 || skipped_records > 0 || limited > 0) && events.is_empty() {
+        bail!("no command records could be recovered from the incomplete input");
     }
     if cli.keep_duplicates {
         sort_events(&mut events);
     } else {
-        events = deduplicate_events(events);
+        events =
+            deduplicate_events_within(events, &mut budget).map_err(|_| state_budget_error())?;
     }
     let since = time_bound(cli.since.as_deref(), false)?;
     let until = time_bound(cli.until.as_deref(), true)?;
@@ -189,15 +236,30 @@ fn main() -> Result<()> {
         session: cli.session,
         category: cli.category.map(Into::into),
     };
-    let mut events = filter_events(events, &filter);
-    let raw_events = events.clone();
+    let mut events = filter_events_within(events, &filter, &mut budget);
+    // Grouping needs the original identities after redaction; keep only those keys.
+    let raw_groups = cli
+        .group_by
+        .map(|group_by| RawGroups::collect(&events, group_by, &mut budget))
+        .transpose()
+        .map_err(|_| state_budget_error())?;
     if !cli.unsafe_no_redact {
-        redact_events(&mut events, cli.workspace.as_deref(), &cli.redact_patterns);
+        redact_events_within(
+            &mut events,
+            cli.workspace.as_deref(),
+            &cli.redact_patterns,
+            &mut budget,
+        )
+        .map_err(|_| state_budget_error())?;
     }
-    let report = if let Some(group_by) = cli.group_by {
-        render_groups(&group_events(&raw_events, &events, group_by), cli.format)?
-    } else {
-        render_events(&events, cli.format)?
+    let report = match (cli.group_by, raw_groups) {
+        (Some(group_by), Some(raw_groups)) => {
+            let groups = raw_groups
+                .count(&events, group_by, &mut budget)
+                .map_err(|_| state_budget_error())?;
+            render_groups(&groups, cli.format)?
+        }
+        _ => render_events(&events, cli.format)?,
     };
     if let Some(output) = cli.output {
         std::fs::write(&output, report)
@@ -255,35 +317,167 @@ fn group_key(event: &CommandEvent, group_by: GroupBy) -> String {
     .unwrap_or_else(|| "<unknown>".to_owned())
 }
 
-fn group_events(
-    raw: &[CommandEvent],
-    redacted: &[CommandEvent],
-    group_by: GroupBy,
-) -> Vec<GroupCount> {
-    let mut counts = BTreeMap::new();
-    for (original, event) in raw.iter().zip(redacted) {
-        let group = counts
-            .entry(group_key(original, group_by))
-            .or_insert_with(|| GroupCount {
-                group: group_key(event, group_by),
-                count: 0,
-            });
-        group.count += 1;
+/// Original group identities and each event's index into them, kept in event
+/// order so redaction can change labels but never merge or split groups.
+struct RawGroups {
+    identities: BTreeMap<String, usize>,
+    event_identity: Vec<usize>,
+    /// Budget charged for `identities` and `event_identity`.
+    charged: usize,
+}
+
+/// Charge `bytes` and remember it in `charged` so it can be released later.
+fn charge_tracked(
+    budget: &mut StateBudget,
+    charged: &mut usize,
+    bytes: usize,
+) -> Result<(), LimitExceeded> {
+    budget.charge(bytes)?;
+    *charged += bytes;
+    Ok(())
+}
+
+impl RawGroups {
+    fn collect(
+        events: &[CommandEvent],
+        group_by: GroupBy,
+        budget: &mut StateBudget,
+    ) -> Result<Self, LimitExceeded> {
+        let mut charged = 0;
+        charge_tracked(
+            budget,
+            &mut charged,
+            events.len().saturating_mul(std::mem::size_of::<usize>()),
+        )?;
+        let mut identities: BTreeMap<String, usize> = BTreeMap::new();
+        let mut event_identity = Vec::with_capacity(events.len());
+        for event in events {
+            let key = group_key(event, group_by);
+            let next = identities.len();
+            if let Some(&index) = identities.get(&key) {
+                event_identity.push(index);
+                continue;
+            }
+            charge_tracked(
+                budget,
+                &mut charged,
+                key.len() + std::mem::size_of::<usize>() + ENTRY_OVERHEAD_BYTES,
+            )?;
+            identities.insert(key, next);
+            event_identity.push(next);
+        }
+        Ok(Self {
+            identities,
+            event_identity,
+            charged,
+        })
     }
-    let mut groups: Vec<GroupCount> = counts.into_values().collect();
-    let mut occurrences = BTreeMap::new();
-    for group in &groups {
-        *occurrences.entry(group.group.clone()).or_insert(0) += 1;
+
+    /// Count per original identity; each label is the redacted key of its first event.
+    /// Every workspace structure is charged before it is allocated; afterwards the
+    /// budget keeps only the returned groups.
+    fn count(
+        self,
+        redacted: &[CommandEvent],
+        group_by: GroupBy,
+        budget: &mut StateBudget,
+    ) -> Result<Vec<GroupCount>, LimitExceeded> {
+        let identity_count = self.identities.len();
+        let mut workspace = 0;
+        charge_tracked(
+            budget,
+            &mut workspace,
+            identity_count.saturating_mul(
+                std::mem::size_of::<Option<String>>() + std::mem::size_of::<usize>(),
+            ),
+        )?;
+        let mut labels: Vec<Option<String>> = vec![None; identity_count];
+        let mut counts = vec![0usize; identity_count];
+        let mut kept = 0;
+        for (&identity, event) in self.event_identity.iter().zip(redacted) {
+            counts[identity] += 1;
+            if labels[identity].is_none() {
+                let label = group_key(event, group_by);
+                charge_tracked(budget, &mut kept, label.len() + ENTRY_OVERHEAD_BYTES)?;
+                labels[identity] = Some(label);
+            }
+        }
+        charge_tracked(
+            budget,
+            &mut kept,
+            identity_count.saturating_mul(std::mem::size_of::<GroupCount>()),
+        )?;
+        // BTreeMap order is the original-identity order of the previous implementation.
+        let mut groups: Vec<GroupCount> = self
+            .identities
+            .into_values()
+            .map(|identity| GroupCount {
+                group: labels[identity].take().unwrap_or_default(),
+                count: counts[identity],
+            })
+            .collect();
+        drop((labels, counts, self.event_identity));
+        budget.release(workspace + self.charged);
+        disambiguate_labels(&mut groups, budget)?;
+        Ok(groups)
     }
-    let mut seen = BTreeMap::new();
-    for group in &mut groups {
-        if occurrences[&group.group] > 1 {
-            let index = seen.entry(group.group.clone()).or_insert(0);
-            *index += 1;
-            group.group = format!("{} [{}]", group.group, index);
+}
+
+/// Give identical redacted labels numeric suffixes in group order. The suffix
+/// tables borrow the labels and are charged while they exist.
+fn disambiguate_labels(
+    groups: &mut [GroupCount],
+    budget: &mut StateBudget,
+) -> Result<(), LimitExceeded> {
+    let mut tables = 0;
+    let suffixes = collect_suffixes(groups, budget, &mut tables);
+    budget.release(tables);
+    for (group, suffix) in groups.iter_mut().zip(suffixes?) {
+        if let Some(index) = suffix {
+            let label = format!("{} [{}]", group.group, index);
+            budget.charge(label.len() - group.group.len())?;
+            group.group = label;
         }
     }
-    groups
+    Ok(())
+}
+
+const SUFFIX_TABLE_ENTRY_BYTES: usize =
+    std::mem::size_of::<&str>() + std::mem::size_of::<usize>() + ENTRY_OVERHEAD_BYTES;
+
+/// Number each repeated label in group order; charges the tables to `tables`.
+fn collect_suffixes(
+    groups: &[GroupCount],
+    budget: &mut StateBudget,
+    tables: &mut usize,
+) -> Result<Vec<Option<usize>>, LimitExceeded> {
+    charge_tracked(
+        budget,
+        tables,
+        groups
+            .len()
+            .saturating_mul(SUFFIX_TABLE_ENTRY_BYTES + std::mem::size_of::<Option<usize>>()),
+    )?;
+    let mut occurrences: BTreeMap<&str, usize> = BTreeMap::new();
+    for group in groups {
+        *occurrences.entry(group.group.as_str()).or_insert(0) += 1;
+    }
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut suffixes = Vec::with_capacity(groups.len());
+    for group in groups {
+        let label = group.group.as_str();
+        if occurrences[label] < 2 {
+            suffixes.push(None);
+            continue;
+        }
+        if !seen.contains_key(label) {
+            charge_tracked(budget, tables, SUFFIX_TABLE_ENTRY_BYTES)?;
+        }
+        let index = seen.entry(label).or_insert(0);
+        *index += 1;
+        suffixes.push(Some(*index));
+    }
+    Ok(suffixes)
 }
 
 fn render_events(events: &[CommandEvent], format: OutputFormat) -> Result<String> {

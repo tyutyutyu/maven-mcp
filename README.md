@@ -546,6 +546,25 @@ suffixes. Formats are `terminal`, `json` (array), `jsonl` (one object per line),
 `csv`, and `markdown`. JSON and CSV include Maven details. `--output` writes a
 report; it cannot overwrite a selected input log.
 
+Processing is bounded. SQLite tables are streamed one row at a time, JSONL and
+IntelliJ logs are read line by line, and `--group-by` keeps only the original
+group identities (not a second copy of every event) until redaction has run;
+the reported counts, labels, and ordering are unchanged. Three limits apply:
+
+| Option | Default | When reached |
+| --- | --- | --- |
+| `--max-record-bytes` | 8 MiB | A JSONL/IntelliJ line, a SQLite row (sum of its column byte lengths, taken from the record header so an oversized value is never loaded), or a VS Code `workspace.json` over the limit is skipped, never parsed, and counted. |
+| `--max-input-bytes` | 64 MiB | A whole-document JSON input (VS Code/Insiders) over the limit is skipped and counted; SQLite and line-based inputs are not limited by file size. |
+| `--max-state-bytes` | 1 GiB | The estimated retained state (events, including their growth by redaction escapes and placeholders; Kilo session/message metadata while its database is read; deduplication identity keys; redaction replacement tables; grouping keys, per-group counting slots, labels, and suffix tables; and a parsed VS Code document at eight times its size) would exceed the budget. Events dropped by deduplication or filtering give their share back. |
+
+Skipped oversized records or inputs print `report is partial` with their counts on
+stderr and the run still succeeds if other commands were recovered; if nothing was
+recovered it fails. Exceeding `--max-state-bytes` is an error: the run fails with
+a message naming the option and writes no report, stdout, or `--output` file.
+The budget is an estimate of retained state, not an operating-system cap: a
+single record that is being parsed (up to `--max-record-bytes`, several times
+that once parsed) and the rendered report text are held in addition to it.
+
 Default privacy redaction covers home paths (including foreign Linux/macOS and
 Windows usernames), the current username, event workspace/working directories,
 `--workspace`, URL credentials, common token formats, and password/token/secret/
