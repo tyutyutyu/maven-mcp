@@ -62,6 +62,31 @@ pub struct ProjectPathRequest {
     project_path: String,
 }
 
+/// Outcome of a completed refresh. Failures are MCP errors, never this type.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct RefreshResult {
+    #[schemars(description = "Always refreshed: the model was re-read and the index rebuilt")]
+    status: RefreshStatus,
+    #[schemars(
+        description = "The cached model and index were dropped and running builds abandoned"
+    )]
+    invalidated: bool,
+    #[schemars(description = "The POMs, wrapper and Maven configuration were read again")]
+    model_reloaded: bool,
+    #[schemars(
+        description = "A new index was built from a Maven classpath resolved after the refresh"
+    )]
+    index_rebuilt: bool,
+    #[schemars(description = "Statistics of the rebuilt index")]
+    index: IndexStats,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshStatus {
+    Refreshed,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
     #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
@@ -485,14 +510,8 @@ impl MavenMcpServer {
             .map_err(|_| ErrorData::internal_error("project cache is poisoned", None))
     }
 
-    fn runner_for(&self, project_path: &str) -> Result<Arc<MavenRunner>, ErrorData> {
-        self.project_runner(project_path)
-            .map(|(_, snapshot)| snapshot.runner)
-    }
-
-    /// Returns the project's runner, re-reading the reactor model when a POM, the wrapper or
-    /// the Maven configuration changed or Maven ran in the project since it was discovered.
-    fn project_runner(&self, project_path: &str) -> Result<(PathBuf, RunnerSnapshot), ErrorData> {
+    /// Canonicalizes `project_path` and requires it inside a host-trusted directory tree.
+    fn trusted_project_root(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
         let root = self.validate_project_path(project_path)?;
         if !self
             .config
@@ -506,6 +525,18 @@ impl MavenMcpServer {
                 None,
             ));
         }
+        Ok(root)
+    }
+
+    fn runner_for(&self, project_path: &str) -> Result<Arc<MavenRunner>, ErrorData> {
+        self.project_runner(project_path)
+            .map(|(_, snapshot)| snapshot.runner)
+    }
+
+    /// Returns the project's runner, re-reading the reactor model when a POM, the wrapper or
+    /// the Maven configuration changed or Maven ran in the project since it was discovered.
+    fn project_runner(&self, project_path: &str) -> Result<(PathBuf, RunnerSnapshot), ErrorData> {
+        let root = self.trusted_project_root(project_path)?;
         let cached = self.lock_projects()?.runner(&root);
         if let Some(snapshot) = cached.as_ref()
             && !snapshot.revalidate
@@ -752,6 +783,27 @@ impl MavenMcpServer {
         self.lock_projects()?.invalidate_after_maven(&root);
         self.publish_runtime_status();
         Ok(())
+    }
+
+    /// Invalidates the trusted project's cached model and index, then rebuilds both. The
+    /// rebuild starts Maven (the classpath goal) through the shared execution permit like any
+    /// cold request. Only an index that was built after the invalidation counts as refreshed;
+    /// every failure says the cache is already invalidated, so it is never reported as success.
+    async fn refresh_project(&self, project_path: &str) -> Result<IndexStats, ErrorData> {
+        let root = self.trusted_project_root(project_path)?;
+        self.lock_projects()?.invalidate_after_maven(&root);
+        self.publish_runtime_status();
+        let index = self.index_for(project_path).await.map_err(|error| {
+            ErrorData::new(
+                error.code,
+                format!(
+                    "the project cache was invalidated but the refresh did not complete: {}",
+                    error.message
+                ),
+                error.data,
+            )
+        })?;
+        Ok(index.stats())
     }
 
     fn artifact_repository_for(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
@@ -1263,6 +1315,23 @@ impl MavenMcpServer {
         Ok(Json(
             self.runner_for(&request.project_path)?.project().clone(),
         ))
+    }
+
+    #[tool(
+        description = "Explicitly refresh one trusted project: drop its cached model and index, abandon any running build, re-read the POMs, wrapper and Maven configuration, and rebuild the index. Starts Maven for the classpath goal through the shared execution permit and the same offline/network policy as a cold request; the refresh itself never deletes or rewrites the local Maven repository, and other projects' caches are untouched. Returns status refreshed only after the rebuild succeeded. A project_path that fails validation is an error that changes nothing; a failure after the invalidation is an error and the project stays invalidated, so the next request retries."
+    )]
+    async fn refresh_maven_project(
+        &self,
+        Parameters(request): Parameters<ProjectPathRequest>,
+    ) -> Result<Json<RefreshResult>, ErrorData> {
+        let index = self.refresh_project(&request.project_path).await?;
+        Ok(Json(RefreshResult {
+            status: RefreshStatus::Refreshed,
+            invalidated: true,
+            model_reloaded: true,
+            index_rebuilt: true,
+            index,
+        }))
     }
 
     #[tool(
