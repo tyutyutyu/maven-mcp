@@ -187,9 +187,9 @@ pub struct ArtifactApiDiffRequest {
     group_id: String,
     #[schemars(description = "Exact Maven artifactId")]
     artifact_id: String,
-    #[schemars(description = "Locally available baseline version")]
+    #[schemars(description = "Baseline version present in the local Maven repository")]
     previous_version: String,
-    #[schemars(description = "Locally available comparison version")]
+    #[schemars(description = "Comparison version present in the local Maven repository")]
     current_version: String,
 }
 
@@ -1133,7 +1133,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Compare the public and protected class API of two locally available versions of one Maven artifact"
+        description = "Compare the public and protected class API of two exact local versions of one Maven artifact read from the local repository, independent of the project classpath"
     )]
     async fn compare_artifact_api(
         &self,
@@ -1152,8 +1152,12 @@ impl MavenMcpServer {
             validate_exact_coordinate(&coordinate)
                 .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         }
-        self.query(request.project_path.clone(), move |index| {
-            index.compare_artifact_api(
+        let repository = self.artifact_repository_for(&request.project_path)?;
+        let max_source_bytes = self.config.max_source_bytes;
+        self.blocking(move || {
+            MavenIndex::compare_artifact_api_at(
+                &repository,
+                max_source_bytes,
                 &request.group_id,
                 &request.artifact_id,
                 &request.previous_version,

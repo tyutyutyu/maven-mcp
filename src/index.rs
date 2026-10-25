@@ -67,6 +67,19 @@ impl JarRecord {
     fn fact_string(&self, id: FactStringId) -> &str {
         &self.fact_strings[(id.0.get() - 1) as usize]
     }
+
+    fn summary(&self) -> JarSummary {
+        JarSummary {
+            coordinate: self.coordinate(),
+            group_id: self.key.group_id.clone(),
+            artifact_id: self.key.artifact_id.clone(),
+            version: self.key.version.clone(),
+            classifier: self.classifier.clone(),
+            path: self.relative_path.clone(),
+            class_count: self.classes.len(),
+            entry_count: self.entries.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1141,8 +1154,12 @@ impl MavenIndex {
         matches
     }
 
-    pub fn compare_artifact_api(
-        &self,
+    /// Compares the public and protected class API of two exact binary JAR versions read
+    /// directly from the repository `root`. Only those two files are opened, so neither
+    /// version needs to be on a project classpath or in any index.
+    pub fn compare_artifact_api_at(
+        root: &Path,
+        max_source_bytes: usize,
         group_id: &str,
         artifact_id: &str,
         previous_version: &str,
@@ -1150,10 +1167,25 @@ impl MavenIndex {
     ) -> Result<ArtifactApiDiff> {
         let previous_coordinate = format!("{group_id}:{artifact_id}:{previous_version}");
         let current_coordinate = format!("{group_id}:{artifact_id}:{current_version}");
-        let previous = self.exact_binary_jar(&previous_coordinate)?;
-        let current = self.exact_binary_jar(&current_coordinate)?;
-        let previous_api = self.public_class_api(previous)?;
-        let current_api = self.public_class_api(current)?;
+        let previous_key = parse_exact_coordinate(&previous_coordinate)?;
+        let current_key = parse_exact_coordinate(&current_coordinate)?;
+        let previous_path = exact_binary_jar_path(root, &previous_key)?;
+        let current_path = exact_binary_jar_path(root, &current_key)?;
+        let mut budget = ArchiveBudget::configured();
+        let previous_api = public_class_api(
+            root,
+            &previous_path,
+            previous_key,
+            &mut budget,
+            max_source_bytes,
+        )?;
+        let current_api = public_class_api(
+            root,
+            &current_path,
+            current_key,
+            &mut budget,
+            max_source_bytes,
+        )?;
 
         let added_classes = current_api
             .keys()
@@ -1226,38 +1258,6 @@ impl MavenIndex {
             removed_classes,
             changed_classes,
         })
-    }
-
-    fn exact_binary_jar(&self, coordinate: &str) -> Result<&JarRecord> {
-        validate_exact_coordinate(coordinate)?;
-        self.jars
-            .iter()
-            .find(|jar| jar.classifier.is_none() && jar.coordinate() == coordinate)
-            .with_context(|| {
-                format!("binary artifact version is not locally available: {coordinate}")
-            })
-    }
-
-    fn public_class_api(&self, jar: &JarRecord) -> Result<BTreeMap<String, ClassDescription>> {
-        let mut api = BTreeMap::new();
-        if jar.classes.is_empty() {
-            return Ok(api);
-        }
-        let mut archive = ClassArchive::open(&jar.path)?;
-        for class_name in &jar.classes {
-            let description = read_class_description_from(
-                &mut archive,
-                jar,
-                self.summary(jar),
-                class_name,
-                self.max_source_bytes,
-                false,
-            )?;
-            if description.visibility == "public" {
-                api.insert(description.class_name.clone(), description);
-            }
-        }
-        Ok(api)
     }
 
     pub fn search_jar_content(
@@ -1750,16 +1750,7 @@ impl MavenIndex {
     }
 
     fn summary(&self, jar: &JarRecord) -> JarSummary {
-        JarSummary {
-            coordinate: jar.coordinate(),
-            group_id: jar.key.group_id.clone(),
-            artifact_id: jar.key.artifact_id.clone(),
-            version: jar.key.version.clone(),
-            classifier: jar.classifier.clone(),
-            path: jar.relative_path.clone(),
-            class_count: jar.classes.len(),
-            entry_count: jar.entries.len(),
-        }
+        jar.summary()
     }
 }
 
@@ -2002,6 +1993,75 @@ fn ensure_dangling_symlink_contained(link: &Path, canonical_root: &Path) -> Resu
 
 pub fn validate_exact_coordinate(coordinate: &str) -> Result<()> {
     parse_exact_coordinate(coordinate).map(|_| ())
+}
+
+/// Resolves the unclassified binary JAR of one exact version below the repository,
+/// applying the shared containment rule. A version without a regular JAR file is an
+/// explicit error, never an empty API.
+fn exact_binary_jar_path(root: &Path, key: &ArtifactKey) -> Result<PathBuf> {
+    let jar_name = format!("{}-{}.jar", key.artifact_id, key.version);
+    contained_artifact_path(root, key, Some(&jar_name))?
+        .filter(|path| path.is_file())
+        .with_context(|| {
+            format!(
+                "binary artifact version is not locally available: {}:{}:{}",
+                key.group_id, key.artifact_id, key.version
+            )
+        })
+}
+
+/// Reads the public classes of one repository JAR through a single archive handle, under
+/// the shared archive budget and the multi-release class selection of the index.
+fn public_class_api(
+    root: &Path,
+    path: &Path,
+    key: ArtifactKey,
+    budget: &mut ArchiveBudget,
+    max_source_bytes: usize,
+) -> Result<BTreeMap<String, ClassDescription>> {
+    // The ZIP reader accepts archives the preflight cannot verify (the indexer skips them),
+    // so any preflight failure is an error: no archive is read outside the budget.
+    preflight_archive(path, budget).map_err(|error| {
+        if error.is::<ArchiveLimit>() {
+            error
+        } else {
+            error.context("invalid ZIP/JAR")
+        }
+    })?;
+    let mut archive = ClassArchive::open(path)?;
+    let JarIndex {
+        classes,
+        entries,
+        class_entries,
+    } = read_jar_index_from(&mut archive)?;
+    let jar = JarRecord {
+        key,
+        classifier: None,
+        relative_path: relative_slash_path(root, path),
+        path: path.to_owned(),
+        classes,
+        entries,
+        class_entries,
+        fact_strings: Vec::new(),
+        class_facts: Vec::new(),
+        providers: Vec::new(),
+    };
+    let mut api = BTreeMap::new();
+    for class_name in &jar.classes {
+        crate::blocking::checkpoint()?;
+        let description = read_class_description_from(
+            &mut archive,
+            &jar,
+            jar.summary(),
+            class_name,
+            max_source_bytes,
+            false,
+        )?;
+        if description.visibility == "public" {
+            api.insert(description.class_name.clone(), description);
+        }
+    }
+    Ok(api)
 }
 
 fn load_jar_record(
@@ -3108,9 +3168,12 @@ struct JarIndex {
 }
 
 fn read_jar_index(path: &Path) -> Result<JarIndex> {
-    let mut archive = ClassArchive::open(path)?;
+    read_jar_index_from(&mut ClassArchive::open(path)?)
+}
+
+fn read_jar_index_from(archive: &mut ClassArchive) -> Result<JarIndex> {
     let entries = archive.file_names()?;
-    let multi_release = read_multi_release_flag(&mut archive, &entries);
+    let multi_release = read_multi_release_flag(archive, &entries);
     let class_entries = effective_class_entries(&entries, multi_release);
     let classes = class_entries
         .keys()

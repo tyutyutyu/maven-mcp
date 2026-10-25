@@ -896,11 +896,16 @@ fn compares_added_removed_and_changed_public_api_between_versions() {
             ("org/example/NewOnly.class", &new_only),
         ],
     );
-    let index = build_index(&root, 20, 64 * 1024);
 
-    let diff = index
-        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
-        .unwrap();
+    let diff = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .unwrap();
     assert_eq!(diff.added_classes, vec!["org.example.NewOnly"]);
     assert_eq!(diff.removed_classes, vec!["org.example.OldOnly"]);
     assert_eq!(diff.changed_classes.len(), 1);
@@ -933,17 +938,258 @@ fn compares_added_removed_and_changed_public_api_between_versions() {
     assert_eq!(changed.added_interfaces, vec!["java.lang.Comparable"]);
     assert_eq!(changed.removed_interfaces, vec!["java.io.Serializable"]);
 
-    let unchanged = index
-        .compare_artifact_api("org.example", "demo", "2.0", "2.0")
-        .unwrap();
+    let unchanged = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "2.0",
+        "2.0",
+    )
+    .unwrap();
     assert!(unchanged.added_classes.is_empty());
     assert!(unchanged.removed_classes.is_empty());
     assert!(unchanged.changed_classes.is_empty());
     assert!(
-        index
-            .compare_artifact_api("org.example", "demo", "1.0", "missing")
-            .is_err()
+        MavenIndex::compare_artifact_api_at(
+            root.path(),
+            64 * 1024,
+            "org.example",
+            "demo",
+            "1.0",
+            "missing"
+        )
+        .is_err()
     );
+}
+
+#[test]
+fn compares_exact_versions_without_indexing_other_repository_artifacts() {
+    let root = TempDir::new().unwrap();
+    let old_only = inspection_class("org/example/OldOnly");
+    let new_only = inspection_class("org/example/NewOnly");
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[("org/example/OldOnly.class", &old_only)],
+    );
+    write_jar(
+        &root.path().join("org/example/demo/2.0/demo-2.0.jar"),
+        &[("org/example/NewOnly.class", &new_only)],
+    );
+    let unrelated = inspection_class("org/other/Unrelated");
+    write_jar(
+        &root.path().join("org/other/lib/9.0/lib-9.0.jar"),
+        &[("org/other/Unrelated.class", &unrelated)],
+    );
+    // Only 1.0 is part of the project search; 2.0 and the unrelated artifact are not.
+    let one = root.path().join("org/example/demo/1.0/demo-1.0.jar");
+    let identity = repository_identity(root.path(), &one).unwrap();
+    let index =
+        MavenIndex::build_from_jars(root.path(), vec![(one, identity)], 20, 64 * 1024).unwrap();
+    assert_eq!(index.search_classes("NewOnly", None).len(), 0);
+
+    let diff = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .unwrap();
+    assert_eq!(diff.added_classes, vec!["org.example.NewOnly"]);
+    assert_eq!(diff.removed_classes, vec!["org.example.OldOnly"]);
+    assert!(diff.changed_classes.is_empty());
+
+    // The comparison neither extends the existing index nor reads it.
+    assert_eq!(index.search_classes("NewOnly", None).len(), 0);
+    assert_eq!(index.search_classes("Unrelated", None).len(), 0);
+    assert_eq!(index.stats().jar_count, 1);
+}
+
+#[test]
+fn exact_version_comparison_reports_missing_versions_and_empty_same_version_diffs() {
+    let root = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Common");
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[("org/example/Common.class", &class)],
+    );
+    let compare = |previous: &str, current: &str| {
+        MavenIndex::compare_artifact_api_at(
+            root.path(),
+            64 * 1024,
+            "org.example",
+            "demo",
+            previous,
+            current,
+        )
+    };
+
+    let same = compare("1.0", "1.0").unwrap();
+    assert!(same.added_classes.is_empty());
+    assert!(same.removed_classes.is_empty());
+    assert!(same.changed_classes.is_empty());
+    for (previous, current, missing) in [("1.0", "2.0", "2.0"), ("2.0", "1.0", "2.0")] {
+        let error = compare(previous, current).expect_err("a missing version is an error");
+        assert_eq!(
+            error.to_string(),
+            format!("binary artifact version is not locally available: org.example:demo:{missing}")
+        );
+    }
+    // The same missing version on both sides is still an error, never an empty diff.
+    assert!(compare("2.0", "2.0").is_err());
+    // A sources-only or classified JAR is not the binary artifact.
+    write_jar(
+        &root
+            .path()
+            .join("org/example/demo/3.0/demo-3.0-sources.jar"),
+        &[("org/example/Common.java", b"class Common {}")],
+    );
+    assert!(compare("1.0", "3.0").is_err());
+    // A directory in place of the JAR file is not a binary artifact either.
+    std::fs::create_dir_all(root.path().join("org/example/demo/4.0/demo-4.0.jar")).unwrap();
+    assert!(compare("1.0", "4.0").is_err());
+    let error = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "../2.0",
+    )
+    .expect_err("a traversal version is invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("exact groupId:artifactId:version")
+    );
+}
+
+#[test]
+fn exact_version_comparison_applies_the_class_size_limit() {
+    let root = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Common");
+    for version in ["1.0", "2.0"] {
+        write_jar(
+            &root
+                .path()
+                .join(format!("org/example/demo/{version}/demo-{version}.jar")),
+            &[("org/example/Common.class", &class)],
+        );
+    }
+    let error =
+        MavenIndex::compare_artifact_api_at(root.path(), 3, "org.example", "demo", "1.0", "2.0")
+            .expect_err("an oversized class entry must stay an error");
+    assert!(error.to_string().contains("MAX_SOURCE_BYTES"), "{error:#}");
+}
+
+#[test]
+fn exact_version_comparison_rejects_archives_the_budget_preflight_cannot_verify() {
+    let root = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Common");
+    for version in ["1.0", "2.0"] {
+        write_jar(
+            &root
+                .path()
+                .join(format!("org/example/demo/{version}/demo-{version}.jar")),
+            &[("org/example/Common.class", &class)],
+        );
+    }
+    // The ZIP reader tolerates bytes after the end record, but the preflight cannot
+    // locate it, so the entry budget was never checked: the indexer skips such a JAR.
+    let path = root.path().join("org/example/demo/2.0/demo-2.0.jar");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"TRAILING");
+    std::fs::write(&path, bytes).unwrap();
+    assert!(ClassArchive::open(&path).is_ok());
+
+    let error = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .expect_err("an archive without a verified budget must stay an error");
+    assert_eq!(error.to_string(), "invalid ZIP/JAR");
+    assert!(!error.is::<ArchiveLimit>(), "{error:#}");
+}
+
+#[test]
+fn exact_version_comparison_reads_jars_under_the_shared_archive_budget() {
+    let root = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Common");
+    let path = root.path().join("org/example/demo/1.0/demo-1.0.jar");
+    write_jar(&path, &[("org/example/Common.class", &class)]);
+    let key = || ArtifactKey {
+        group_id: "org.example".to_owned(),
+        artifact_id: "demo".to_owned(),
+        version: "1.0".to_owned(),
+    };
+    let budget = |jar_entries| ArchiveBudget {
+        entries: 100,
+        names: 10_000,
+        jar_entries,
+    };
+
+    let api = public_class_api(root.path(), &path, key(), &mut budget(100), 64 * 1024).unwrap();
+    assert_eq!(api.keys().collect::<Vec<_>>(), ["org.example.Common"]);
+    let error = public_class_api(root.path(), &path, key(), &mut budget(0), 64 * 1024)
+        .expect_err("an archive over the entry limit must stay an error");
+    assert!(error.is::<ArchiveLimit>(), "{error:#}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_version_comparison_does_not_follow_symlinks_outside_the_repository() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let class = inspection_class("org/example/Common");
+    write_jar(
+        &root.path().join("org/example/demo/1.0/demo-1.0.jar"),
+        &[("org/example/Common.class", &class)],
+    );
+    write_jar(
+        &outside.path().join("demo-2.0.jar"),
+        &[("org/example/Common.class", &class)],
+    );
+    // A symlinked JAR file, a symlinked version directory, and a dangling link.
+    let linked_file = root.path().join("org/example/demo/2.0");
+    std::fs::create_dir_all(&linked_file).unwrap();
+    symlink(
+        outside.path().join("demo-2.0.jar"),
+        linked_file.join("demo-2.0.jar"),
+    )
+    .unwrap();
+    symlink(outside.path(), root.path().join("org/example/demo/3.0")).unwrap();
+    let dangling = root.path().join("org/example/demo/4.0");
+    std::fs::create_dir_all(&dangling).unwrap();
+    symlink(
+        outside.path().join("absent.jar"),
+        dangling.join("demo-4.0.jar"),
+    )
+    .unwrap();
+
+    for version in ["2.0", "3.0", "4.0"] {
+        let error = MavenIndex::compare_artifact_api_at(
+            root.path(),
+            64 * 1024,
+            "org.example",
+            "demo",
+            "1.0",
+            version,
+        )
+        .expect_err(version);
+        assert!(
+            error.is::<ArtifactOutsideRepository>(),
+            "{version}: {error:#}"
+        );
+        assert!(!error.to_string().contains(outside.path().to_str().unwrap()));
+    }
 }
 
 #[test]
@@ -1975,9 +2221,15 @@ fn all_classfile_tools_use_the_same_multi_release_variant() {
     assert!(targets.contains(&"java.lang.Number"));
     assert!(!targets.contains(&"java.lang.Object"));
 
-    let diff = index
-        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
-        .unwrap();
+    let diff = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .unwrap();
     assert!(diff.added_classes.is_empty() && diff.removed_classes.is_empty());
     assert_eq!(diff.changed_classes.len(), 1);
     assert_eq!(
@@ -2630,9 +2882,15 @@ fn member_search_and_api_comparison_open_each_jar_once_with_unchanged_results() 
     assert_eq!(index.search_class_members("late7", None, None).len(), 2);
 
     let before = archive_opens();
-    let diff = index
-        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
-        .unwrap();
+    let diff = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .unwrap();
     assert_eq!(archive_opens() - before, 2);
     assert_eq!(diff.added_classes, vec!["org.example.Shape"]);
     assert!(diff.removed_classes.is_empty());
@@ -2689,9 +2947,15 @@ fn member_search_skips_bad_entries_and_keeps_reading_the_same_archive() {
         reference_member_matches_skipping_errors(&index, "greet")
     );
 
-    let error = index
-        .compare_artifact_api("org.example", "demo", "1.0", "1.0")
-        .expect_err("an unreadable class must stay an error");
+    let error = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        good.len() + 64,
+        "org.example",
+        "demo",
+        "1.0",
+        "1.0",
+    )
+    .expect_err("an unreadable class must stay an error");
     assert!(
         error.to_string().contains("cannot parse classfile")
             || error.to_string().contains("MAX_SOURCE_BYTES")
@@ -2755,9 +3019,15 @@ fn unopenable_archive_is_skipped_by_member_search_and_fails_the_api_comparison()
             .iter()
             .all(|item| item.jar.coordinate == "org.example:demo:2.0")
     );
-    let error = index
-        .compare_artifact_api("org.example", "demo", "1.0", "2.0")
-        .expect_err("an unopenable archive must stay an error");
+    let error = MavenIndex::compare_artifact_api_at(
+        root.path(),
+        64 * 1024,
+        "org.example",
+        "demo",
+        "1.0",
+        "2.0",
+    )
+    .expect_err("an unopenable archive must stay an error");
     assert!(error.to_string().contains("invalid ZIP/JAR"), "{error:#}");
 }
 

@@ -331,7 +331,7 @@ case " $* " in
   *" dependency:build-classpath "*)
     classpath="$PWD/execution-repository/org/libs/helper/2.0/helper-2.0.jar"
     if [ -f .repository-inspection-fixture ]; then
-      classpath="$classpath:$PWD/execution-repository/org/libs/api-fixture/1.0/api-fixture-1.0.jar:$PWD/execution-repository/org/libs/api-fixture/2.0/api-fixture-2.0.jar:$PWD/execution-repository/org/libs/resource-fixture/1.0/resource-fixture-1.0.jar"
+      classpath="$classpath:$PWD/execution-repository/org/libs/api-fixture/1.0/api-fixture-1.0.jar:$PWD/execution-repository/org/libs/resource-fixture/1.0/resource-fixture-1.0.jar"
     fi
     if [ -f .multi-release-fixture ]; then
       for jar in multi-release/1.0/multi-release-1.0 multi-release/2.0/multi-release-2.0 plain-release/1.0/plain-release-1.0; do
