@@ -1673,6 +1673,182 @@ async fn resource_limits_are_visible_to_stdio_clients() -> Result<()> {
     Ok(())
 }
 
+const OVERLOADS_JAVA: &str = r#"package org.example;
+
+public class Overloads {
+    /* put(long value) { */
+    void put(String value) { String brace = "}"; }
+
+    void put(
+            @Deprecated int value) {
+        // }
+        value++;
+    }
+
+    static class Inner {
+        void put(String value) {}
+    }
+}
+"#;
+
+const GREETER_KOTLIN: &str = r#"package org.example
+
+class Greeter {
+    fun greet(name: String) = """Hello ${ "}" } $name"""
+
+    fun greet(times: Int): String {
+        return "{".repeat(times)
+    }
+}
+"#;
+
+async fn declaration_lookup(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    project_path: &str,
+    class_name: &str,
+    member_name: &str,
+    descriptor: &str,
+) -> Result<Value> {
+    Ok(structured(
+        client
+            .call_tool(
+                CallToolRequestParams::new("get_declaration_source").with_arguments(arguments(
+                    json!({
+                        "project_path": project_path,
+                        "class_name": class_name,
+                        "member_name": member_name,
+                        "descriptor": descriptor
+                    }),
+                )),
+            )
+            .await?,
+    ))
+}
+
+#[tokio::test]
+async fn declaration_source_selects_overloads_by_descriptor_through_stdio() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let put = |descriptor| ("put", descriptor);
+    let overloads = support::member_class(
+        "org/example/Overloads",
+        &[],
+        &[put("(J)V"), put("(I)V"), put("(Ljava/lang/String;)V")],
+    );
+    let inner = support::member_class(
+        "org/example/Overloads$Inner",
+        &[],
+        &[put("(Ljava/lang/String;)V")],
+    );
+    let greeter = support::member_class(
+        "org/example/Greeter",
+        &[],
+        &[
+            ("greet", "(I)Ljava/lang/String;"),
+            ("greet", "(Ljava/lang/String;)Ljava/lang/String;"),
+        ],
+    );
+    server.replace_helper_classes(&[
+        ("org/example/Overloads.class", &overloads),
+        ("org/example/Overloads$Inner.class", &inner),
+        ("org/example/Greeter.class", &greeter),
+    ])?;
+    server.replace_helper_sources(&[
+        ("org/example/Overloads.java", OVERLOADS_JAVA.as_bytes()),
+        ("org/example/Greeter.kt", GREETER_KOTLIN.as_bytes()),
+    ])?;
+    let project_path = server.project_path().unwrap().display().to_string();
+    let client = server.connect().await?;
+    let lookup = |class_name, member_name, descriptor| {
+        declaration_lookup(&client, &project_path, class_name, member_name, descriptor)
+    };
+    let lines = |response: &Value| {
+        assert_eq!(response["unresolved"], json!([]));
+        assert_eq!(response["results"].as_array().unwrap().len(), 1);
+        let result = &response["results"][0];
+        assert_eq!(result["truncated"], false);
+        (result["start_line"].clone(), result["end_line"].clone())
+    };
+
+    let integer = lookup("org.example.Overloads", "put", "(I)V").await?;
+    assert_eq!(lines(&integer), (json!(7), json!(11)));
+    assert!(
+        integer["results"][0]["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("    void put(\n            @Deprecated int value) {")
+    );
+    let string = lookup("org.example.Overloads", "put", "(Ljava/lang/String;)V").await?;
+    assert_eq!(lines(&string), (json!(5), json!(5)));
+    let nested = lookup(
+        "org.example.Overloads$Inner",
+        "put",
+        "(Ljava/lang/String;)V",
+    )
+    .await?;
+    assert_eq!(lines(&nested), (json!(14), json!(14)));
+    let kotlin_text = lookup(
+        "org.example.Greeter",
+        "greet",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+    )
+    .await?;
+    assert_eq!(lines(&kotlin_text), (json!(4), json!(4)));
+    let kotlin_count = lookup("org.example.Greeter", "greet", "(I)Ljava/lang/String;").await?;
+    assert_eq!(lines(&kotlin_count), (json!(6), json!(8)));
+
+    let unproven = lookup("org.example.Overloads", "put", "(J)V").await?;
+    assert_eq!(unproven["results"], json!([]));
+    assert_eq!(unproven["ambiguous_candidates"], json!([]));
+    assert_eq!(
+        unproven["unresolved"],
+        json!([{
+            "class_name": "org.example.Overloads",
+            "kind": "method",
+            "name": "put",
+            "descriptor": "(J)V",
+            "source_jar": unproven["unresolved"][0]["source_jar"].clone(),
+            "entry": "org/example/Overloads.java",
+            "reason": "unproven",
+            "candidate_lines": [5, 7],
+            "truncated": false
+        }])
+    );
+    assert_eq!(
+        unproven["unresolved"][0]["source_jar"]["coordinate"],
+        "org.libs:helper:2.0:sources"
+    );
+    client.cancel().await?;
+
+    // The limit cuts the source inside the body of `put(int)`; the slice ends at the last
+    // code token that was read.
+    let limit = OVERLOADS_JAVA.find("value++").unwrap().to_string();
+    let (truncated_client, _) = server
+        .connect_with_limits(&[("MAX_SOURCE_BYTES", limit.as_str())])
+        .await?;
+    let truncated = declaration_lookup(
+        &truncated_client,
+        &project_path,
+        "org.example.Overloads",
+        "put",
+        "(I)V",
+    )
+    .await?;
+    let result = &truncated["results"][0];
+    assert_eq!(result["truncated"], true);
+    assert_eq!(
+        (&result["start_line"], &result["end_line"]),
+        (&json!(7), &json!(8))
+    );
+    assert!(
+        result["source"]
+            .as_str()
+            .unwrap()
+            .ends_with("@Deprecated int value) {")
+    );
+    truncated_client.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn source_search_reports_truncated_sources_with_and_without_matches() -> Result<()> {
     let server = TestServer::start_with_project().await?;

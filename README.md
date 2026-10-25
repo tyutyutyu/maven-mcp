@@ -71,7 +71,9 @@ The server exposes the following MCP tools:
   `MAX_SOURCE_BYTES × MAX_RESULTS`); `incomplete` is `true` whenever any part of
   a source was not searched, even with no matches (see below).
 - `get_declaration_source` – returns a focused source excerpt for a class, field,
-  or method; overloads can be disambiguated with a JVM descriptor.
+  or method; overloads are selected by their JVM descriptor, and a declaration
+  whose source cannot be proven is reported in `unresolved` (see
+  [Declaration source slices](#declaration-source-slices)).
 - `search_providers` – returns structured Java ServiceLoader, JPMS
   `uses`/`provides`, `spring.factories`, and Spring `.imports` provider
   declarations.
@@ -98,6 +100,58 @@ version of your project:
 - Version directories that are not canonical decimal numbers (for example `x`,
   `+11`, or `011`) or are below 9 are never selected.
 - `search_jar_entries` still lists the raw entries, including every versioned one.
+
+### Declaration source slices
+
+`get_declaration_source` reads the classfile of the class to find the requested
+declaration (class, field, or method with its JVM descriptor) and then locates it
+in the matching `.java` or `.kt` entry of the `-sources.jar`. The source is split
+into code tokens first, so comments, string and character literals, Java text
+blocks, and Kotlin raw strings and `${...}` templates never move a declaration
+boundary, and brackets are matched across lines. A slice consists of whole lines:
+it starts at the first annotation or modifier of the declaration (Javadoc is not
+included) and ends at its closing `}` or `;`, or at the end of a Kotlin
+declaration without a body. `start_line` and `end_line` are 1-based lines of the
+source entry.
+
+Supported cases:
+
+- Java and Kotlin top-level and nested types (`Outer$Inner` binary names, also
+  `class`, `interface`, `enum`, `record`, `@interface`, Kotlin `object`,
+  `companion object`, `data`/`enum`/`inner` classes); members of a nested type are
+  searched only in that type, and anonymous or local classes are not supported.
+- Fields: Java declarators (also several in one declaration), enum constants,
+  record components, Kotlin `val`/`var` properties (with accessors on the
+  following lines), primary-constructor properties, and companion-object
+  constants.
+- Methods and constructors, also with multi-line signatures, annotations,
+  generics, `throws`, Kotlin expression bodies (also continued on later lines
+  after a binary operator, an `if`/`while`/`for` condition, or `else`; a
+  line-ending `>` that closes type arguments ends the declaration), extension
+  receivers, `suspend`, `vararg`, nullable and function types, and Kotlin
+  primary and secondary constructors. An overload is selected by comparing the descriptor with the
+  erased source parameter types by simple name and array dimension (type
+  variables erase to their first bound), independently of the source order. The
+  enclosing-instance parameter of inner-class constructors and the name/ordinal
+  parameters of enum constructors are accepted.
+
+Every classfile declaration that is not returned as a slice is listed in
+`unresolved` with a `reason`: `not_found` (no such declaration in the source
+type), `ambiguous` (several source declarations match equally, for example
+parameter types with the same simple name from different packages), or
+`unproven` (same-named declarations exist, but none provably matches the
+descriptor, for example a compiler-generated bridge or synthetic method, which
+is recognized by its classfile access flags, or an `@JvmOverloads` overload). `candidate_lines` lists the start lines of the declarations involved.
+No source fragment is guessed. Without `member_name` the class itself is
+returned; with `member_name` but without `descriptor`, several classfile
+overloads are still reported in `ambiguous_candidates`.
+
+Each source is read up to `MAX_SOURCE_BYTES`. When it was cut, `truncated` is
+`true` on both results and unresolved entries, a declaration that runs past the
+limit ends at the last code token that was read, and an overload whose parameter
+list was cut off is never returned as a match: it is reported as `ambiguous`
+together with a complete match, and as `unproven` when no complete match exists. An artifact without a `-sources.jar` or
+without the source entry produces neither a result nor an unresolved entry.
 
 Project inspection and execution use the same request `project_path`:
 

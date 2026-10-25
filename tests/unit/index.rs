@@ -1727,6 +1727,1040 @@ fn returns_class_and_method_declaration_source_slices() {
     );
 }
 
+/// Public class with the given `(name, descriptor)` fields and methods.
+fn member_class(class_name: &str, fields: &[(&str, &str)], methods: &[(&str, &str)]) -> Vec<u8> {
+    let methods = methods
+        .iter()
+        .map(|(name, descriptor)| (*name, *descriptor, ACC_PUBLIC))
+        .collect::<Vec<_>>();
+    member_class_with_access(class_name, fields, &methods)
+}
+
+const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PUBLIC_BRIDGE_SYNTHETIC: u16 = 0x1041;
+
+/// A classfile whose methods carry the given access flags; fields are public.
+fn member_class_with_access(
+    class_name: &str,
+    fields: &[(&str, &str)],
+    methods: &[(&str, &str, u16)],
+) -> Vec<u8> {
+    let members = fields
+        .iter()
+        .copied()
+        .chain(
+            methods
+                .iter()
+                .map(|(name, descriptor, _)| (*name, *descriptor)),
+        )
+        .collect::<Vec<_>>();
+    let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 61);
+    push_u16(&mut bytes, u16::try_from(5 + members.len() * 2).unwrap());
+    push_utf8(&mut bytes, class_name); // #1
+    push_class(&mut bytes, 1); // #2
+    push_utf8(&mut bytes, "java/lang/Object"); // #3
+    push_class(&mut bytes, 3); // #4
+    for (name, descriptor) in &members {
+        push_utf8(&mut bytes, name);
+        push_utf8(&mut bytes, descriptor);
+    }
+    push_u16(&mut bytes, 0x0021);
+    push_u16(&mut bytes, 2);
+    push_u16(&mut bytes, 4);
+    push_u16(&mut bytes, 0); // interfaces
+    let field_flags = vec![ACC_PUBLIC; fields.len()];
+    let method_flags = methods.iter().map(|(_, _, flags)| *flags).collect();
+    let mut member_index = 0u16;
+    for flags in [field_flags, method_flags] {
+        push_u16(&mut bytes, u16::try_from(flags.len()).unwrap());
+        for access in flags {
+            push_u16(&mut bytes, access);
+            push_u16(&mut bytes, 5 + member_index * 2);
+            push_u16(&mut bytes, 6 + member_index * 2);
+            push_u16(&mut bytes, 0);
+            member_index += 1;
+        }
+    }
+    push_u16(&mut bytes, 0); // class attributes
+    bytes
+}
+
+fn locate_declaration(
+    language: SourceLanguage,
+    source: &str,
+    class_name: &str,
+    kind: DeclarationKind,
+    name: &str,
+    descriptor: Option<&str>,
+) -> SliceOutcome {
+    SourceOutline::parse(source, language).locate(
+        class_name,
+        &DeclarationCandidate {
+            kind,
+            name: name.to_owned(),
+            descriptor: descriptor.map(str::to_owned),
+        },
+        false,
+    )
+}
+
+/// Asserts a located slice by its one-based first and last line.
+fn assert_slice(outcome: SliceOutcome, start_line: usize, end_line: usize, source: &str) {
+    let SliceOutcome::Found(slice) = outcome else {
+        panic!("expected a slice of lines {start_line}..={end_line}, got {outcome:?}");
+    };
+    assert_eq!((slice.start_line, slice.end_line), (start_line, end_line));
+    let expected = source
+        .lines()
+        .skip(start_line - 1)
+        .take(end_line - start_line + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(slice.source, expected);
+}
+
+fn assert_unresolved(outcome: SliceOutcome, reason: UnresolvedDeclarationReason, lines: &[usize]) {
+    assert_eq!(
+        outcome,
+        SliceOutcome::Unresolved {
+            reason,
+            candidate_lines: lines.to_vec(),
+        }
+    );
+}
+
+const TRICKY_JAVA: &str = r#"package org.example;
+
+/** Javadoc with { and } and ; and class Tricky { */
+public class Tricky<E> {
+    // a stray } brace and class Tricky { in a line comment
+    private static final String BRACES = "}{;\"}", OTHER = "{";
+    private static final char QUOTE = '}';
+    private static final String BLOCK = """
+        text block with } and ; and \""" quotes
+        """;
+
+    /* block comment } ; */
+    @Deprecated
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public <T extends Comparable<T>> java.util.List<T> sort(
+            final java.util.Collection<? extends T> values, // trailing }
+            int[] limits,
+            String... labels)
+            throws java.io.IOException {
+        String s = "{";
+        return null;
+    }
+
+    int after() { return 1; }
+
+    void add(E element, java.util.Map.Entry<String, E> entry) {}
+
+    static class Inner {
+        int after(long value) { return '}'; }
+        Runnable task = () -> { System.out.println("};"); };
+    }
+}
+"#;
+
+#[test]
+fn java_slices_ignore_braces_and_semicolons_in_comments_and_literals() {
+    let locate = |class_name, kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Java,
+            TRICKY_JAVA,
+            class_name,
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    let tricky = "org.example.Tricky";
+    assert_slice(
+        locate(tricky, DeclarationKind::Class, tricky, None),
+        4,
+        32,
+        TRICKY_JAVA,
+    );
+    for (name, start, end) in [
+        ("BRACES", 6, 6),
+        ("OTHER", 6, 6),
+        ("QUOTE", 7, 7),
+        ("BLOCK", 8, 10),
+    ] {
+        let descriptor = Some("Ljava/lang/String;");
+        assert_slice(
+            locate(tricky, DeclarationKind::Field, name, descriptor),
+            start,
+            end,
+            TRICKY_JAVA,
+        );
+    }
+    let sort = locate(
+        tricky,
+        DeclarationKind::Method,
+        "sort",
+        Some("(Ljava/util/Collection;[I[Ljava/lang/String;)Ljava/util/List;"),
+    );
+    assert_slice(sort, 13, 22, TRICKY_JAVA);
+    let after = locate(tricky, DeclarationKind::Method, "after", Some("()I"));
+    assert_slice(after, 24, 24, TRICKY_JAVA);
+    let add = locate(
+        tricky,
+        DeclarationKind::Method,
+        "add",
+        Some("(Ljava/lang/Object;Ljava/util/Map$Entry;)V"),
+    );
+    assert_slice(add, 26, 26, TRICKY_JAVA);
+}
+
+#[test]
+fn java_inner_class_members_are_scoped_to_their_type() {
+    let locate = |class_name, kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Java,
+            TRICKY_JAVA,
+            class_name,
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    let inner = "org.example.Tricky$Inner";
+    assert_slice(
+        locate(inner, DeclarationKind::Class, inner, None),
+        28,
+        31,
+        TRICKY_JAVA,
+    );
+    let after = locate(inner, DeclarationKind::Method, "after", Some("(J)I"));
+    assert_slice(after, 29, 29, TRICKY_JAVA);
+    let task = locate(
+        inner,
+        DeclarationKind::Field,
+        "task",
+        Some("Ljava/lang/Runnable;"),
+    );
+    assert_slice(task, 30, 30, TRICKY_JAVA);
+    assert_unresolved(
+        locate(inner, DeclarationKind::Method, "sort", Some("()V")),
+        UnresolvedDeclarationReason::NotFound,
+        &[],
+    );
+    for local in [
+        "org.example.Tricky$1",
+        "org.example.Tricky$1Local",
+        "org.example.Missing",
+    ] {
+        assert_unresolved(
+            locate(local, DeclarationKind::Class, local, None),
+            UnresolvedDeclarationReason::NotFound,
+            &[],
+        );
+    }
+}
+
+const OVERLOADS_JAVA: &str = r#"package org.example;
+
+public class Overloads {
+    public Overloads(String name) {}
+    public Overloads(int size, long... rest) {}
+
+    void put(String value) {}
+    void put(int value) {}
+    void put(Object[][] value) {}
+    <T extends Number> void put(T number, T[] numbers) {}
+
+    void take(first.Type value) {}
+    void take(second.Type value) {}
+
+    class Inner {
+        Inner(int code) {}
+    }
+
+    enum Mode {
+        @Deprecated FIRST(1),
+        SECOND(2) {
+            @Override public String toString() { return "}"; }
+        };
+
+        Mode(int code) {}
+    }
+}
+"#;
+
+#[test]
+fn java_overloads_are_selected_by_descriptor_regardless_of_source_order() {
+    let locate = |class_name, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Java,
+            OVERLOADS_JAVA,
+            class_name,
+            DeclarationKind::Method,
+            name,
+            Some(descriptor),
+        )
+    };
+    let overloads = "org.example.Overloads";
+    for (descriptor, line) in [
+        ("(Ljava/lang/Number;[Ljava/lang/Number;)V", 10),
+        ("([[Ljava/lang/Object;)V", 9),
+        ("(I)V", 8),
+        ("(Ljava/lang/String;)V", 7),
+    ] {
+        assert_slice(
+            locate(overloads, "put", descriptor),
+            line,
+            line,
+            OVERLOADS_JAVA,
+        );
+    }
+    assert_slice(
+        locate(overloads, "Overloads", "(I[J)V"),
+        5,
+        5,
+        OVERLOADS_JAVA,
+    );
+    assert_slice(
+        locate(overloads, "Overloads", "(Ljava/lang/String;)V"),
+        4,
+        4,
+        OVERLOADS_JAVA,
+    );
+    let inner = locate(
+        "org.example.Overloads$Inner",
+        "Inner",
+        "(Lorg/example/Overloads;I)V",
+    );
+    assert_slice(inner, 16, 16, OVERLOADS_JAVA);
+    let mode = locate(
+        "org.example.Overloads$Mode",
+        "Mode",
+        "(Ljava/lang/String;II)V",
+    );
+    assert_slice(mode, 25, 25, OVERLOADS_JAVA);
+
+    assert_unresolved(
+        locate(overloads, "take", "(Lfirst/Type;)V"),
+        UnresolvedDeclarationReason::Ambiguous,
+        &[12, 13],
+    );
+    assert_unresolved(
+        locate(overloads, "put", "(J)V"),
+        UnresolvedDeclarationReason::Unproven,
+        &[7, 8, 9, 10],
+    );
+    assert_unresolved(
+        locate(overloads, "missing", "()V"),
+        UnresolvedDeclarationReason::NotFound,
+        &[],
+    );
+}
+
+#[test]
+fn java_enum_constants_are_fields_with_their_arguments_and_bodies() {
+    let locate = |name| {
+        locate_declaration(
+            SourceLanguage::Java,
+            OVERLOADS_JAVA,
+            "org.example.Overloads$Mode",
+            DeclarationKind::Field,
+            name,
+            Some("Lorg/example/Overloads$Mode;"),
+        )
+    };
+    assert_slice(locate("FIRST"), 20, 20, OVERLOADS_JAVA);
+    assert_slice(locate("SECOND"), 21, 23, OVERLOADS_JAVA);
+}
+
+const TRICKY_KOTLIN: &str = r#"package org.example
+
+/* outer /* nested } class KTricky { */ still a comment { */
+class KTricky<E : Number>(val id: Int, name: String) {
+    private val template = "value ${ mapOf("}" to "{").size } }"
+    val raw = """
+        raw } ${ "\"" } ;
+    """
+
+    // fun render(x: Int) {
+    @JvmOverloads
+    fun render(
+        prefix: String?,
+        vararg counts: Int,
+    ): String {
+        return "$prefix}"
+    }
+
+    fun render(prefix: String, block: (Int) -> Unit) = prefix
+        .trim()
+
+    suspend fun load(id: Long, element: E): String? = null
+
+    fun String.shout(times: Int = 1, values: Array<out Int?>): String = this
+
+    var counter: Int = 0
+        private set
+
+    inner class Nested {
+        fun render(value: Double) {}
+    }
+
+    companion object {
+        const val LIMIT = 3
+    }
+}
+"#;
+
+#[test]
+fn kotlin_slices_handle_nested_comments_templates_and_expression_bodies() {
+    let locate = |class_name, kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Kotlin,
+            TRICKY_KOTLIN,
+            class_name,
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    let tricky = "org.example.KTricky";
+    assert_slice(
+        locate(tricky, DeclarationKind::Class, tricky, None),
+        4,
+        36,
+        TRICKY_KOTLIN,
+    );
+    for (name, start, end) in [
+        ("id", 4, 4),
+        ("template", 5, 5),
+        ("raw", 6, 8),
+        ("counter", 26, 27),
+        ("LIMIT", 34, 34),
+    ] {
+        assert_slice(
+            locate(tricky, DeclarationKind::Field, name, Some("I")),
+            start,
+            end,
+            TRICKY_KOTLIN,
+        );
+    }
+    let method = |name, descriptor| locate(tricky, DeclarationKind::Method, name, Some(descriptor));
+    assert_slice(
+        method("render", "(Ljava/lang/String;[I)Ljava/lang/String;"),
+        11,
+        17,
+        TRICKY_KOTLIN,
+    );
+    assert_slice(
+        method(
+            "render",
+            "(Ljava/lang/String;Lkotlin/jvm/functions/Function1;)Ljava/lang/String;",
+        ),
+        19,
+        20,
+        TRICKY_KOTLIN,
+    );
+    assert_slice(
+        method(
+            "load",
+            "(JLjava/lang/Number;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+        ),
+        22,
+        22,
+        TRICKY_KOTLIN,
+    );
+    assert_slice(
+        method(
+            "shout",
+            "(Ljava/lang/String;I[Ljava/lang/Integer;)Ljava/lang/String;",
+        ),
+        24,
+        24,
+        TRICKY_KOTLIN,
+    );
+    assert_slice(
+        method("KTricky", "(ILjava/lang/String;)V"),
+        4,
+        4,
+        TRICKY_KOTLIN,
+    );
+    assert_unresolved(
+        method("render", "(I)V"),
+        UnresolvedDeclarationReason::Unproven,
+        &[11, 19],
+    );
+
+    let nested = "org.example.KTricky$Nested";
+    assert_slice(
+        locate(nested, DeclarationKind::Class, nested, None),
+        29,
+        31,
+        TRICKY_KOTLIN,
+    );
+    assert_slice(
+        locate(nested, DeclarationKind::Method, "render", Some("(D)V")),
+        30,
+        30,
+        TRICKY_KOTLIN,
+    );
+    let companion = "org.example.KTricky$Companion";
+    assert_slice(
+        locate(companion, DeclarationKind::Class, companion, None),
+        33,
+        35,
+        TRICKY_KOTLIN,
+    );
+}
+
+const TYPE_FORMS_JAVA: &str = r#"package org.example;
+
+public interface Forms {
+    record Point(int x, @Deprecated long y) implements Forms {
+        static Point origin() { return new Point(0, 0); }
+    }
+
+    @interface Marker {
+        String value() default "};";
+    }
+
+    default <T> T pick(java.util.List<? extends T> values) { return values.get(0); }
+}
+"#;
+
+const TYPE_FORMS_KOTLIN: &str = r##"package org.example
+
+data class Pair(val left: String, val right: String)
+
+object Registry {
+    fun lookup(key: String) = key
+}
+
+enum class Color(val rgb: Int) {
+    RED(0xff0000), GREEN(0x00ff00);
+
+    fun hex(): String = "#" +
+        rgb.toString(16)
+}
+"##;
+
+#[test]
+fn kotlin_expression_bodies_continue_over_operators_and_conditions() {
+    let source = r#"abstract class Exprs {
+    fun twice(x: Int) = x *
+        2
+    fun choose(x: Int) = if (x > 0)
+        x
+    else
+        -x
+    fun greater(a: Int, b: Int) = a >
+        b
+    fun less(a: Int, b: Int) = a <
+        b
+    val items: List<Int>
+        get() = listOf(1)
+    abstract fun <T> wrap(value: T): List<T>
+    val after = 1
+}
+"#;
+    let locate = |kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Kotlin,
+            source,
+            "Exprs",
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    for (name, descriptor, start, end) in [
+        ("twice", "(I)I", 2, 3),
+        ("choose", "(I)I", 4, 7),
+        ("greater", "(II)Z", 8, 9),
+        ("less", "(II)Z", 10, 11),
+        ("wrap", "(Ljava/lang/Object;)Ljava/util/List;", 14, 14),
+    ] {
+        assert_slice(
+            locate(DeclarationKind::Method, name, Some(descriptor)),
+            start,
+            end,
+            source,
+        );
+    }
+    // A line-ending `>` that closes type arguments ends the declaration.
+    assert_slice(
+        locate(DeclarationKind::Field, "items", None),
+        12,
+        13,
+        source,
+    );
+    assert_slice(
+        locate(DeclarationKind::Field, "after", None),
+        15,
+        15,
+        source,
+    );
+}
+
+#[test]
+fn java_and_kotlin_type_forms_are_outlined() {
+    let java = |class_name, kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Java,
+            TYPE_FORMS_JAVA,
+            class_name,
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    let point = "org.example.Forms$Point";
+    assert_slice(
+        java(point, DeclarationKind::Field, "y", None),
+        4,
+        4,
+        TYPE_FORMS_JAVA,
+    );
+    assert_slice(
+        java(
+            point,
+            DeclarationKind::Method,
+            "origin",
+            Some("()Lorg/example/Forms$Point;"),
+        ),
+        5,
+        5,
+        TYPE_FORMS_JAVA,
+    );
+    let marker = "org.example.Forms$Marker";
+    assert_slice(
+        java(marker, DeclarationKind::Class, marker, None),
+        8,
+        10,
+        TYPE_FORMS_JAVA,
+    );
+    assert_slice(
+        java(
+            marker,
+            DeclarationKind::Method,
+            "value",
+            Some("()Ljava/lang/String;"),
+        ),
+        9,
+        9,
+        TYPE_FORMS_JAVA,
+    );
+    assert_slice(
+        java(
+            "org.example.Forms",
+            DeclarationKind::Method,
+            "pick",
+            Some("(Ljava/util/List;)Ljava/lang/Object;"),
+        ),
+        12,
+        12,
+        TYPE_FORMS_JAVA,
+    );
+
+    let kotlin = |class_name, kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Kotlin,
+            TYPE_FORMS_KOTLIN,
+            class_name,
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    let pair = "org.example.Pair";
+    assert_slice(
+        kotlin(pair, DeclarationKind::Class, pair, None),
+        3,
+        3,
+        TYPE_FORMS_KOTLIN,
+    );
+    assert_slice(
+        kotlin(pair, DeclarationKind::Field, "right", None),
+        3,
+        3,
+        TYPE_FORMS_KOTLIN,
+    );
+    let registry = "org.example.Registry";
+    assert_slice(
+        kotlin(registry, DeclarationKind::Class, registry, None),
+        5,
+        7,
+        TYPE_FORMS_KOTLIN,
+    );
+    assert_slice(
+        kotlin(
+            registry,
+            DeclarationKind::Method,
+            "lookup",
+            Some("(Ljava/lang/String;)Ljava/lang/String;"),
+        ),
+        6,
+        6,
+        TYPE_FORMS_KOTLIN,
+    );
+    let color = "org.example.Color";
+    assert_slice(
+        kotlin(color, DeclarationKind::Field, "GREEN", None),
+        10,
+        10,
+        TYPE_FORMS_KOTLIN,
+    );
+    assert_slice(
+        kotlin(color, DeclarationKind::Field, "rgb", None),
+        9,
+        9,
+        TYPE_FORMS_KOTLIN,
+    );
+    assert_slice(
+        kotlin(
+            color,
+            DeclarationKind::Method,
+            "Color",
+            Some("(Ljava/lang/String;II)V"),
+        ),
+        9,
+        9,
+        TYPE_FORMS_KOTLIN,
+    );
+    assert_slice(
+        kotlin(
+            color,
+            DeclarationKind::Method,
+            "hex",
+            Some("()Ljava/lang/String;"),
+        ),
+        12,
+        13,
+        TYPE_FORMS_KOTLIN,
+    );
+}
+
+#[test]
+fn hostile_nesting_depth_is_bounded() {
+    let depth = 100_000;
+    let types = format!(
+        "class Deep {{\n    fun f(x: {}Int{}, y: {}Int{}) {{}}\n}}\n",
+        "(".repeat(depth),
+        ")".repeat(depth),
+        "Array<".repeat(depth),
+        ">".repeat(depth)
+    );
+    assert_unresolved(
+        locate_declaration(
+            SourceLanguage::Kotlin,
+            &types,
+            "Deep",
+            DeclarationKind::Method,
+            "f",
+            Some("(I[I)V"),
+        ),
+        UnresolvedDeclarationReason::Unproven,
+        &[2],
+    );
+    let templates = format!(
+        "class Deep {{\n    val text = \"{}\"\n}}\n",
+        "${\"".repeat(depth)
+    );
+    let outcome = locate_declaration(
+        SourceLanguage::Kotlin,
+        &templates,
+        "Deep",
+        DeclarationKind::Class,
+        "Deep",
+        None,
+    );
+    assert!(matches!(outcome, SliceOutcome::Found(slice) if slice.start_line == 1));
+}
+
+#[test]
+fn truncated_and_multibyte_sources_keep_utf8_slices_and_line_numbers() {
+    let source = "class Tükör {\n    String árvíz = \"}é\";\n    void tükör(String é) {\n        int x = 1;\n";
+    let locate = |kind, name, descriptor| {
+        locate_declaration(
+            SourceLanguage::Java,
+            source,
+            "org.example.Tükör",
+            kind,
+            name,
+            descriptor,
+        )
+    };
+    assert_slice(locate(DeclarationKind::Field, "árvíz", None), 2, 2, source);
+    // The truncated method and class extend to the end of the bounded source.
+    assert_slice(
+        locate(
+            DeclarationKind::Method,
+            "tükör",
+            Some("(Ljava/lang/String;)V"),
+        ),
+        3,
+        4,
+        source,
+    );
+    assert_slice(locate(DeclarationKind::Class, "Tükör", None), 1, 4, source);
+    let kotlin = "class K {\n    val text = \"\"\"\n        unterminated }";
+    assert_slice(
+        locate_declaration(
+            SourceLanguage::Kotlin,
+            kotlin,
+            "K",
+            DeclarationKind::Field,
+            "text",
+            None,
+        ),
+        2,
+        3,
+        kotlin,
+    );
+}
+
+#[test]
+fn declaration_lookup_reports_overloads_by_descriptor_and_explicit_uncertainty() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    // The classfile order is the reverse of the source order.
+    let overloads = member_class(
+        "org/example/Overloads",
+        &[],
+        &[
+            ("put", "(Ljava/lang/Number;[Ljava/lang/Number;)V"),
+            ("put", "(I)V"),
+            ("put", "(Ljava/lang/String;)V"),
+            ("put", "(J)V"),
+        ],
+    );
+    let kotlin = member_class(
+        "org/example/KTricky",
+        &[("raw", "Ljava/lang/String;")],
+        &[(
+            "load",
+            "(JLjava/lang/Number;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+        )],
+    );
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[
+            ("org/example/Overloads.class", &overloads),
+            ("org/example/KTricky.class", &kotlin),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Overloads.java", OVERLOADS_JAVA.as_bytes()),
+            ("org/example/KTricky.kt", TRICKY_KOTLIN.as_bytes()),
+        ],
+    );
+    let index = build_index(&root, 10, 64 * 1024);
+    let lookup = |class_name, member, descriptor| {
+        index
+            .get_declaration_source(class_name, Some(member), descriptor, None, None)
+            .unwrap()
+    };
+
+    let integer = lookup("org.example.Overloads", "put", Some("(I)V"));
+    assert_eq!(integer.results.len(), 1);
+    assert_eq!(
+        (integer.results[0].start_line, integer.results[0].end_line),
+        (8, 8)
+    );
+    assert_eq!(integer.results[0].source.trim(), "void put(int value) {}");
+    assert!(integer.unresolved.is_empty());
+
+    let unproven = lookup("org.example.Overloads", "put", Some("(J)V"));
+    assert!(unproven.results.is_empty());
+    assert_eq!(unproven.unresolved.len(), 1);
+    let unresolved = &unproven.unresolved[0];
+    assert_eq!(unresolved.reason, UnresolvedDeclarationReason::Unproven);
+    assert_eq!(unresolved.candidate_lines, vec![7, 8, 9, 10]);
+    assert_eq!(unresolved.descriptor.as_deref(), Some("(J)V"));
+    assert_eq!(unresolved.entry, "org/example/Overloads.java");
+    assert!(!unresolved.truncated);
+
+    let ambiguous = lookup("org.example.Overloads", "put", None);
+    assert!(ambiguous.results.is_empty() && ambiguous.unresolved.is_empty());
+    assert_eq!(ambiguous.ambiguous_candidates.len(), 4);
+
+    let suspend = lookup(
+        "org.example.KTricky",
+        "load",
+        Some("(JLjava/lang/Number;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;"),
+    );
+    assert_eq!(suspend.results[0].start_line, 22);
+    assert_eq!(suspend.results[0].entry, "org/example/KTricky.kt");
+    let raw = lookup("org.example.KTricky", "raw", None);
+    assert_eq!((raw.results[0].start_line, raw.results[0].end_line), (6, 8));
+}
+
+#[test]
+fn declaration_lookup_preserves_truncation_and_missing_source_states() {
+    let root = TempDir::new().unwrap();
+    let with_sources = root.path().join("org/example/demo/1.0");
+    let without_sources = root.path().join("org/example/bare/1.0");
+    let class = member_class("org/example/Overloads", &[], &[("take", "(Lfirst/Type;)V")]);
+    write_jar(
+        &with_sources.join("demo-1.0.jar"),
+        &[("org/example/Overloads.class", &class)],
+    );
+    write_jar(
+        &with_sources.join("demo-1.0-sources.jar"),
+        &[("org/example/Overloads.java", OVERLOADS_JAVA.as_bytes())],
+    );
+    write_jar(
+        &without_sources.join("bare-1.0.jar"),
+        &[("org/example/Overloads.class", &class)],
+    );
+    // The limit cuts the source inside the second `take` overload.
+    let limit = OVERLOADS_JAVA.find("second.Type").unwrap();
+    let index = build_index(&root, 10, limit);
+
+    let member = index
+        .get_declaration_source("org.example.Overloads", Some("take"), None, None, None)
+        .unwrap();
+    assert!(member.results.is_empty());
+    assert_eq!(
+        member.unresolved.len(),
+        1,
+        "only the artifact with sources answers"
+    );
+    let unresolved = &member.unresolved[0];
+    assert!(unresolved.truncated);
+    assert_eq!(unresolved.reason, UnresolvedDeclarationReason::Ambiguous);
+    assert_eq!(unresolved.candidate_lines, vec![12, 13]);
+    assert_eq!(
+        unresolved.source_jar.coordinate,
+        "org.example:demo:1.0:sources"
+    );
+
+    let class = index
+        .get_declaration_source("org.example.Overloads", None, None, None, None)
+        .unwrap();
+    assert_eq!(class.results.len(), 1);
+    let result = &class.results[0];
+    assert!(result.truncated);
+    assert_eq!((result.start_line, result.end_line), (3, 13));
+    assert!(result.source.ends_with("    void take("));
+    assert!(OVERLOADS_JAVA.starts_with(&format!("package org.example;\n\n{}", result.source)));
+
+    let class_lookup = index
+        .get_declaration_source(
+            "org.example.Overloads",
+            None,
+            None,
+            Some("bare-1.0.jar"),
+            None,
+        )
+        .unwrap();
+    assert!(class_lookup.results.is_empty() && class_lookup.unresolved.is_empty());
+}
+
+const CUT_JAVA: &str = r#"package org.example;
+
+/** Padding so that the source limit cut below still admits the classfile of `Cut` itself, which is read under the same limit. */
+public class Cut {
+    void f(String value) {}
+    void f(int value) {}
+}
+"#;
+
+const COVARIANT_JAVA: &str = r#"package org.example;
+
+import java.util.function.Supplier;
+
+public class Covariant implements Supplier<String> {
+    public String get() { return "x"; }
+}
+"#;
+
+#[test]
+fn declaration_lookup_reports_cut_overloads_and_bridges_as_unproven() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    let cut = member_class(
+        "org/example/Cut",
+        &[],
+        &[("f", "(I)V"), ("f", "(Ljava/lang/String;)V")],
+    );
+    let covariant = member_class_with_access(
+        "org/example/Covariant",
+        &[],
+        &[
+            ("get", "()Ljava/lang/String;", ACC_PUBLIC),
+            ("get", "()Ljava/lang/Object;", ACC_PUBLIC_BRIDGE_SYNTHETIC),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[
+            ("org/example/Cut.class", &cut),
+            ("org/example/Covariant.class", &covariant),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Cut.java", CUT_JAVA.as_bytes()),
+            ("org/example/Covariant.java", COVARIANT_JAVA.as_bytes()),
+        ],
+    );
+    // The limit cuts the parameter list of the only `f` that is read; `f(int)` is unread.
+    let limit = CUT_JAVA.find("String value").unwrap() + "String".len();
+    let cut_index = build_index(&root, 10, limit);
+    let index = build_index(&root, 10, 64 * 1024);
+    let lookup = |index: &MavenIndex, class_name, member, descriptor| {
+        index
+            .get_declaration_source(class_name, Some(member), Some(descriptor), None, None)
+            .unwrap()
+    };
+
+    let cut = lookup(&cut_index, "org.example.Cut", "f", "(I)V");
+    assert!(
+        cut.results.is_empty(),
+        "a cut parameter list is not a match"
+    );
+    assert_eq!(cut.unresolved.len(), 1);
+    let unresolved = &cut.unresolved[0];
+    assert_eq!(unresolved.reason, UnresolvedDeclarationReason::Unproven);
+    assert_eq!(unresolved.candidate_lines, vec![5]);
+    assert!(unresolved.truncated);
+
+    let bridge = lookup(
+        &index,
+        "org.example.Covariant",
+        "get",
+        "()Ljava/lang/Object;",
+    );
+    assert!(
+        bridge.results.is_empty(),
+        "a bridge has no source declaration"
+    );
+    assert_eq!(bridge.unresolved.len(), 1);
+    assert_eq!(
+        bridge.unresolved[0].reason,
+        UnresolvedDeclarationReason::Unproven
+    );
+    assert_eq!(bridge.unresolved[0].candidate_lines, vec![6]);
+    assert!(!bridge.unresolved[0].truncated);
+
+    let source = lookup(
+        &index,
+        "org.example.Covariant",
+        "get",
+        "()Ljava/lang/String;",
+    );
+    assert!(source.unresolved.is_empty());
+    assert_eq!(
+        (source.results[0].start_line, source.results[0].end_line),
+        (6, 6)
+    );
+}
+
 #[test]
 fn indexes_and_filters_constant_pool_references() {
     assert!(

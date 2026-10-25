@@ -25,5 +25,6 @@ expression: execution.response
       "start_line": 1,
       "truncated": false
     }
-  ]
+  ],
+  "unresolved": []
 }

@@ -1237,7 +1237,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Return the bounded source slice for one Java or Kotlin class, field, or method declaration"
+        description = "Return the bounded source slice for one Java or Kotlin class, field, or method declaration; a declaration whose exact source cannot be proven is listed in unresolved"
     )]
     async fn get_declaration_source(
         &self,

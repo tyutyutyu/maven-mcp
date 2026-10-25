@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
+mod declaration_source;
+
+use declaration_source::{SliceOutcome, SourceLanguage, SourceOutline};
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct ArtifactKey {
     group_id: String,
@@ -369,10 +373,40 @@ pub struct DeclarationSource {
     pub truncated: bool,
 }
 
+/// Why a classfile declaration has no source slice although its source file was read.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+pub enum UnresolvedDeclarationReason {
+    /// The source has no declaration of this kind and name in the expected type.
+    NotFound,
+    /// Several source declarations match equally; `candidate_lines` lists them.
+    Ambiguous,
+    /// Same-named declarations exist, but none provably matches the descriptor;
+    /// `candidate_lines` lists them.
+    Unproven,
+}
+
+/// A classfile declaration whose exact source fragment cannot be proven.
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct UnresolvedDeclaration {
+    pub class_name: String,
+    pub kind: DeclarationKind,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<String>,
+    pub source_jar: JarSummary,
+    pub entry: String,
+    pub reason: UnresolvedDeclarationReason,
+    /// One-based start lines of the source declarations that could not be told apart.
+    pub candidate_lines: Vec<usize>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct DeclarationSourceLookup {
     pub results: Vec<DeclarationSource>,
     pub ambiguous_candidates: Vec<DeclarationCandidate>,
+    pub unresolved: Vec<UnresolvedDeclaration>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1481,11 +1515,13 @@ impl MavenIndex {
             return Ok(DeclarationSourceLookup {
                 results: Vec::new(),
                 ambiguous_candidates: Vec::new(),
+                unresolved: Vec::new(),
             });
         };
         let member_name = member_name.map(normalize_member_name);
         let mut results = Vec::new();
         let mut ambiguous_candidates = BTreeSet::new();
+        let mut unresolved = Vec::new();
         for jar_index in locations {
             let binary = &self.jars[*jar_index];
             if jar_selector.is_some_and(|selector| !matches_selector(binary, selector))
@@ -1503,15 +1539,15 @@ impl MavenIndex {
                 self.max_source_bytes,
             )?;
             let matching = candidates
-                .iter()
-                .filter(|candidate| {
-                    descriptor
-                        .is_none_or(|expected| candidate.descriptor.as_deref() == Some(expected))
+                .into_iter()
+                .filter(|declaration| {
+                    descriptor.is_none_or(|expected| {
+                        declaration.candidate.descriptor.as_deref() == Some(expected)
+                    })
                 })
-                .cloned()
                 .collect::<Vec<_>>();
             if member_name.is_some() && descriptor.is_none() && matching.len() > 1 {
-                ambiguous_candidates.extend(matching);
+                ambiguous_candidates.extend(matching.into_iter().map(|value| value.candidate));
                 continue;
             }
             let source_jar = &self.jars[*source_index];
@@ -1520,33 +1556,25 @@ impl MavenIndex {
             else {
                 continue;
             };
-            for candidate in matching {
-                let Some(slice) = slice_declaration(
-                    &source,
-                    &class_name,
-                    &candidate,
-                    candidates
-                        .iter()
-                        .filter(|value| {
-                            value.kind == candidate.kind && value.name == candidate.name
-                        })
-                        .position(|value| value == &candidate)
-                        .unwrap_or(0),
-                ) else {
-                    continue;
-                };
-                results.push(DeclarationSource {
-                    class_name: class_name.clone(),
-                    kind: candidate.kind,
-                    name: candidate.name,
-                    descriptor: candidate.descriptor,
+            let outline = SourceOutline::parse(&source, SourceLanguage::of_entry(&entry));
+            for ClassfileDeclaration {
+                candidate,
+                is_compiler_generated,
+            } in matching
+            {
+                let located = LocatedSource {
+                    class_name: &class_name,
                     source_jar: self.summary(source_jar),
-                    entry: entry.clone(),
-                    start_line: slice.start_line,
-                    end_line: slice.end_line,
-                    source: slice.source,
+                    entry: &entry,
                     truncated,
-                });
+                };
+                match outline.locate(&class_name, &candidate, is_compiler_generated) {
+                    SliceOutcome::Found(slice) => results.push(located.found(candidate, slice)),
+                    SliceOutcome::Unresolved {
+                        reason,
+                        candidate_lines,
+                    } => unresolved.push(located.unresolved(candidate, reason, candidate_lines)),
+                }
             }
         }
         results.sort_by(|left, right| {
@@ -1563,9 +1591,26 @@ impl MavenIndex {
                     &right.descriptor,
                 ))
         });
+        unresolved.sort_by(|left, right| {
+            (
+                &left.source_jar.coordinate,
+                &left.entry,
+                left.kind,
+                &left.name,
+                &left.descriptor,
+            )
+                .cmp(&(
+                    &right.source_jar.coordinate,
+                    &right.entry,
+                    right.kind,
+                    &right.name,
+                    &right.descriptor,
+                ))
+        });
         Ok(DeclarationSourceLookup {
             results,
             ambiguous_candidates: ambiguous_candidates.into_iter().collect(),
+            unresolved,
         })
     }
 
@@ -3360,17 +3405,27 @@ fn normalize_member_name(value: &str) -> String {
         .to_owned()
 }
 
+/// A classfile declaration with whether the compiler generated it (a bridge or synthetic
+/// method), in which case it has no source declaration of its own.
+struct ClassfileDeclaration {
+    candidate: DeclarationCandidate,
+    is_compiler_generated: bool,
+}
+
 fn declaration_candidates(
     jar: &JarRecord,
     class_name: &str,
     member_name: Option<&str>,
     max_bytes: usize,
-) -> Result<Vec<DeclarationCandidate>> {
+) -> Result<Vec<ClassfileDeclaration>> {
     let Some(member_name) = member_name else {
-        return Ok(vec![DeclarationCandidate {
-            kind: DeclarationKind::Class,
-            name: class_name.to_owned(),
-            descriptor: None,
+        return Ok(vec![ClassfileDeclaration {
+            candidate: DeclarationCandidate {
+                kind: DeclarationKind::Class,
+                name: class_name.to_owned(),
+                descriptor: None,
+            },
+            is_compiler_generated: false,
         }]);
     };
     let mut archive = ClassArchive::open(&jar.path)?;
@@ -3393,10 +3448,13 @@ fn declaration_candidates(
             .fields
             .iter()
             .filter(|field| field.name.as_ref() == member_name)
-            .map(|field| DeclarationCandidate {
-                kind: DeclarationKind::Field,
-                name: member_name.to_owned(),
-                descriptor: Some(field.descriptor.to_string()),
+            .map(|field| ClassfileDeclaration {
+                candidate: DeclarationCandidate {
+                    kind: DeclarationKind::Field,
+                    name: member_name.to_owned(),
+                    descriptor: Some(field.descriptor.to_string()),
+                },
+                is_compiler_generated: false,
             }),
     );
     candidates.extend(
@@ -3407,122 +3465,70 @@ fn declaration_candidates(
                 method.name.as_ref() == member_name
                     || (method.name.as_ref() == "<init>" && member_name == simple_class_name)
             })
-            .map(|method| DeclarationCandidate {
-                kind: DeclarationKind::Method,
-                name: if method.name.as_ref() == "<init>" {
-                    simple_class_name.to_owned()
-                } else {
-                    member_name.to_owned()
+            .map(|method| ClassfileDeclaration {
+                candidate: DeclarationCandidate {
+                    kind: DeclarationKind::Method,
+                    name: if method.name.as_ref() == "<init>" {
+                        simple_class_name.to_owned()
+                    } else {
+                        member_name.to_owned()
+                    },
+                    descriptor: Some(method.descriptor.to_string()),
                 },
-                descriptor: Some(method.descriptor.to_string()),
+                is_compiler_generated: method
+                    .access_flags
+                    .intersects(MethodAccessFlags::BRIDGE | MethodAccessFlags::SYNTHETIC),
             }),
     );
     Ok(candidates)
 }
 
-struct SourceSlice {
-    start_line: usize,
-    end_line: usize,
-    source: String,
+/// The source file context shared by the declarations located in it.
+struct LocatedSource<'a> {
+    class_name: &'a str,
+    source_jar: JarSummary,
+    entry: &'a str,
+    truncated: bool,
 }
 
-fn slice_declaration(
-    source: &str,
-    class_name: &str,
-    candidate: &DeclarationCandidate,
-    overload_ordinal: usize,
-) -> Option<SourceSlice> {
-    let lines = source.lines().collect::<Vec<_>>();
-    let start = match candidate.kind {
-        DeclarationKind::Class => {
-            let simple_name = class_name.rsplit(['.', '$']).next().unwrap_or(class_name);
-            lines
-                .iter()
-                .position(|line| is_type_declaration(line, simple_name))?
-        }
-        DeclarationKind::Method => lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| is_method_declaration(line, &candidate.name))
-            .nth(overload_ordinal)
-            .map(|(index, _)| index)?,
-        DeclarationKind::Field => lines
-            .iter()
-            .position(|line| is_field_declaration(line, &candidate.name))?,
-    };
-    let end = match candidate.kind {
-        DeclarationKind::Field => (start..lines.len())
-            .find(|index| lines[*index].contains(';'))
-            .unwrap_or(start),
-        DeclarationKind::Class | DeclarationKind::Method => declaration_end(&lines, start),
-    };
-    Some(SourceSlice {
-        start_line: start + 1,
-        end_line: end + 1,
-        source: lines[start..=end].join("\n"),
-    })
-}
-
-fn is_type_declaration(line: &str, name: &str) -> bool {
-    ["class", "interface", "enum", "record", "object"]
-        .iter()
-        .any(|keyword| contains_token_sequence(line, keyword, name))
-}
-
-fn contains_token_sequence(line: &str, keyword: &str, name: &str) -> bool {
-    let tokens = line
-        .split(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-    tokens
-        .windows(2)
-        .any(|tokens| tokens[0] == keyword && tokens[1] == name)
-}
-
-fn is_method_declaration(line: &str, name: &str) -> bool {
-    let compact = line.split_whitespace().collect::<String>();
-    compact.contains(&format!("{name}("))
-        && !compact.starts_with("//")
-        && !compact.contains(&format!(".{name}("))
-}
-
-fn is_field_declaration(line: &str, name: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with("//") || trimmed.contains('(') {
-        return false;
-    }
-    trimmed
-        .split(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '$'
-        })
-        .any(|token| token == name)
-        && (trimmed.contains(';')
-            || trimmed
-                .split_whitespace()
-                .any(|token| matches!(token, "val" | "var")))
-}
-
-fn declaration_end(lines: &[&str], start: usize) -> usize {
-    let mut opened = false;
-    let mut depth = 0isize;
-    for (index, line) in lines.iter().enumerate().skip(start) {
-        for character in line.chars() {
-            match character {
-                '{' => {
-                    opened = true;
-                    depth += 1;
-                }
-                '}' if opened => depth -= 1,
-                _ => {}
-            }
-        }
-        if (!opened && line.contains(';')) || (opened && depth <= 0) {
-            return index;
+impl LocatedSource<'_> {
+    fn found(
+        self,
+        candidate: DeclarationCandidate,
+        slice: declaration_source::SourceSlice,
+    ) -> DeclarationSource {
+        DeclarationSource {
+            class_name: self.class_name.to_owned(),
+            kind: candidate.kind,
+            name: candidate.name,
+            descriptor: candidate.descriptor,
+            source_jar: self.source_jar,
+            entry: self.entry.to_owned(),
+            start_line: slice.start_line,
+            end_line: slice.end_line,
+            source: slice.source,
+            truncated: self.truncated,
         }
     }
-    lines.len().saturating_sub(1)
+
+    fn unresolved(
+        self,
+        candidate: DeclarationCandidate,
+        reason: UnresolvedDeclarationReason,
+        candidate_lines: Vec<usize>,
+    ) -> UnresolvedDeclaration {
+        UnresolvedDeclaration {
+            class_name: self.class_name.to_owned(),
+            kind: candidate.kind,
+            name: candidate.name,
+            descriptor: candidate.descriptor,
+            source_jar: self.source_jar,
+            entry: self.entry.to_owned(),
+            reason,
+            candidate_lines,
+            truncated: self.truncated,
+        }
+    }
 }
 
 fn read_class_description(
