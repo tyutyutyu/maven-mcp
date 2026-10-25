@@ -191,7 +191,7 @@ scenarios:
 
   - id: scoped-artifact-api-comparison
     title: API diff of two local artifact versions
-    description: The classes added and removed between the local versions appear in structured form.
+    description: Only api-fixture 1.0 is on the classpath; the diff against the local, unselected 2.0 still lists the added and removed classes in structured form.
     tool: compare_artifact_api
     arguments:
       group_id: org.libs

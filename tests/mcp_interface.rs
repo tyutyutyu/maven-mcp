@@ -2718,6 +2718,158 @@ async fn reactor_outputs_are_indexed_and_unselected_artifacts_are_not() -> Resul
 }
 
 #[tokio::test]
+async fn api_comparison_reads_exact_local_versions_outside_the_classpath() -> Result<()> {
+    let (server, project) = controlled_project().await?;
+    let demo_jar = |version: &str| {
+        project.join(format!(
+            "execution-repository/org/t/demo/{version}/demo-{version}.jar"
+        ))
+    };
+    support::write_class_jar(
+        &demo_jar("1.0"),
+        &class_list(&["org/t/DemoOld", "org/t/DemoShared"]),
+    )?;
+    support::write_class_jar(
+        &demo_jar("2.0"),
+        &class_list(&["org/t/DemoNew", "org/t/DemoShared"]),
+    )?;
+    // Only demo 1.0 is on the classpath; demo 2.0 and `beta` are local but unselected.
+    support::set_controlled_classpath(
+        &project,
+        &[repository_jar(&project, "alpha"), demo_jar("1.0")],
+    )?;
+    let repository = project.join("execution-repository");
+    let before = tree_snapshot(&repository)?;
+    let client = server.connect().await?;
+    let project_path = project.display().to_string();
+    let comparison = |previous: &str, current: &str| {
+        json!({
+            "project_path": project_path,
+            "group_id": "org.t",
+            "artifact_id": "demo",
+            "previous_version": previous,
+            "current_version": current
+        })
+    };
+
+    // The comparison needs no classpath resolution, so no Maven process runs for it.
+    let diff = call(&client, "compare_artifact_api", comparison("1.0", "2.0")).await?;
+    assert_eq!(diff["added_classes"], json!(["org.t.DemoNew"]));
+    assert_eq!(diff["removed_classes"], json!(["org.t.DemoOld"]));
+    assert_eq!(diff["changed_classes"], json!([]));
+    let reversed = call(&client, "compare_artifact_api", comparison("2.0", "1.0")).await?;
+    assert_eq!(reversed["added_classes"], json!(["org.t.DemoOld"]));
+    assert_eq!(reversed["removed_classes"], json!(["org.t.DemoNew"]));
+    assert_eq!(support::controlled_classpath_runs(&project), 0);
+
+    // The normal project search still sees only the classpath, before and after the diff.
+    assert_eq!(
+        class_names(&client, &project, "Demo").await?,
+        names(&["org.t.DemoOld", "org.t.DemoShared"])
+    );
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+    let jars = call(
+        &client,
+        "search_jars",
+        json!({ "project_path": project_path, "query": "org.t" }),
+    )
+    .await?;
+    let coordinates = jars["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|jar| jar["coordinate"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(coordinates, names(&["org.t:alpha:1.0", "org.t:demo:1.0"]));
+
+    // The same version is an empty diff; a missing version is a deterministic argument error.
+    let same = call(&client, "compare_artifact_api", comparison("2.0", "2.0")).await?;
+    assert_eq!(
+        [
+            &same["added_classes"],
+            &same["removed_classes"],
+            &same["changed_classes"]
+        ],
+        [&json!([]), &json!([]), &json!([])]
+    );
+    for (previous, current) in [("1.0", "3.0"), ("3.0", "1.0"), ("3.0", "3.0")] {
+        let error = call_error(
+            &client,
+            "compare_artifact_api",
+            comparison(previous, current),
+        )
+        .await;
+        assert!(
+            error.contains("binary artifact version is not locally available: org.t:demo:3.0"),
+            "{error}"
+        );
+    }
+    let traversal = call_error(&client, "compare_artifact_api", comparison("1.0", "../2.0")).await;
+    assert!(
+        traversal.contains("exact groupId:artifactId:version"),
+        "{traversal}"
+    );
+
+    // The project context and trust boundary still apply.
+    let other = TestServer::start_with_project().await?;
+    let untrusted = call_error(
+        &client,
+        "compare_artifact_api",
+        json!({
+            "project_path": other.project_path().unwrap().display().to_string(),
+            "group_id": "org.t",
+            "artifact_id": "demo",
+            "previous_version": "1.0",
+            "current_version": "2.0"
+        }),
+    )
+    .await;
+    assert!(
+        untrusted.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"),
+        "{untrusted}"
+    );
+
+    // A version directory that links outside the repository is rejected without leaking paths.
+    let outside = tempfile::TempDir::new()?;
+    support::write_class_jar(
+        &outside.path().join("demo-9.0.jar"),
+        &class_list(&["org/t/Outside"]),
+    )?;
+    std::os::unix::fs::symlink(outside.path(), repository.join("org/t/demo/9.0"))?;
+    let escaped = call_error(&client, "compare_artifact_api", comparison("1.0", "9.0")).await;
+    assert!(
+        !escaped.contains(outside.path().to_str().unwrap()),
+        "{escaped}"
+    );
+    std::fs::remove_file(repository.join("org/t/demo/9.0"))?;
+
+    assert_eq!(tree_snapshot(&repository)?, before);
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Every file and directory below `root` with the file contents, for before/after comparison.
+fn tree_snapshot(root: &Path) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>> {
+    walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .map(|entry| {
+            let entry = entry?;
+            let content = entry
+                .file_type()
+                .is_file()
+                .then(|| std::fs::read(entry.path()))
+                .transpose()?;
+            Ok((entry.path().to_owned(), content))
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn selected_entries_that_cannot_be_indexed_fail_without_caching() -> Result<()> {
     let (server, project) = controlled_project().await?;
     let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;

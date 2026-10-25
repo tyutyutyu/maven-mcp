@@ -47,9 +47,19 @@ The server exposes the following MCP tools:
 - `search_class_references` – searches inbound or outbound class, field, and
   method references from the classfile constant pool; a result is a reference,
   not proof of a runtime call site.
-- `compare_artifact_api` – compares the public/protected API of two local
+- `compare_artifact_api` – compares the public/protected API of two exact local
   versions of the same artifact at class, member, superclass, and interface
-  levels.
+  levels. Both unclassified binary JARs are read straight from the local Maven
+  repository, like `get_artifact_pom`, so neither version has to be on the
+  project classpath and no Maven process or project index is needed; the
+  project search is not extended by the compared versions. The request still
+  needs a trusted `project_path`. Resolution is contained in the repository
+  (traversal and outward symlinks are rejected), makes no network access or
+  repository change, and applies the archive limits, `MAX_SOURCE_BYTES`, and
+  the multi-release class selection of the other classfile tools. A version
+  without a local binary JAR is an invalid-argument error; the same version on
+  both sides yields an empty diff. Reactor outputs that were never installed
+  into the repository are not compared.
 - `search_jar_content` – searches manifests, `META-INF/services/*`, and UTF-8
   entries ending in `.conf`, `.config`, `.factories`, `.imports`, `.json`,
   `.list`, `.properties`, `.txt`, `.xml`, `.yaml`, or `.yml`. Each entry is
