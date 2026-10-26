@@ -181,6 +181,18 @@ impl TestServer {
         )
     }
 
+    /// Replaces the class entries of the project-scoped `org.libs:helper:2.0` artifact.
+    pub fn replace_helper_classes(&self, entries: &[(&str, &[u8])]) -> Result<()> {
+        let project_path = self
+            .project_path
+            .as_deref()
+            .context("a project fixture is required")?;
+        write_jar(
+            &project_path.join("execution-repository/org/libs/helper/2.0/helper-2.0.jar"),
+            entries,
+        )
+    }
+
     pub fn project_path(&self) -> Option<&Path> {
         self.project_path.as_deref()
     }
@@ -575,6 +587,56 @@ fn fixture_multi_release_jars(root: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Public class with the given `(name, descriptor)` fields and methods, without code.
+pub fn member_class(
+    class_name: &str,
+    fields: &[(&str, &str)],
+    methods: &[(&str, &str)],
+) -> Vec<u8> {
+    fn push_u16(bytes: &mut Vec<u8>, value: usize) {
+        let value = u16::try_from(value).expect("test class values should fit in u16");
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+    fn push_utf8(bytes: &mut Vec<u8>, value: &str) {
+        bytes.push(1);
+        push_u16(bytes, value.len());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    let members = fields.iter().chain(methods).collect::<Vec<_>>();
+    let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 61);
+    push_u16(&mut bytes, 5 + members.len() * 2);
+    push_utf8(&mut bytes, class_name); // #1
+    bytes.push(7); // #2 class #1
+    push_u16(&mut bytes, 1);
+    push_utf8(&mut bytes, "java/lang/Object"); // #3
+    bytes.push(7); // #4 class #3
+    push_u16(&mut bytes, 3);
+    for (name, descriptor) in &members {
+        push_utf8(&mut bytes, name);
+        push_utf8(&mut bytes, descriptor);
+    }
+    push_u16(&mut bytes, 0x0021);
+    push_u16(&mut bytes, 2);
+    push_u16(&mut bytes, 4);
+    push_u16(&mut bytes, 0); // interfaces
+    let mut member_index = 0;
+    for count in [fields.len(), methods.len()] {
+        push_u16(&mut bytes, count);
+        for _ in 0..count {
+            push_u16(&mut bytes, 0x0001);
+            push_u16(&mut bytes, 5 + member_index * 2);
+            push_u16(&mut bytes, 6 + member_index * 2);
+            push_u16(&mut bytes, 0);
+            member_index += 1;
+        }
+    }
+    push_u16(&mut bytes, 0); // class attributes
+    bytes
 }
 
 fn minimal_class(class_name: &str) -> Vec<u8> {

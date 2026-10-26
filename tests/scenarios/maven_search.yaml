@@ -266,3 +266,23 @@ scenarios:
           kind: class
           name: org.example.Foo
           entry: org/example/Foo.java
+
+  - id: scoped-source-declaration-unresolved-member
+    title: Report a member the source does not declare
+    description: The classfile field value has no declaration in the scoped source, so it is reported as unresolved instead of an arbitrary source fragment.
+    tool: get_declaration_source
+    arguments:
+      class_name: org.example.Foo
+      member_name: value
+    expect:
+      matches:
+        results: []
+        unresolved:
+          - class_name: org.example.Foo
+            kind: field
+            name: value
+            descriptor: I
+            entry: org/example/Foo.java
+            reason: not_found
+            candidate_lines: []
+            truncated: false
