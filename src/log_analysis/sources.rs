@@ -712,7 +712,6 @@ fn for_each_database_row(
     let columns = connection
         .prepare(&format!("SELECT * FROM {table}"))?
         .column_names()
-        .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
     let mut statement = connection.prepare(&guarded_row_query(&table, &columns))?;
