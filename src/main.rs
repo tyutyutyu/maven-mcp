@@ -8,7 +8,7 @@ use maven_mcp::{
     server::MavenMcpServer,
 };
 use rmcp::ServiceExt;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -64,8 +64,13 @@ async fn run() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "maven_mcp=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer().with_writer(io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+                .with_filter(filter_fn(is_minimized_event)),
+        )
         .init();
+    std::panic::set_hook(Box::new(log_panic_without_payload));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -105,6 +110,29 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `RUST_LOG` selects the verbosity, but MCP transport (`rmcp`) events are never written at
+/// any level: they quote peer-supplied requests, notifications, cancellation reasons and
+/// results, including absolute `project_path` values, requested source code and Maven output,
+/// which the data minimization contract excludes.
+fn is_minimized_event(metadata: &tracing::Metadata<'_>) -> bool {
+    !metadata.target().starts_with("rmcp")
+}
+
+/// A panic payload can quote the text being processed, such as Maven output or a request
+/// argument, so only the source file name and line of the panic are logged.
+fn log_panic_without_payload(info: &std::panic::PanicHookInfo<'_>) {
+    let location = info.location().map_or_else(
+        || "unknown".to_owned(),
+        |location| {
+            let file = std::path::Path::new(location.file())
+                .file_name()
+                .map_or_else(|| "unknown".into(), |name| name.to_string_lossy());
+            format!("{file}:{}", location.line())
+        },
+    );
+    tracing::error!(%location, "internal panic; payload withheld to protect request data");
 }
 
 fn exit_after_signal() -> ! {

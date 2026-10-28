@@ -21,11 +21,11 @@ fn report_discovery_enforces_aggregate_file_boundaries() {
     );
     let paths = discover_report_files(root.path()).unwrap();
     assert_eq!(paths.len(), crate::config::MAX_XML_FILES);
-    parse_test_reports(&paths).unwrap();
+    parse_test_reports(&paths, str::to_owned).unwrap();
     let mut too_many = paths;
     too_many.push(too_many[0].clone());
     assert!(
-        parse_test_reports(&too_many)
+        parse_test_reports(&too_many, str::to_owned)
             .unwrap_err()
             .to_string()
             .contains("MAX_XML_FILES")
@@ -82,7 +82,7 @@ fn xml_limits_reach_pom_effective_pom_jacoco_and_surefire_parsers() {
         assert!(
             format!(
                 "{:#}",
-                parse_test_reports(std::slice::from_ref(&surefire)).unwrap_err()
+                parse_test_reports(std::slice::from_ref(&surefire), str::to_owned).unwrap_err()
             )
             .contains(limit)
         );
@@ -720,7 +720,7 @@ fn malformed_surefire_xml_is_an_explicit_error() {
     let root = TempDir::new().unwrap();
     let report = root.path().join("TEST-broken.xml");
     fs::write(&report, "<testsuite><broken></testsuite>").unwrap();
-    assert!(parse_test_reports(&[report]).is_err());
+    assert!(parse_test_reports(&[report], str::to_owned).is_err());
 }
 
 #[tokio::test]
@@ -1350,4 +1350,89 @@ fn rediscovery_rereads_the_reactor_and_keeps_the_last_focused_test_state() {
     ] {
         assert!(after.contains(&refreshed.root.join(expected)), "{expected}");
     }
+}
+
+const SECRET_MARKER: &str = "synthetic-secret-marker";
+
+#[tokio::test]
+async fn unicode_and_complete_authorization_output_is_redacted_without_panicking() {
+    let (root, config) = wrapper_project(&format!(
+        "#!/bin/sh\nprintf '%s\\n' 'İ password=é' 'Authorization: Bearer {SECRET_MARKER}' \"$PWD/x secret={SECRET_MARKER}\"\n"
+    ));
+    let runner = MavenRunner::discover(&config).unwrap();
+    let result = runner.run_arguments(&[]).await.unwrap();
+    assert_eq!(result.status, MavenRunStatus::Success);
+    assert_eq!(
+        result.stdout,
+        "İ password=<redacted>\nAuthorization: <redacted>\n<PROJECT_ROOT>/x secret=<redacted>\n"
+    );
+    assert_eq!(result.redaction_count, 4);
+    assert!(
+        !result
+            .stdout
+            .contains(root.path().to_string_lossy().as_ref())
+    );
+}
+
+#[tokio::test]
+async fn structured_test_failures_and_last_failures_are_redacted_before_truncation() {
+    let long_message = format!("{} token={SECRET_MARKER}", "x".repeat(1_988));
+    let report = format!(
+        r#"<testsuite tests="3" failures="2" errors="1" skipped="0">
+            <testcase classname="org.example.FooTest" name="fails[password={SECRET_MARKER}]"><failure message="{long_message}"/></testcase>
+            <testcase classname="org.example.FooTest" name="quoted"><failure message="{{&quot;password&quot;:&quot;a\&quot;{SECRET_MARKER}&quot;}} secret=a;{SECRET_MARKER}"/></testcase>
+            <testcase classname="org.example.FooTest" name="errors"><error>Authorization: Basic {SECRET_MARKER} at ROOT/src</error></testcase>
+        </testsuite>"#
+    );
+    let script = format!(
+        "#!/bin/sh\nmkdir -p core/target/surefire-reports\nprintf '%s' '{}' | sed \"s#ROOT#$PWD#\" > core/target/surefire-reports/TEST-org.example.FooTest.xml\nexit 1\n",
+        report.replace('\'', "'\\''")
+    );
+    let (root, config) = wrapper_project(&script);
+    let runner = MavenRunner::discover(&config).unwrap();
+    let result = runner
+        .run_focused_test(&FocusedTestInvocation {
+            test_class: "org.example.FooTest".to_owned(),
+            test_method: None,
+            module: None,
+            also_make: false,
+        })
+        .await;
+    assert_eq!(result.report_status, TestReportStatus::Available);
+    assert_eq!(result.failures.len(), 3);
+    assert_eq!(result.failures[0].class_name, "org.example.FooTest");
+    assert_eq!(result.failures[0].message, "Authorization: <redacted>");
+    assert_eq!(result.failures[1].test_name, "fails[password=<redacted>]");
+    assert_eq!(result.failures[1].message.chars().count(), 2_000);
+    assert!(result.failures[1].message.ends_with(" token=<reda"));
+    assert_eq!(
+        result.failures[2].message,
+        r#"{"password":<redacted>} secret=<redacted>"#
+    );
+    let last = runner.last_test_failures().await;
+    assert_eq!(last.failures, result.failures);
+    let serialized = serde_json::to_string(&last).unwrap();
+    assert!(!serialized.contains(SECRET_MARKER), "{serialized}");
+    assert!(!serialized.contains(root.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn effective_pom_masks_sensitive_properties_and_keeps_other_values() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("effective.xml");
+    fs::write(
+        &path,
+        format!(
+            "<project><artifactId>a</artifactId><properties><db.password>{SECRET_MARKER}</db.password><repository.url>https://ci:{SECRET_MARKER}@repo.example/r</repository.url><java.version>21</java.version><encoding>UTF-8</encoding></properties></project>"
+        ),
+    )
+    .unwrap();
+    let properties = &parse_effective_pom(&path).unwrap()[0].properties;
+    assert_eq!(properties["db.password"], "<redacted>");
+    assert_eq!(
+        properties["repository.url"],
+        "https://<credentials>@repo.example/r"
+    );
+    assert_eq!(properties["java.version"], "21");
+    assert_eq!(properties["encoding"], "UTF-8");
 }

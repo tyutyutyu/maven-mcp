@@ -3940,3 +3940,135 @@ async fn warm_index_validation_runs_as_heavy_work() -> Result<()> {
     client.cancel().await?;
     Ok(())
 }
+
+const SECRET_MARKER: &str = "synthetic-secret-marker";
+
+fn assert_no_secret_or_host_path(value: &Value, project: &Path) {
+    let text = value.to_string();
+    assert!(!text.contains(SECRET_MARKER), "{text}");
+    assert!(!text.contains(project.to_string_lossy().as_ref()), "{text}");
+}
+
+#[tokio::test]
+async fn credentials_are_redacted_from_maven_output_and_structured_diagnostics() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().unwrap();
+    let project_path = project.display().to_string();
+    let source = format!(
+        "package org.example; public class Foo {{ String password = \"{SECRET_MARKER}\"; }}"
+    );
+    server.replace_helper_sources(&[("org/example/Foo.java", source.as_bytes())])?;
+    std::fs::write(
+        project.join("execution-repository/org/libs/helper/2.0/helper-2.0.pom"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.libs</groupId><artifactId>helper</artifactId><version>2.0</version><properties><gpg.passphrase>{SECRET_MARKER}</gpg.passphrase><deploy.url>https://deploy:{SECRET_MARKER}@repo.example/releases</deploy.url><java.version>21</java.version></properties></project>"
+        ),
+    )?;
+    std::fs::write(
+        project.join(".effective-pom-fixture.xml"),
+        format!(
+            "<project><artifactId>a</artifactId><properties><db.password>{SECRET_MARKER}</db.password><sonar.token>{SECRET_MARKER}</sonar.token><java.version>21</java.version><greeting>İ ő</greeting></properties></project>"
+        ),
+    )?;
+    let client = server.connect().await?;
+    let call = |name: &'static str, extra: Value| {
+        let mut request = json!({ "project_path": project_path });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let client = &client;
+        async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                client
+                    .call_tool(CallToolRequestParams::new(name).with_arguments(arguments(request))),
+            )
+            .await
+            .map(|result| structured(result.expect("tool call must succeed")))
+            .expect("tool must respond in time")
+        }
+    };
+
+    let effective = call("get_effective_pom", json!({})).await;
+    assert_eq!(effective["status"], "available", "{effective:#}");
+    let properties = &effective["projects"][0]["properties"];
+    assert_eq!(properties["db.password"], "<redacted>");
+    assert_eq!(properties["sonar.token"], "<redacted>");
+    assert_eq!(properties["java.version"], "21");
+    assert_eq!(properties["greeting"], "İ ő");
+    assert_no_secret_or_host_path(&effective, project);
+
+    let pom = call(
+        "get_artifact_pom",
+        json!({"coordinate": "org.libs:helper:2.0"}),
+    )
+    .await;
+    let properties = &pom["descriptor"]["properties"];
+    assert_eq!(properties["gpg.passphrase"], "<redacted>");
+    assert_eq!(
+        properties["deploy.url"],
+        "https://<credentials>@repo.example/releases"
+    );
+    assert_eq!(properties["java.version"], "21");
+    assert_no_secret_or_host_path(&pom, project);
+
+    // Requested source code is returned verbatim, even when it looks like a credential.
+    let class_source = call("get_class_source", json!({"class_name": "org.example.Foo"})).await;
+    assert_eq!(class_source["results"][0]["source"], source);
+
+    std::fs::write(
+        project.join("mvnw"),
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" test "*)
+    mkdir -p target/surefire-reports
+    cat > target/surefire-reports/TEST-org.example.LoginTest.xml <<XML
+<testsuite tests="2" failures="1" errors="1" skipped="0"><testcase classname="org.example.LoginTest" name="rejects"><failure message="expected token={SECRET_MARKER} to be rejected in $PWD/src/test"/></testcase><testcase classname="org.example.LoginTest" name="errors"><error>Authorization: Bearer {SECRET_MARKER}
+at org.example.LoginTest.errors(LoginTest.java:7)</error></testcase></testsuite>
+XML
+    exit 1
+    ;;
+esac
+printf '%s\n' 'İ password=é' 'Authorization: Bearer {SECRET_MARKER}' 'ﬀ token={SECRET_MARKER} ő' 'https://deploy:{SECRET_MARKER}@repo.example/x'
+printf 'Proxy-Authorization: Basic {SECRET_MARKER}\n' >&2
+"#
+        ),
+    )?;
+    let run = call("run_maven", json!({"arguments": ["custom:goal"]})).await;
+    assert_eq!(run["status"], "success", "{run:#}");
+    assert_eq!(
+        run["stdout"],
+        "İ password=<redacted>\nAuthorization: <redacted>\nﬀ token=<redacted> ő\nhttps://<credentials>@repo.example/x\n"
+    );
+    assert_eq!(run["stderr"], "Proxy-Authorization: <redacted>\n");
+    assert_eq!(run["redaction_count"], 5);
+    assert_no_secret_or_host_path(&run, project);
+
+    let tested = call(
+        "run_maven_test",
+        json!({"test_class": "org.example.LoginTest"}),
+    )
+    .await;
+    assert_eq!(tested["report_status"], "available", "{tested:#}");
+    let failures = &tested["failures"];
+    assert_eq!(failures[0]["class_name"], "org.example.LoginTest");
+    assert_eq!(failures[0]["test_name"], "errors");
+    assert_eq!(
+        failures[0]["message"],
+        "Authorization: <redacted>\nat org.example.LoginTest.errors(LoginTest.java:7)"
+    );
+    assert_eq!(failures[1]["test_name"], "rejects");
+    assert_eq!(
+        failures[1]["message"],
+        "expected token=<redacted> to be rejected in <PROJECT_ROOT>/src/test"
+    );
+    assert_no_secret_or_host_path(&tested, project);
+    let last = call("get_last_maven_test_failures", json!({})).await;
+    assert_eq!(last["failures"], tested["failures"]);
+    assert_no_secret_or_host_path(&last, project);
+
+    client.cancel().await?;
+    Ok(())
+}

@@ -508,6 +508,56 @@ not necessarily a project error. It also names `MAVEN_EXECUTION_NETWORK=true` as
 the opt-in setting for trusted projects. The optional field is omitted from
 successful runs and failures unrelated to offline artifact resolution.
 
+### Redaction and data minimization
+
+Maven-backed responses pass through one shared redaction step before they are
+returned or retained. It protects these fields:
+
+- `stdout` and `stderr` of every Maven run, including the build diagnostics,
+  compiler diagnostics and MCP error text derived from them;
+- `failures[].class_name`, `failures[].test_name`, `failures[].message` and
+  `report_error` of `run_maven_test`, and the `failures` returned by
+  `get_last_maven_test_failures`;
+- `projects[].properties` and `error` of `get_effective_pom`;
+- `descriptor.properties` of `get_artifact_pom`.
+
+The step replaces the complete value of an `Authorization` or
+`Proxy-Authorization` header (scheme and credentials through the end of the
+line, with any case and spacing) with `<redacted>`. It also replaces values after a
+key that contains `password`, `passwd`, `passphrase`, `secret`, `token`,
+`credential`, `api key`, `access key` or `private key`. The key forms are
+`key=value`, `key: value`, quoted JSON and XML elements. URL user information
+becomes `<credentials>`, and self-identifying GitHub, `sk-`, AWS access-key and
+JWT tokens become `<redacted>`. Property values whose names contain one of those
+words are masked completely; other property values only lose embedded
+credentials, so values such as `java.version` stay intact. In Maven output and
+test diagnostics, the project root, execution repository and home directory
+become `<PROJECT_ROOT>`, `<MAVEN_REPOSITORY>` and `<HOME>`. `redaction_count`
+reports the number of actual replacements. Matching runs on the original UTF-8
+text, so arbitrary Unicode output cannot crash a request. Long test failure
+messages are redacted before they are truncated.
+
+Requested content is returned verbatim: `get_class_source`,
+`get_declaration_source`, `get_jar_entry` and the other artifact tools do not
+rewrite source code or archive entries. Redaction is pattern-based. It does not
+recognize a secret without a recognizable key, header or token format, a secret
+split across lines, or custom header names. Values next to a sensitive word may
+be redacted even when they are not secrets.
+
+Diagnostics go only to stderr. Logs and MCP errors name archives by file name
+instead of their absolute host path. `RUST_LOG` can raise the verbosity of
+`maven_mcp`, but MCP transport (`rmcp`) events are always suppressed at every
+level, because they can quote complete requests, notifications, cancellation
+reasons and responses. A panic logs only
+its source file and line, never its payload.
+
+Local logs, MCP Inspector sessions, `target/promptfoo/`,
+`target/mcp-test-report/`, `target/coverage/`, benchmark results and
+`maven-agent-log` reports can contain absolute paths, model output or
+credentials. Keep them out of version control, issue reports and release
+packages; a release contains only the built binaries and the public
+documentation.
+
 ### Request-scoped jenv Java selection
 
 Start the STDIO server with `maven-mcp --jenv` to resolve Java separately for
@@ -558,7 +608,7 @@ Surefire failures follow the existing report-error contract.
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |
 | `MAVEN_MCP_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime` | User-private directory for live runtime status files consumed by `maven-mcp stats`. |
 | `JENV_ROOT` | `$HOME/.jenv` | jenv installation root used only when the server starts with `--jenv`; must be an absolute path when explicitly set. |
-| `RUST_LOG` | `maven_mcp=info` | Logging level/filter. |
+| `RUST_LOG` | `maven_mcp=info` | Logging level/filter for stderr diagnostics. MCP transport (`rmcp`) events are always suppressed; see [Redaction and data minimization](#redaction-and-data-minimization). |
 
 `get_class_source` returns a result only when the corresponding sources artifact
 is present in the local repository. For Maven projects, these artifacts can be

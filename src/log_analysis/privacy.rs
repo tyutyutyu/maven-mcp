@@ -1,4 +1,5 @@
 use super::{CommandEvent, ENTRY_OVERHEAD_BYTES, LimitExceeded, StateBudget};
+use crate::redaction::KNOWN_TOKEN;
 use regex::Regex;
 use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
@@ -16,9 +17,6 @@ static SECRET_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
 });
 static URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(\w+://)[^\s/@'"<>]+@"#).expect("constant URL expression"));
-static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b").expect("constant token expression")
-});
 
 pub fn redact_events(
     events: &mut [CommandEvent],
@@ -244,7 +242,7 @@ fn redact(text: &mut String, replacements: &[(String, String)], usernames: &[Reg
     // Match credentials before replacing paths so quoted secrets are removed whole.
     *text = redact_secret_values(text);
     *text = URL.replace_all(text, "${1}<CREDENTIALS>@").into_owned();
-    *text = TOKEN.replace_all(text, "<REDACTED>").into_owned();
+    *text = KNOWN_TOKEN.replace_all(text, "<REDACTED>").into_owned();
     for (pattern, replacement) in replacements {
         if !pattern.is_empty() {
             *text = text.replace(pattern, replacement);
