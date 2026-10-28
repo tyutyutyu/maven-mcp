@@ -41,6 +41,10 @@ jobs:
       - name: Check advisories, licenses, bans and sources
         run: cargo deny --locked check advisories licenses bans sources
 
+      # The deterministic gate only: the opt-in real Maven smoke and the
+      # Promptfoo agent eval need network access or provider credentials and
+      # are not run here. The gate enforces line coverage; branch coverage is
+      # not measured on the stable toolchain.
       - name: Run verification gate
         run: scripts/test-pyramid.sh
 

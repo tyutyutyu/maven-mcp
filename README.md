@@ -552,7 +552,8 @@ reasons and responses. A panic logs only
 its source file and line, never its payload.
 
 Local logs, MCP Inspector sessions, `target/promptfoo/`,
-`target/mcp-test-report/`, `target/coverage/`, benchmark results and
+`target/mcp-test-report/`, `target/coverage/`, `target/real-maven-smoke/`,
+benchmark results and
 `maven-agent-log` reports can contain absolute paths, model output or
 credentials. Keep them out of version control, issue reports and release
 packages; a release contains only the built binaries and the public
@@ -977,9 +978,22 @@ cargo test --test mcp_interface
 
 The integration contract verifies that all project-dependent tools require
 `project_path`, Maven-backed operations require a host-configured trusted
-directory tree, and execution occurs through a real STDIO MCP client. Lifecycle
-tests ensure EOF and SIGTERM stop the process, even while index work is blocked,
-and stdout contains JSON-RPC only.
+directory tree, and execution occurs through a real STDIO MCP client. Each
+independent public contract (the tool catalog, each output schema rule, each
+error class, and each project tool) is its own test, so a failure names the
+broken contract. Lifecycle tests ensure EOF and SIGTERM stop the process, even
+while index work is blocked, and stdout contains JSON-RPC only.
+
+There are three separate verification levels:
+
+| Level | Command | When | Network, credentials |
+| --- | --- | --- | --- |
+| Deterministic gate | `scripts/test-pyramid.sh` | before every handoff and in the required `CI` check | none; synthetic fixtures and fake Maven wrappers, no Maven, JDK or `~/.m2` |
+| Real Maven smoke | `scripts/real-maven-smoke.sh` | on demand | network once to prepare a pinned Maven and plugins; then offline |
+| Agent eval | `scripts/run-agent-eval.sh` | only when separately decided | a model provider account; usually paid |
+
+The gate runs neither the smoke nor the agent eval, and its result does not
+cover them.
 
 Run the complete test pyramid—unit tests, real child-process STDIO MCP
 integration and lifecycle tests, YAML scenarios, JSON snapshots, and a Markdown
@@ -1015,6 +1029,34 @@ target/coverage/html/index.html
 target/coverage/summary.json
 ```
 
+Branch coverage is not measured: `cargo llvm-cov --branch` requires a nightly
+Rust toolchain, and the project pins stable Rust. The `branches` totals in
+`summary.json` are therefore zero; they are not a branch coverage result.
+
+### Real Maven Smoke
+
+The deterministic fixtures are complemented by an opt-in smoke test that runs a
+real Apache Maven:
+
+```bash
+scripts/real-maven-smoke.sh            # prepare once, then run offline
+scripts/real-maven-smoke.sh --refresh  # re-download and re-prepare first
+```
+
+It pins Apache Maven `3.9.9` (verified by SHA-512), `maven-dependency-plugin`
+`3.8.1` and `maven-help-plugin` `3.5.1`, and accepts a JDK with major version
+17, 21 or 25 from `JAVA_HOME` or `PATH` (with jenv: `jenv exec
+scripts/real-maven-smoke.sh`). Prerequisites are `curl`, `sha512sum`, `tar` and
+Cargo. A one-time online step resolves only the pinned plugins into
+`target/real-maven-smoke/` with an empty `<settings/>` file. Each run then
+copies that repository into a temporary directory, adds synthetic artifacts, and
+runs Maven offline, never reading `~/.m2` or the user's Maven settings or
+`~/.mavenrc`. The ignored Cargo tests in `tests/real_maven_smoke.rs` check that
+real Maven reproduces the versioned `tests/fixtures/dependency_tree.txt` capture
+and that the server's dependency, classpath, class search and effective-POM
+tools work against real Maven over STDIO. `target/real-maven-smoke/` is a local
+cache; do not commit it.
+
 ### Hosted CI
 
 GitHub Actions runs the same verification gate from
@@ -1042,8 +1084,8 @@ exception register and alert handling.
 
 ### Agent and LLM Evaluation
 
-Above the deterministic Rust test pyramid, a separate Promptfoo evaluation
-checks whether an MCP-capable model selects the correct tool and essential
+Above the deterministic Rust test pyramid, a separate, optional Promptfoo
+evaluation checks whether an MCP-capable model selects the correct tool and essential
 arguments for positive, ambiguous, and no-result natural-language requests, and
 then avoids inventing artifacts, versions, JARs, or classes absent from the
 fixture.
@@ -1064,8 +1106,15 @@ The reviewable HTML is written to `target/promptfoo/report.html`, and the comple
 machine-readable JSON to `target/promptfoo/results.json`. The provider/model is
 configured only through `PROMPTFOO_PROVIDER`, while authentication comes from
 the provider's standard environment variable; never put secrets in YAML. The
-report may contain complete model output and configuration, so treat it as an
-artifact and do not commit it.
+report may contain complete model output, configuration and local paths, so
+keep it local: do not commit it, attach it to issues or pull requests, or
+upload it as a CI artifact.
+
+Neither `scripts/test-pyramid.sh` nor the `CI` workflow runs this evaluation;
+only the offline check of its configuration file is part of the gate. It calls
+a real, usually paid model provider, so run it only when that cost is
+intentionally accepted. Without `PROMPTFOO_PROVIDER` or `npx`, the script stops
+with exit code 2 before building anything.
 
 Start MCP Inspector with the fixture repository:
 

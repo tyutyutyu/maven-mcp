@@ -287,13 +287,40 @@ printf '%s' "$valid" > "$output"
     Ok(())
 }
 
-#[tokio::test]
-async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
+/// Starts the shared project fixture of `tests/support` with one connected STDIO client.
+async fn project_client() -> Result<(TestServer, Client, String)> {
     let server = TestServer::start_with_project().await?;
     let client = server.connect().await?;
     let project_path = server.project_path().unwrap().display().to_string();
+    Ok((server, client, project_path))
+}
 
+async fn listed_tools() -> Result<Vec<rmcp::model::Tool>> {
+    let (_server, client, _) = project_client().await?;
     let tools = client.list_all_tools().await?;
+    client.cancel().await?;
+    Ok(tools)
+}
+
+fn output_schema<'a>(tools: &'a [rmcp::model::Tool], name: &str) -> &'a Map<String, Value> {
+    tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .and_then(|tool| tool.output_schema.as_deref())
+        .unwrap_or_else(|| panic!("{name} must publish an output schema"))
+}
+
+fn assert_schema_properties(schema: &Map<String, Value>, tool: &str, fields: &[&str]) {
+    let missing = fields
+        .iter()
+        .filter(|field| schema["properties"].get(**field).is_none())
+        .collect::<Vec<_>>();
+    assert!(missing.is_empty(), "{tool} schema misses {missing:?}");
+}
+
+#[tokio::test]
+async fn tool_catalog_lists_exactly_the_public_tools() -> Result<()> {
+    let tools = listed_tools().await?;
     let actual_names = tools
         .iter()
         .map(|tool| tool.name.as_ref())
@@ -333,6 +360,54 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
         "search_type_hierarchy",
     ]);
     assert_eq!(actual_names, expected_names);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_tool_output_schema_has_an_object_root() -> Result<()> {
+    let tools = listed_tools().await?;
+    let non_object = tools
+        .iter()
+        .filter(|tool| {
+            tool.output_schema
+                .as_ref()
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str)
+                != Some("object")
+        })
+        .map(|tool| tool.name.as_ref())
+        .collect::<Vec<_>>();
+    assert!(
+        non_object.is_empty(),
+        "output schemas without an object root: {non_object:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_tool_requires_an_explicit_project_path() -> Result<()> {
+    let tools = listed_tools().await?;
+    let without_project_path = tools
+        .iter()
+        .filter(|tool| {
+            !tool
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|name| name == "project_path"))
+        })
+        .map(|tool| tool.name.as_ref())
+        .collect::<Vec<_>>();
+    assert!(
+        without_project_path.is_empty(),
+        "tools that do not require project_path: {without_project_path:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_maven_schema_takes_an_argument_array_and_reports_the_raw_run() -> Result<()> {
+    let tools = listed_tools().await?;
     let maven_tool = tools.iter().find(|tool| tool.name == "run_maven").unwrap();
     assert_eq!(
         maven_tool.input_schema["properties"]["arguments"]["type"],
@@ -348,111 +423,74 @@ async fn stdio_mcp_exposes_and_executes_all_tools() -> Result<()> {
             .unwrap()
             .contains(&json!("arguments"))
     );
-    let maven_schema = maven_tool.output_schema.as_ref().unwrap();
-    for field in [
-        "status",
-        "exit_code",
-        "duration_ms",
-        "timed_out",
-        "stdout",
-        "stderr",
-        "stdout_truncated",
-        "stderr_truncated",
-        "redaction_count",
-    ] {
-        assert!(
-            maven_schema["properties"].get(field).is_some(),
-            "run_maven schema missing {field}"
-        );
-    }
-    for tool in &tools {
-        assert_eq!(
-            tool.output_schema
-                .as_ref()
-                .and_then(|schema| schema.get("type"))
-                .and_then(Value::as_str),
-            Some("object"),
-            "{} output schema must be an object",
-            tool.name
-        );
-    }
-    let refresh_schema = tools
-        .iter()
-        .find(|tool| tool.name == "refresh_maven_project")
-        .and_then(|tool| tool.output_schema.as_ref())
-        .expect("refresh_maven_project must publish an output schema");
-    for field in [
-        "status",
-        "invalidated",
-        "model_reloaded",
-        "index_rebuilt",
-        "index",
-    ] {
-        assert!(
-            refresh_schema["properties"].get(field).is_some(),
-            "refresh_maven_project schema missing {field}"
-        );
-    }
-    let lifecycle_schema = tools
-        .iter()
-        .find(|tool| tool.name == "run_maven_lifecycle")
-        .and_then(|tool| tool.output_schema.as_ref())
-        .expect("run_maven_lifecycle must publish an output schema");
-    assert!(
-        lifecycle_schema["properties"]
-            .get("policy_notice")
-            .is_some(),
-        "run_maven_lifecycle schema must expose policy_notice"
+    assert_schema_properties(
+        output_schema(&tools, "run_maven"),
+        "run_maven",
+        &[
+            "status",
+            "exit_code",
+            "duration_ms",
+            "timed_out",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated",
+            "redaction_count",
+        ],
     );
-    for tool in &tools {
-        let required = tool
-            .input_schema
-            .get("required")
-            .and_then(Value::as_array)
-            .expect("input schema must list required properties");
-        assert!(
-            required.iter().any(|name| name == "project_path"),
-            "{} must require project_path",
-            tool.name
-        );
-    }
+    Ok(())
+}
 
-    let project = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("inspect_maven_project")
-                    .with_arguments(arguments(json!({ "project_path": project_path }))),
-            )
-            .await?,
+#[tokio::test]
+async fn refresh_schema_reports_invalidation_reload_and_rebuild() -> Result<()> {
+    let tools = listed_tools().await?;
+    assert_schema_properties(
+        output_schema(&tools, "refresh_maven_project"),
+        "refresh_maven_project",
+        &[
+            "status",
+            "invalidated",
+            "model_reloaded",
+            "index_rebuilt",
+            "index",
+        ],
     );
-    assert_eq!(project["artifact_id"], "fixture-project");
+    Ok(())
+}
 
-    let classes = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_classes").with_arguments(arguments(json!({
-                    "project_path": server.project_path().unwrap().display().to_string(),
-                    "query": "Foo"
-                }))),
-            )
-            .await?,
+#[tokio::test]
+async fn lifecycle_schema_exposes_the_offline_policy_notice() -> Result<()> {
+    let tools = listed_tools().await?;
+    assert_schema_properties(
+        output_schema(&tools, "run_maven_lifecycle"),
+        "run_maven_lifecycle",
+        &["policy_notice"],
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn class_search_finds_project_classpath_classes_without_repository_leaks() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let classes = call(
+        &client,
+        "search_classes",
+        json!({ "project_path": project_path, "query": "Foo" }),
+    )
+    .await?;
     assert_eq!(classes["results"][0]["class_name"], "org.example.Foo");
     assert_eq!(
         classes["results"][0]["jar"]["coordinate"],
         "org.libs:helper:2.0"
     );
-    let leaked = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("search_jars").with_arguments(arguments(json!({
-                    "project_path": server.project_path().unwrap().display().to_string(),
-                    "query": "demo"
-                }))),
-            )
-            .await?,
-    );
-    assert_eq!(leaked["results"].as_array().unwrap().len(), 0);
+    let leaked = call(
+        &client,
+        "search_jars",
+        json!({ "project_path": project_path, "query": "demo" }),
+    )
+    .await?;
+    assert_eq!(leaked["results"], json!([]));
 
     client.cancel().await?;
     Ok(())
@@ -1273,10 +1311,8 @@ async fn maven_lifecycle_reports_build_failure_and_timeout_through_stdio() -> Re
 }
 
 #[tokio::test]
-async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
-    let server = TestServer::start_with_project().await?;
-    let client = server.connect().await?;
-    let project_path = server.project_path().unwrap().display().to_string();
+async fn missing_required_arguments_are_reported_as_tool_errors() -> Result<()> {
+    let (_server, client, _) = project_client().await?;
 
     let missing_argument = client
         .call_tool(CallToolRequestParams::new("search_classes"))
@@ -1290,33 +1326,55 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
             .contains("project_path")
     );
 
-    let invalid_regex = client
-        .call_tool(
-            CallToolRequestParams::new("search_source").with_arguments(arguments(json!({
-                "project_path": project_path,
-                "query": "[",
-                "regex": true
-            }))),
-        )
-        .await
-        .expect_err("invalid regex must fail at the protocol level");
-    assert!(invalid_regex.to_string().contains("regex parse error"));
+    client.cancel().await?;
+    Ok(())
+}
 
-    let descriptor_without_member = client
-        .call_tool(
-            CallToolRequestParams::new("get_declaration_source").with_arguments(arguments(json!({
-                "project_path": server.project_path().unwrap().display().to_string(),
-                "class_name": "org.example.Foo",
-                "descriptor": "()V"
-            }))),
-        )
-        .await
-        .expect_err("descriptor without member name must fail at the protocol level");
+#[tokio::test]
+async fn invalid_source_regex_is_a_protocol_error() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let invalid_regex = call_error(
+        &client,
+        "search_source",
+        json!({ "project_path": project_path, "query": "[", "regex": true }),
+    )
+    .await;
     assert!(
-        descriptor_without_member
-            .to_string()
-            .contains("member_name")
+        invalid_regex.contains("regex parse error"),
+        "{invalid_regex}"
     );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declaration_descriptor_without_member_name_is_a_protocol_error() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let descriptor_without_member = call_error(
+        &client,
+        "get_declaration_source",
+        json!({
+            "project_path": project_path,
+            "class_name": "org.example.Foo",
+            "descriptor": "()V"
+        }),
+    )
+    .await;
+    assert!(
+        descriptor_without_member.contains("member_name"),
+        "{descriptor_without_member}"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_tool_is_a_protocol_error() -> Result<()> {
+    let (_server, client, _) = project_client().await?;
 
     let unknown_tool = client
         .call_tool(CallToolRequestParams::new("not_a_real_tool"))
@@ -1326,7 +1384,8 @@ async fn stdio_mcp_rejects_invalid_and_unknown_tool_calls() -> Result<()> {
         unknown_tool
             .to_string()
             .to_lowercase()
-            .contains("not found")
+            .contains("not found"),
+        "{unknown_tool}"
     );
 
     client.cancel().await?;
@@ -1396,147 +1455,127 @@ async fn effective_pom_validates_complete_xml_through_stdio() -> Result<()> {
 }
 
 #[tokio::test]
-async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> {
-    let server = TestServer::start_with_project().await?;
-    let other_server = TestServer::start_with_project().await?;
-    let client = server.connect().await?;
-    let project_path = server.project_path().unwrap().display().to_string();
-    let other_project_path = other_server.project_path().unwrap().display().to_string();
+async fn inspect_reports_the_trusted_wrapper_project() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
 
-    let tools = client.list_all_tools().await?;
-    let names = tools
-        .iter()
-        .map(|tool| tool.name.as_ref())
-        .collect::<BTreeSet<_>>();
-    for name in [
-        "explain_dependency_resolution",
-        "get_dependency_tree",
-        "get_effective_pom",
-        "get_jacoco_coverage",
-        "get_jacoco_coverage_gaps",
-        "get_last_maven_test_failures",
-        "get_maven_classpath",
+    let project = call(
+        &client,
         "inspect_maven_project",
-        "list_maven_test_classes",
-        "refresh_maven_project",
-        "run_maven",
-        "run_maven_lifecycle",
-        "run_maven_test",
-    ] {
-        assert!(names.contains(name), "missing opt-in project tool {name}");
-    }
-
-    let project = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("inspect_maven_project")
-                    .with_arguments(arguments(json!({ "project_path": project_path }))),
-            )
-            .await?,
-    );
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert_eq!(project["artifact_id"], "fixture-project");
     assert_eq!(project["wrapper"], true);
 
-    let untrusted = client
-        .call_tool(
-            CallToolRequestParams::new("inspect_maven_project")
-                .with_arguments(arguments(json!({ "project_path": other_project_path }))),
-        )
-        .await
-        .expect_err("a project outside the trusted directory tree must be rejected");
-    assert!(
-        untrusted
-            .to_string()
-            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
-    );
+    client.cancel().await?;
+    Ok(())
+}
 
-    let lifecycle = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("run_maven_lifecycle").with_arguments(arguments(
-                    json!({
-                        "project_path": server.project_path().unwrap().display().to_string(),
-                        "phase": "compile"
-                    }),
-                )),
-            )
-            .await?,
-    );
+#[tokio::test]
+async fn project_tools_reject_projects_outside_the_trusted_tree() -> Result<()> {
+    let (_server, client, _) = project_client().await?;
+    let other_server = TestServer::start_with_project().await?;
+    let other_project_path = other_server.project_path().unwrap().display().to_string();
+
+    for tool in ["inspect_maven_project", "get_last_maven_test_failures"] {
+        let untrusted =
+            call_error(&client, tool, json!({ "project_path": other_project_path })).await;
+        assert!(
+            untrusted.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"),
+            "{tool}: {untrusted}"
+        );
+    }
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_compile_reports_success() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let lifecycle = call(
+        &client,
+        "run_maven_lifecycle",
+        json!({ "project_path": project_path, "phase": "compile" }),
+    )
+    .await?;
     assert_eq!(lifecycle["outcome"], "success");
 
-    let tests = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("list_maven_test_classes").with_arguments(arguments(
-                    json!({ "project_path": server.project_path().unwrap().display().to_string() }),
-                )),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_class_listing_reports_the_fixture_test() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let tests = call(
+        &client,
+        "list_maven_test_classes",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert_eq!(tests["results"], json!(["org.example.FooTest"]));
-    let focused = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("run_maven_test").with_arguments(arguments(json!({
-                    "project_path": server.project_path().unwrap().display().to_string(),
-                    "test_class": "org.example.FooTest"
-                }))),
-            )
-            .await?,
-    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn focused_test_run_is_reported_and_remembered() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let focused = call(
+        &client,
+        "run_maven_test",
+        json!({ "project_path": project_path, "test_class": "org.example.FooTest" }),
+    )
+    .await?;
     assert_eq!(focused["report_status"], "available");
     assert_eq!(focused["summary"]["passed"], 1);
-    let first_failures = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_last_maven_test_failures").with_arguments(
-                    arguments(json!({
-                        "project_path": server.project_path().unwrap().display().to_string()
-                    })),
-                ),
-            )
-            .await?,
-    );
-    assert_eq!(first_failures["available"], true);
-    let other_failures = client
-        .call_tool(
-            CallToolRequestParams::new("get_last_maven_test_failures")
-                .with_arguments(arguments(json!({ "project_path": other_project_path }))),
-        )
-        .await
-        .expect_err("last-test state must not be observable outside the trusted directory tree");
-    assert!(
-        other_failures
-            .to_string()
-            .contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES")
-    );
+    let last_failures = call(
+        &client,
+        "get_last_maven_test_failures",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
+    assert_eq!(last_failures["available"], true);
 
-    let effective = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_effective_pom").with_arguments(arguments(json!({
-                    "project_path": server.project_path().unwrap().display().to_string()
-                }))),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn effective_pom_reports_the_project_coordinate() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let effective = call(
+        &client,
+        "get_effective_pom",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert_eq!(effective["status"], "available");
     assert_eq!(
         effective["projects"][0]["coordinate"]["artifact_id"],
         "fixture-project"
     );
 
-    let dependency_tree = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_dependency_tree").with_arguments(arguments(
-                    json!({
-                        "project_path": server.project_path().unwrap().display().to_string()
-                    }),
-                )),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dependency_tree_reports_the_direct_dependency_with_scope_and_depth() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let dependency_tree = call(
+        &client,
+        "get_dependency_tree",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert_eq!(dependency_tree["dependencies"].as_array().unwrap().len(), 1);
     assert_eq!(
         dependency_tree["dependencies"][0]["coordinate"],
@@ -1545,17 +1584,20 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
     assert_eq!(dependency_tree["dependencies"][0]["scope"], "compile");
     assert_eq!(dependency_tree["dependencies"][0]["depth"], 1);
 
-    let resolution = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("explain_dependency_resolution").with_arguments(
-                    arguments(json!({
-                        "project_path": server.project_path().unwrap().display().to_string()
-                    })),
-                ),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dependency_resolution_explains_the_selected_artifact() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let resolution = call(
+        &client,
+        "explain_dependency_resolution",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert!(matches!(
         resolution["status"].as_str(),
         Some("available" | "incomplete")
@@ -1565,44 +1607,53 @@ async fn opt_in_project_mode_exposes_and_executes_project_tools() -> Result<()> 
         "org.libs:helper:jar"
     );
 
-    let classpath = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_maven_classpath").with_arguments(arguments(
-                    json!({
-                        "project_path": server.project_path().unwrap().display().to_string(),
-                        "kind": "test"
-                    }),
-                )),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_classpath_lists_normalized_artifact_coordinates() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let classpath = call(
+        &client,
+        "get_maven_classpath",
+        json!({ "project_path": project_path, "kind": "test" }),
+    )
+    .await?;
     assert_eq!(classpath["artifacts"], json!(["org.libs:helper:2.0"]));
 
-    let coverage = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_jacoco_coverage").with_arguments(arguments(
-                    json!({ "project_path": server.project_path().unwrap().display().to_string() }),
-                )),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn jacoco_coverage_reads_the_existing_report() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let coverage = call(
+        &client,
+        "get_jacoco_coverage",
+        json!({ "project_path": project_path }),
+    )
+    .await?;
     assert_eq!(coverage["status"], "available");
     assert_eq!(coverage["reports"][0]["metrics"]["lines"]["covered"], 9);
 
-    let gaps = structured(
-        client
-            .call_tool(
-                CallToolRequestParams::new("get_jacoco_coverage_gaps").with_arguments(arguments(
-                    json!({
-                        "project_path": server.project_path().unwrap().display().to_string(),
-                        "limit": 1
-                    }),
-                )),
-            )
-            .await?,
-    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn jacoco_coverage_gaps_rank_the_existing_report() -> Result<()> {
+    let (_server, client, project_path) = project_client().await?;
+
+    let gaps = call(
+        &client,
+        "get_jacoco_coverage_gaps",
+        json!({ "project_path": project_path, "limit": 1 }),
+    )
+    .await?;
     assert_eq!(gaps["gaps"][0]["class_name"], "org.example.Foo");
 
     client.cancel().await?;

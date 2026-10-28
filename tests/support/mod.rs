@@ -318,6 +318,8 @@ fn fixture_project(root: &Path, include_inspection_fixtures: bool) -> Result<()>
     // Captured using Apache Maven 3.9.9, maven-dependency-plugin 3.8.1:
     // mvn -s settings.xml -B -ntp -Dmaven.repo.local=<fixture-repository>
     //   org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree -DoutputType=text
+    // The other wrapper outputs (classpath, Surefire, effective POM) and the JaCoCo report
+    // below are synthetic minimal documents, not Maven captures.
     let wrapper = root.join("mvnw");
     std::fs::write(
         &wrapper,
