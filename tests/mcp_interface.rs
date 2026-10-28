@@ -319,6 +319,44 @@ fn assert_schema_properties(schema: &Map<String, Value>, tool: &str, fields: &[&
 }
 
 #[tokio::test]
+async fn initialize_reports_the_embedded_build_identity() -> Result<()> {
+    let server = TestServer::start().await?;
+    let client = server.connect().await?;
+    let server_info = client
+        .peer_info()
+        .and_then(|info| info.server_info.clone())
+        .expect("initialize must return the server implementation");
+    assert_eq!(server_info.name, "maven-mcp");
+    assert_eq!(server_info.version, maven_mcp::build_info::server_version());
+    match maven_mcp::build_info::build_commit() {
+        Some(commit) => assert_eq!(
+            server_info.version,
+            format!("{}+{}", env!("CARGO_PKG_VERSION"), &commit[..12])
+        ),
+        None => assert_eq!(server_info.version, env!("CARGO_PKG_VERSION")),
+    }
+    client.cancel().await?;
+    Ok(())
+}
+
+#[test]
+fn version_flag_names_the_package_version_and_build_commit() -> Result<()> {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .arg("--version")
+        .output()?;
+    assert!(output.status.success());
+    let commit = maven_mcp::build_info::build_commit().unwrap_or("unknown");
+    assert_eq!(
+        String::from_utf8(output.stdout)?,
+        format!(
+            "maven-mcp {} (commit {commit})\n",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn tool_catalog_lists_exactly_the_public_tools() -> Result<()> {
     let tools = listed_tools().await?;
     let actual_names = tools

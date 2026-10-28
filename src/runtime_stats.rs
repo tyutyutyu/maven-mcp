@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{config::Config, index::IndexStats};
+use crate::{build_info, config::Config, index::IndexStats};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeReport {
@@ -21,6 +21,12 @@ pub struct RuntimeReport {
 pub struct RuntimeInstanceStatus {
     pub schema_version: u32,
     pub binary_version: String,
+    /// Full source commit embedded at build time; absent for unidentified builds.
+    #[serde(default)]
+    pub build_commit: Option<String>,
+    /// Resolved path of the running executable, which names the installed version.
+    #[serde(default)]
+    pub executable: Option<String>,
     pub pid: u32,
     pub started_unix_ms: u128,
     pub updated_unix_ms: u128,
@@ -88,7 +94,9 @@ impl RuntimeStatusPublisher {
             path: directory.join(format!("{pid}.json")),
             status: Mutex::new(RuntimeInstanceStatus {
                 schema_version: 1,
-                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                binary_version: build_info::PACKAGE_VERSION.to_owned(),
+                build_commit: build_info::build_commit().map(str::to_owned),
+                executable: running_executable(),
                 pid,
                 started_unix_ms: now,
                 updated_unix_ms: now,
@@ -177,12 +185,16 @@ pub fn format_runtime_report(report: &RuntimeReport) -> String {
     let mut output = String::new();
     for instance in &report.instances {
         output.push_str(&format!(
-            "maven-mcp pid={} version={} rss={} peak_rss={}\n",
+            "maven-mcp pid={} version={} commit={} rss={} peak_rss={}\n",
             instance.pid,
             instance.binary_version,
+            instance.build_commit.as_deref().unwrap_or("unknown"),
             bytes_label(instance.memory.rss_bytes),
             bytes_label(instance.memory.peak_rss_bytes)
         ));
+        if let Some(executable) = &instance.executable {
+            output.push_str(&format!("  executable: {executable}\n"));
+        }
         output.push_str(&format!(
             "  cache: entries={} hits={} misses={} evictions={} invalidations={} max_project_indexes={}\n",
             instance.cache.entries,
@@ -229,6 +241,14 @@ fn runtime_dir() -> Result<PathBuf> {
     }
     let home = std::env::var_os("HOME").context("HOME is required for maven-mcp runtime stats")?;
     Ok(PathBuf::from(home).join(".cache/maven-mcp/runtime"))
+}
+
+/// The canonical path of the running binary; on Linux it is resolved through symlinks, so a
+/// stable or candidate alias reports the versioned installation directory it points to.
+fn running_executable() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
 }
 
 fn process_is_alive(pid: u32) -> bool {

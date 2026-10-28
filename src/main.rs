@@ -3,6 +3,7 @@ use std::{io, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use maven_mcp::{
+    build_info,
     config::Config,
     runtime_stats::{format_runtime_report, read_runtime_report},
     server::MavenMcpServer,
@@ -11,7 +12,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = build_info::version_label(), about)]
 struct Cli {
     #[arg(
         long,
@@ -77,6 +78,8 @@ async fn run() -> Result<()> {
 
     let config = Config::from_env_with_jenv(cli.jenv)?;
     tracing::info!(
+        version = build_info::PACKAGE_VERSION,
+        commit = build_info::build_commit().unwrap_or("unknown"),
         max_results = config.max_results,
         max_source_bytes = config.max_source_bytes,
         "MCP server ready for request-scoped Maven projects"

@@ -1,0 +1,42 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+# Versioned native local installation. MCP hosts start the selected binary over STDIO;
+# there are intentionally no server start or stop tasks.
+tasks:
+  candidate:
+    desc: Verify the clean worktree, build an identified release binary, and install it as candidate
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v git
+        msg: git is required
+      - sh: test -x scripts/local-install.sh
+        msg: scripts/local-install.sh must be executable
+    cmds:
+      - scripts/local-install.sh candidate
+
+  promote:
+    desc: Point the stable alias at the candidate (or ID=<version+commit>); the old stable becomes previous
+    preconditions:
+      - sh: test -x scripts/local-install.sh
+        msg: scripts/local-install.sh must be executable
+    cmds:
+      - scripts/local-install.sh promote {{.ID}}
+
+  rollback:
+    desc: Swap the stable and previous aliases
+    preconditions:
+      - sh: test -x scripts/local-install.sh
+        msg: scripts/local-install.sh must be executable
+    cmds:
+      - scripts/local-install.sh rollback
+
+  status:
+    desc: Show the candidate, stable and previous aliases and the installed versions
+    preconditions:
+      - sh: test -x scripts/local-install.sh
+        msg: scripts/local-install.sh must be executable
+    cmds:
+      - scripts/local-install.sh status

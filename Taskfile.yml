@@ -9,6 +9,10 @@ includes:
     taskfile: ./.tasks/business/agent-log.yml
   benchmark:
     taskfile: ./.tasks/business/benchmark.yml
+  install:
+    taskfile: ./.tasks/business/install.yml
+  dogfood:
+    taskfile: ./.tasks/business/dogfood.yml
 
 tasks:
   default:
