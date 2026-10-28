@@ -1,0 +1,20 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+tasks:
+  smoke:
+    desc: Run the installed binary on private real Maven projects (MANIFEST and OUTPUT outside the repository)
+    requires:
+      vars: [MANIFEST, OUTPUT]
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: test -x scripts/dogfood-smoke.sh
+        msg: scripts/dogfood-smoke.sh must be executable
+    cmds:
+      - >-
+        scripts/dogfood-smoke.sh
+        --manifest "{{.MANIFEST}}"
+        --output "{{.OUTPUT}}"
+        {{if .BINARY}}--binary "{{.BINARY}}"{{end}}

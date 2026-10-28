@@ -130,6 +130,19 @@ async fn stats_cli_reports_live_stdio_instance() -> Result<()> {
     let report: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(report["instances"].as_array().unwrap().len(), 1);
     assert_eq!(report["instances"][0]["pid"], child.id().unwrap());
+    assert_eq!(
+        report["instances"][0]["binary_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(
+        report["instances"][0]["build_commit"],
+        json!(maven_mcp::build_info::build_commit())
+    );
+    let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_maven-mcp"))?;
+    assert_eq!(
+        report["instances"][0]["executable"],
+        json!(executable.display().to_string())
+    );
 
     drop(stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await?;

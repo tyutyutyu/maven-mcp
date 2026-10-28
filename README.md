@@ -348,11 +348,14 @@ task dev:build-release
 
 `task dev:build` creates a debug binary under `target/debug/` instead.
 
-Configure the MCP host to run the resulting `target/release/maven-mcp` binary and
-pass request `project_path` values in tool calls. The host owns process startup,
-shutdown, and STDIO; there is no port, URL, daemon, health endpoint, Docker
-image, or manual server lifecycle. Startup is lightweight because no repository
-index is built before initialization finishes.
+For day-to-day use, install a verified, versioned copy instead of pointing an
+MCP host at the source worktree (see
+[Versioned local installation](#versioned-local-installation)). Configure the
+MCP host to run the installed binary and pass request `project_path` values in
+tool calls. The host owns process startup, shutdown, and STDIO; there is no port,
+URL, daemon, health endpoint, Docker image, or manual server lifecycle, and there
+are no start or stop tasks. Startup is lightweight because no repository index is
+built before initialization finishes.
 
 Add `--jenv` to the server command when Maven children must use each project's
 jenv-selected Java instead of relying on the MCP host's inherited `JAVA_HOME`
@@ -361,15 +364,20 @@ and `PATH`.
 Runtime diagnostics are available without starting an MCP transport:
 
 ```bash
+maven-mcp --version
 maven-mcp stats
 maven-mcp stats --json
 ```
 
-The stats command reads user-private runtime status files for live host-managed
-STDIO instances and reports PIDs, process RSS where the platform exposes it,
+`--version` prints the package version and the source commit embedded at build
+time, for example `maven-mcp 0.1.0 (commit <40-hex commit>)`, or
+`(commit unknown)` for a build made without the installation flow. The stats
+command reads user-private runtime status files for live host-managed STDIO
+instances and reports PIDs, the package version, embedded commit and resolved
+executable path of each instance, process RSS where the platform exposes it,
 active project indexes, index sizes, estimated retained bytes, and cache
-hit/miss/eviction/invalidation counters. If no
-server is running, it exits successfully with an empty report.
+hit/miss/eviction/invalidation counters. If no server is running, it exits
+successfully with an empty report.
 
 For local source-tree inspection, the bundled helper builds the binary and lets
 MCP Inspector start it over STDIO:
@@ -379,34 +387,105 @@ scripts/run-inspector.sh
 scripts/run-inspector.sh --cli --method tools/list
 ```
 
+### Versioned local installation
+
+`scripts/local-install.sh` (wrapped by the `install:*` tasks) installs immutable,
+commit-identified release binaries outside the source worktree and selects them
+through explicit aliases:
+
+```bash
+task install:candidate               # verify, build and install the clean HEAD
+task install:status                  # show aliases and installed versions
+task install:promote                 # stable -> candidate, previous -> old stable
+task install:promote ID=0.1.0+0123456789ab
+task install:rollback                # swap stable and previous
+```
+
+`install:candidate` refuses a worktree with uncommitted changes, runs the full
+`scripts/test-pyramid.sh` gate, builds `cargo build --release --locked` with
+`MAVEN_MCP_BUILD_COMMIT` set to the `HEAD` commit, takes the executable path from
+Cargo's JSON artifact messages (so `CARGO_TARGET_DIR` or a configured target
+cannot leave a stale `target/release` binary in its place), checks that `HEAD`
+and the worktree did not change meanwhile and that the binary reports the `HEAD`
+commit, and copies it with `verified=true` in `BUILD-INFO`. Builds without an
+embedded commit (plain `cargo build`) are rejected.
+`scripts/local-install.sh install --unverified <binary>` installs an already
+built, commit-identified binary without the clean-tree check, the gate, or the
+commit match, and records `verified=false`; `install:status` shows the flag of
+every version. The install root is
+`MAVEN_MCP_INSTALL_ROOT`, by default `${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp`,
+and must be outside the source worktree:
+
+```text
+<root>/versions/<id>/maven-mcp    immutable copy of one identified binary
+<root>/versions/<id>/BUILD-INFO   id, version, commit, verified, sha256, installed_at
+<root>/candidate -> versions/<id>
+<root>/stable    -> versions/<id>
+<root>/previous  -> versions/<id>
+```
+
+The installation `<id>` is `<package version>+<first 12 commit characters>`, the
+same value the server reports as MCP `initialize` `serverInfo.version`. An
+installed version is never overwritten: reinstalling identical content is a
+no-op, and different content under the same id is an error. Promotion and
+rollback verify the target's SHA-256 and reported commit against `BUILD-INFO`,
+then switch the symlinks atomically. Rollback swaps `stable` and `previous`, so
+running it twice restores the original state. Hosts that are already running keep
+their binary; a new host session starts the newly selected one. Installing a
+candidate locally does not publish a release.
+
+Point MCP hosts at `<root>/stable/maven-mcp` for everyday use, or at
+`<root>/candidate/maven-mcp` while trying a candidate. Check the running version
+with the host's server information, `maven-mcp stats`, or `--version` on the
+alias path.
+
 ### Codex project configuration
 
-In a trusted project, add `.codex/config.toml` with an absolute installed binary
-path:
+In a trusted project, add `.codex/config.toml` with the absolute path of the
+selected alias and the trusted Maven project directories:
 
 ```toml
 [mcp_servers.maven-mcp]
-command = "/absolute/path/to/maven-mcp"
+command = "/home/<user>/.local/share/maven-mcp/stable/maven-mcp"
 args = ["--jenv"]
+env = { MAVEN_TRUSTED_PROJECT_DIRECTORIES = "/absolute/path/to/trusted-projects" }
 startup_timeout_sec = 300
 ```
 
 Alternatively, register the same STDIO command with `codex mcp add`. Verify it
-with `codex mcp list` or `/mcp`. See the
+with `codex mcp get maven-mcp`, `codex mcp list`, or `/mcp`. See the
 [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 ### GitHub Copilot CLI configuration
 
-Copilot CLI defaults local commands to STDIO. Register the installed binary and
-300-second timeout from a shell where the Maven repository path is known:
+Copilot CLI defaults local commands to STDIO. In a trusted folder, add the same
+alias as a workspace server in `.github/mcp.json` (or `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "maven-mcp": {
+      "type": "local",
+      "command": "/home/<user>/.local/share/maven-mcp/stable/maven-mcp",
+      "args": ["--jenv"],
+      "env": { "MAVEN_TRUSTED_PROJECT_DIRECTORIES": "/absolute/path/to/trusted-projects" },
+      "tools": ["*"],
+      "timeout": 300000
+    }
+  }
+}
+```
+
+Alternatively, register it as a user server:
 
 ```bash
 copilot mcp add \
   --timeout 300000 \
-  maven-mcp -- /absolute/path/to/maven-mcp --jenv
+  maven-mcp -- /home/<user>/.local/share/maven-mcp/stable/maven-mcp --jenv
 copilot mcp get maven-mcp
 ```
 
+Use the `candidate` alias instead of `stable` in either host to try a candidate.
 See the
 [official GitHub Copilot CLI MCP documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
 
@@ -608,6 +687,8 @@ Surefire failures follow the existing report-error contract.
 | `MAVEN_TIMEOUT_SECONDS` | `300` | Maximum runtime of one Maven child process. |
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |
 | `MAVEN_MCP_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime` | User-private directory for live runtime status files consumed by `maven-mcp stats`. |
+| `MAVEN_MCP_BUILD_COMMIT` | none | Build time only, not read at runtime. Full 40-character lowercase commit embedded into `--version`, `serverInfo.version` and stats; set by `install:candidate`. Any other value fails the build. |
+| `MAVEN_MCP_INSTALL_ROOT` | `${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp` | Used only by `scripts/local-install.sh` and `scripts/dogfood-smoke.sh`: absolute versioned installation root outside the source worktree. |
 | `JENV_ROOT` | `$HOME/.jenv` | jenv installation root used only when the server starts with `--jenv`; must be an absolute path when explicitly set. |
 | `RUST_LOG` | `maven_mcp=info` | Logging level/filter for stderr diagnostics. MCP transport (`rmcp`) events are always suppressed; see [Redaction and data minimization](#redaction-and-data-minimization). |
 
@@ -929,7 +1010,18 @@ task agent-log:discover -- --format terminal
 task benchmark:run PROJECT_PATH=/absolute/path/to/maven-project
 task benchmark:run PROJECT_PATH=/absolute/path/to/maven-project \
   SPEC=my-benchmark.json OUTPUT=target/custom-results.json ITERATIONS=10 WARMUP=2
+
+task install:candidate
+task install:status
+task install:promote
+task install:rollback
+
+task dogfood:smoke MANIFEST=/private/dogfood.json OUTPUT=/private/dogfood-results
 ```
+
+The `install` tasks are described in
+[Versioned local installation](#versioned-local-installation), and
+`dogfood:smoke` in [Multi-project dogfood smoke](#multi-project-dogfood-smoke).
 
 The repository includes a default `benchmark.json` specification for common
 Maven inspection commands, parameterized with `${PROJECT_PATH}`; the project
@@ -990,9 +1082,10 @@ There are three separate verification levels:
 | --- | --- | --- | --- |
 | Deterministic gate | `scripts/test-pyramid.sh` | before every handoff and in the required `CI` check | none; synthetic fixtures and fake Maven wrappers, no Maven, JDK or `~/.m2` |
 | Real Maven smoke | `scripts/real-maven-smoke.sh` | on demand | network once to prepare a pinned Maven and plugins; then offline |
+| Multi-project dogfood smoke | `scripts/dogfood-smoke.sh` | on demand, with an installed binary | the user's own trusted Maven projects, JDK and Maven repository |
 | Agent eval | `scripts/run-agent-eval.sh` | only when separately decided | a model provider account; usually paid |
 
-The gate runs neither the smoke nor the agent eval, and its result does not
+The gate runs neither the smokes nor the agent eval, and its result does not
 cover them.
 
 Run the complete test pyramid—unit tests, real child-process STDIO MCP
@@ -1056,6 +1149,65 @@ real Maven reproduces the versioned `tests/fixtures/dependency_tree.txt` capture
 and that the server's dependency, classpath, class search and effective-POM
 tools work against real Maven over STDIO. `target/real-maven-smoke/` is a local
 cache; do not commit it.
+
+### Multi-project dogfood smoke
+
+The opt-in dogfood smoke runs an installed binary against real Maven projects
+that you choose and trust:
+
+```bash
+scripts/dogfood-smoke.sh --manifest /private/dogfood.json --output /private/dogfood-results
+scripts/dogfood-smoke.sh --manifest /private/dogfood.json --output /private/dogfood-results \
+  --binary "$HOME/.local/share/maven-mcp/stable/maven-mcp"
+```
+
+The binary defaults to `<install root>/candidate/maven-mcp` and must not be a
+build output inside the source worktree. The manifest and the output directory
+must be outside the repository; both are private, so never commit or package the
+project list, paths, logs or results. Manifest format:
+
+```json
+{
+  "schema_version": 1,
+  "server_arguments": ["--jenv"],
+  "server_environment": { "MAVEN_EXECUTION_REPO_PATH": "/private/maven-repository" },
+  "reuse_repetitions": 10,
+  "projects": [
+    {
+      "id": "single",
+      "layout": "single_module",
+      "path": "/absolute/path/to/project",
+      "class_query": "org.slf4j.Logger",
+      "source_class": "org.slf4j.Logger",
+      "focused_test": { "test_class": "com.example.FooTest" }
+    },
+    {
+      "id": "reactor",
+      "layout": "multi_module",
+      "path": "/absolute/path/to/reactor",
+      "class_query": "org.slf4j.Logger",
+      "lifecycle": { "phase": "compile", "module": "core", "also_make": true }
+    }
+  ]
+}
+```
+
+Each project gets a freshly started STDIO server (no cache from earlier
+projects) whose `MAVEN_TRUSTED_PROJECT_DIRECTORIES` is exactly that project. The
+ignored Cargo test `tests/dogfood_smoke.rs` checks `initialize` (the reported
+`serverInfo.version` must equal the binary's installation id), `tools/list`,
+`inspect_maven_project` against the declared layout, the cold first
+`search_classes` (classpath resolution plus index build), `reuse_repetitions`
+cached repeats, `index_stats`, `get_class_source`, `get_dependency_tree`, the test
+`get_maven_classpath`, `get_effective_pom`, the Maven and JDK versions through
+`run_maven --version`, `list_maven_test_classes`, and the optional focused test
+(`run_maven_test`) and lifecycle phase (`run_maven_lifecycle`). It records each
+step's result and duration plus the server RSS after initialization, after the
+cold query, and at the end (current and peak) in
+`<output>/dogfood-<id>-<unix ms>.json`, then fails if any step failed.
+Structured tools run offline unless `MAVEN_EXECUTION_NETWORK=true` is in
+`server_environment`, so prepare the projects' dependencies first. Native Maven
+execution is not a sandbox: plugins and tests run with your permissions.
 
 ### Hosted CI
 

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 
 use crate::blocking::{HeavyWork, HeavyWorkError, HeavyWorkLimits};
+use crate::build_info;
 use crate::config::Config;
 use crate::index::{
     ArtifactApiDiff, ArtifactHealth, ArtifactOutsideRepository, ClassDescription, ClassList,
@@ -1530,13 +1531,26 @@ impl MavenMcpServer {
     }
 }
 
-#[tool_handler(
-    router = self.tool_router,
-    name = "maven-mcp",
-    version = "0.1.0",
-    instructions = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository."
-)]
+const SERVER_NAME: &str = "maven-mcp";
+const SERVER_INSTRUCTIONS: &str = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository.";
+
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for MavenMcpServer {
+    /// `serverInfo.version` carries the embedded build commit, so a host can identify the
+    /// exact installed binary it started.
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            SERVER_NAME,
+            build_info::server_version(),
+        ))
+        .with_instructions(SERVER_INSTRUCTIONS.to_owned())
+    }
+
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,

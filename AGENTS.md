@@ -20,6 +20,8 @@ agent-specific development rules.
 
 ## Repository Map
 
+- `src/build_info.rs`: build identity (package version and the commit embedded
+  through `MAVEN_MCP_BUILD_COMMIT`) for `--version`, `serverInfo.version` and stats.
 - `src/config.rs`: environment configuration and request-independent limits.
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
   index, and all search operations.
@@ -38,7 +40,11 @@ agent-specific development rules.
 - `tests/mcp_scenarios.rs`: scenario interpretation, semantic validation,
   snapshots, and Markdown report generation.
 - `tests/snapshots/`: reviewable public MCP response contracts.
-- `scripts/`: full verification, Inspector, and agent-evaluation entry points.
+- `scripts/`: full verification, Inspector, agent-evaluation, real Maven smoke,
+  versioned local installation (`local-install.sh`, tested by
+  `tests/local_install.rs`), and multi-project dogfood smoke
+  (`dogfood-smoke.sh`, driving the ignored `tests/dogfood_smoke.rs`) entry points.
+  Dogfood manifests and results are private and stay outside the repository.
 
 ## Important Architectural Contracts
 
@@ -111,6 +117,10 @@ request's canonical project root. Ignore inherited `JENV_VERSION` and `JENV_DIR`
 validate the absolute selected home and executable `bin/java`, and modify
 `JAVA_HOME`/`PATH` only on the Maven child. When disabled, preserve inherited
 Java environment behavior.
+
+`maven-mcp --version` prints the package version and embedded commit. Install
+verified, versioned copies with `scripts/local-install.sh` (`task install:*`);
+there are no MCP start/stop tasks because the MCP host owns the lifecycle.
 
 Inspect live host-managed instances without starting MCP transport:
 
