@@ -556,3 +556,106 @@ async fn blocked_index_work_does_not_keep_the_server_alive_after_eof_or_sigterm(
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn debug_logging_and_responses_never_reveal_credentials_or_project_paths() -> Result<()> {
+    const MARKER: &str = "synthetic-secret-marker";
+    let fixture = TestServer::start_with_project().await?;
+    let project = fixture.project_path().context("missing fixture project")?;
+    std::fs::write(
+        project.join("mvnw"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' 'İ password=é' 'Authorization: Bearer {MARKER}' \"root=$PWD token={MARKER}\" 'secret=a&{MARKER};x'\nprintf 'Authorization: Basic {MARKER}\\n' >&2\n"
+        ),
+    )?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("RUST_LOG", "trace")
+        .env(
+            "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+            fixture.trusted_project_directory().unwrap(),
+        )
+        .env(
+            "MAVEN_EXECUTION_REPO_PATH",
+            project.join("execution-repository"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("missing child stdin")?;
+    let mut lines = BufReader::new(child.stdout.take().context("missing child stdout")?).lines();
+    let stderr = child.stderr.take().context("missing child stderr")?;
+    let stderr = tokio::spawn(async move {
+        let mut text = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut text)
+            .await
+            .map(|_| text)
+    });
+    for message in [
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "redaction-test", "version": "1.0" }
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "run_maven",
+                "arguments": {
+                    "project_path": project.display().to_string(),
+                    "arguments": [format!("-Dpassword={MARKER}")]
+                }
+            }
+        }),
+    ] {
+        stdin.write_all(format!("{message}\n").as_bytes()).await?;
+    }
+    let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .context("server closed stdout before the tool response")?;
+            let message: Value = serde_json::from_str(&line)?;
+            if message["id"] == 2 {
+                return Ok::<_, anyhow::Error>(message);
+            }
+        }
+    })
+    .await
+    .context("tool call with Unicode and credential output timed out")??;
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["status"], "success", "{response:#}");
+    assert_eq!(
+        result["stdout"],
+        "İ password=<redacted>\nAuthorization: <redacted>\nroot=<PROJECT_ROOT> token=<redacted>\nsecret=<redacted>\n"
+    );
+    assert_eq!(result["stderr"], "Authorization: <redacted>\n");
+    let cancelled = json!({
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {
+            "requestId": 2,
+            "reason": format!("{} password={MARKER}", project.display())
+        }
+    });
+    stdin.write_all(format!("{cancelled}\n").as_bytes()).await?;
+
+    drop(stdin);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .context("server did not stop after stdin EOF")??;
+    assert!(status.success(), "server exited with {status}");
+    let stderr = stderr.await??;
+    let response = response.to_string();
+    for text in [&stderr, &response] {
+        assert!(!text.contains(MARKER), "{text}");
+        assert!(!text.contains(project.to_string_lossy().as_ref()), "{text}");
+        assert!(!text.contains("panicked"), "{text}");
+    }
+    assert!(stderr.contains("MCP server ready for request-scoped Maven projects"));
+    Ok(())
+}

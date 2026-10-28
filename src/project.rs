@@ -26,6 +26,7 @@ use tokio::{
 use walkdir::WalkDir;
 
 use crate::config::{JavaEnvironment, MavenExecutionConfig, ProjectExecutionConfig};
+use crate::redaction::{redact_properties, redact_sensitive_values};
 
 const JENV_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -735,7 +736,7 @@ impl MavenRunner {
                 report_error: None,
                 build,
             },
-            Ok(reports) => match parse_test_reports(&reports) {
+            Ok(reports) => match parse_test_reports(&reports, |text| self.redacted(text)) {
                 Ok((summary, failures)) => FocusedTestResult {
                     report_status: TestReportStatus::Available,
                     summary: Some(summary),
@@ -747,7 +748,7 @@ impl MavenRunner {
                     report_status: TestReportStatus::Invalid,
                     summary: None,
                     failures: Vec::new(),
-                    report_error: Some(error.to_string()),
+                    report_error: Some(self.redacted(&error.to_string())),
                     build,
                 },
             },
@@ -755,7 +756,7 @@ impl MavenRunner {
                 report_status: TestReportStatus::Invalid,
                 summary: None,
                 failures: Vec::new(),
-                report_error: Some(error.to_string()),
+                report_error: Some(self.redacted(&error.to_string())),
                 build,
             },
         };
@@ -793,7 +794,7 @@ impl MavenRunner {
     pub fn test_classes(&self) -> Result<Vec<String>> {
         let mut classes = BTreeSet::new();
         for entry in WalkDir::new(&self.root).follow_links(false) {
-            let entry = entry?;
+            let entry = entry.context("cannot read project test sources")?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -913,7 +914,7 @@ impl MavenRunner {
             Err(error) => EffectivePomResult {
                 status: DiagnosticStatus::Invalid,
                 projects: Vec::new(),
-                error: Some(error.to_string()),
+                error: Some(self.redacted(&error.to_string())),
                 build,
             },
         }
@@ -1444,8 +1445,13 @@ impl MavenRunner {
     }
 
     fn redact(&self, bytes: &[u8]) -> (String, usize) {
-        let mut output = String::from_utf8_lossy(bytes).into_owned();
-        let mut count = 0;
+        self.redact_text(&String::from_utf8_lossy(bytes))
+    }
+
+    /// Removes credentials first, so a secret value is replaced whole even when it contains
+    /// a path, then replaces the repository, project and home paths with placeholders.
+    fn redact_text(&self, text: &str) -> (String, usize) {
+        let (mut output, mut count) = redact_sensitive_values(text);
         if let Some(repository) = &self.execution_repository {
             count += replace_all(
                 &mut output,
@@ -1457,8 +1463,11 @@ impl MavenRunner {
         if let Some(home) = std::env::var_os("HOME") {
             count += replace_all(&mut output, &home.to_string_lossy(), "<HOME>");
         }
-        let (output, sensitive_count) = redact_sensitive_values(output);
-        (output, count + sensitive_count)
+        (output, count)
+    }
+
+    fn redacted(&self, text: &str) -> String {
+        self.redact_text(text).0
     }
 
     fn runner_error(&self, started: Instant, message: String) -> MavenRunResult {
@@ -1844,49 +1853,6 @@ fn replace_all(output: &mut String, value: &str, replacement: &str) -> usize {
     count
 }
 
-fn redact_sensitive_values(mut output: String) -> (String, usize) {
-    let mut count = 0;
-    for key in ["password=", "token=", "secret=", "authorization:"] {
-        let mut offset = 0;
-        loop {
-            let lowercase = output.to_lowercase();
-            let Some(relative_start) = lowercase[offset..].find(key) else {
-                break;
-            };
-            let start = offset + relative_start;
-            let value_start = start + key.len();
-            let value_end = output[value_start..]
-                .find(char::is_whitespace)
-                .map(|offset| value_start + offset)
-                .unwrap_or(output.len());
-            output.replace_range(value_start..value_end, "<redacted>");
-            count += 1;
-            offset = value_start + "<redacted>".len();
-        }
-    }
-    let mut offset = 0;
-    loop {
-        let remaining = &output[offset..];
-        let Some(scheme) = remaining.find("://") else {
-            break;
-        };
-        let credentials_start = offset + scheme + 3;
-        let after_scheme = &output[credentials_start..];
-        let authority_end = after_scheme
-            .find(['/', ' ', '\n', '\r'])
-            .unwrap_or(after_scheme.len());
-        let authority = &after_scheme[..authority_end];
-        let Some(at) = authority.rfind('@') else {
-            offset = credentials_start + authority_end;
-            continue;
-        };
-        output.replace_range(credentials_start..credentials_start + at, "<credentials>");
-        count += 1;
-        offset = credentials_start + "<credentials>".len() + 1;
-    }
-    (output, count)
-}
-
 fn parse_reactor_summary(output: &str) -> Vec<ReactorModuleResult> {
     let mut in_summary = false;
     let mut results = Vec::new();
@@ -1944,7 +1910,7 @@ fn test_source_relative(path: &Path) -> Option<PathBuf> {
 fn discover_report_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut reports = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
+        let entry = entry.context("cannot read Surefire report directory")?;
         if !entry.file_type().is_file() {
             continue;
         }
@@ -2008,7 +1974,12 @@ struct RawTestProblem {
     text: Option<String>,
 }
 
-fn parse_test_reports(paths: &[PathBuf]) -> Result<(TestSummary, Vec<TestFailureDetail>)> {
+/// `redact` applies to every reported failure string before it is truncated, so a truncated
+/// message never ends in a partial secret or host path.
+fn parse_test_reports(
+    paths: &[PathBuf],
+    redact: impl Fn(&str) -> String,
+) -> Result<(TestSummary, Vec<TestFailureDetail>)> {
     let mut summary = TestSummary::default();
     let mut failures = Vec::new();
     let mut xml_budget = crate::config::XmlBudget::default();
@@ -2041,6 +2012,7 @@ fn parse_test_reports(paths: &[PathBuf]) -> Result<(TestSummary, Vec<TestFailure
                     &name,
                     TestFailureKind::Failure,
                     problem,
+                    &redact,
                 ));
             } else if let Some(problem) = error {
                 failures.push(test_failure_detail(
@@ -2048,6 +2020,7 @@ fn parse_test_reports(paths: &[PathBuf]) -> Result<(TestSummary, Vec<TestFailure
                     &name,
                     TestFailureKind::Error,
                     problem,
+                    &redact,
                 ));
             }
         }
@@ -2063,19 +2036,17 @@ fn test_failure_detail(
     test_name: &str,
     kind: TestFailureKind,
     problem: RawTestProblem,
+    redact: impl Fn(&str) -> String,
 ) -> TestFailureDetail {
     let message = problem
         .message
         .or(problem.text)
-        .unwrap_or_else(|| "test failed without a message".to_owned())
-        .chars()
-        .take(2_000)
-        .collect();
+        .unwrap_or_else(|| "test failed without a message".to_owned());
     TestFailureDetail {
-        class_name: class_name.to_owned(),
-        test_name: test_name.to_owned(),
+        class_name: redact(class_name),
+        test_name: redact(test_name),
         kind,
-        message,
+        message: redact(&message).chars().take(2_000).collect(),
     }
 }
 
@@ -2310,7 +2281,7 @@ fn parse_effective_pom(path: &Path) -> Result<Vec<EffectiveProject>> {
                     artifact_id: parent.artifact_id,
                     version: parent.version,
                 }),
-                properties: raw.properties,
+                properties: redact_properties(raw.properties),
                 dependencies,
                 dependency_management,
                 plugins,
@@ -2844,7 +2815,7 @@ struct ParsedCoverageReports {
 fn discover_jacoco_reports(root: &Path) -> Result<Vec<PathBuf>> {
     let mut reports = Vec::new();
     for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
+        let entry = entry.context("cannot read JaCoCo report directory")?;
         if !entry.file_type().is_file() || entry.file_name() != "jacoco.xml" {
             continue;
         }
@@ -2876,7 +2847,7 @@ fn report_is_stale(report: &Path, module_root: &Path) -> Result<bool> {
             continue;
         }
         for entry in WalkDir::new(directory).follow_links(false) {
-            let entry = entry?;
+            let entry = entry.context("cannot read compiled class directory")?;
             if entry.file_type().is_file() && entry.metadata()?.modified()? > report_modified {
                 return Ok(true);
             }

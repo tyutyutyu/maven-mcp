@@ -1823,7 +1823,7 @@ impl PomDescriptor {
                 artifact_id: parent.artifact_id,
                 version: Some(parent.version),
             }),
-            properties: raw.properties,
+            properties: crate::redaction::redact_properties(raw.properties),
             dependencies,
             dependency_management,
             bom_imports,
@@ -2126,7 +2126,7 @@ fn load_jar_record(
     } = match read_jar_index(path) {
         Ok(content) => content,
         Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "skipping unreadable jar");
+            tracing::warn!(file = %file_label(path), %error, "skipping unreadable jar");
             return None;
         }
     };
@@ -2149,13 +2149,24 @@ fn load_jar_record(
     })
 }
 
+/// Logs and public errors name an archive by its file name only, never by its absolute host path.
+fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name()
+        .map_or(std::borrow::Cow::Borrowed("<unnamed>"), |name| {
+            name.to_string_lossy()
+        })
+}
+
 fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
     let mut jar_paths = Vec::new();
     for entry in WalkDir::new(root).follow_links(false).into_iter() {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                tracing::warn!(%error, "unable to inspect repository entry");
+                tracing::warn!(
+                    error = %error.io_error().map_or_else(|| "symbolic link loop".to_owned(), ToString::to_string),
+                    "unable to inspect repository entry"
+                );
                 continue;
             }
         };
@@ -2172,7 +2183,7 @@ fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
 
 fn repository_identity(root: &Path, path: &Path) -> Option<JarIdentity> {
     let Some((key, classifier)) = parse_coordinate(root, path) else {
-        tracing::debug!(path = %path.display(), "skipping jar outside Maven layout");
+        tracing::debug!(file = %file_label(path), "skipping jar outside Maven layout");
         return None;
     };
     Some(JarIdentity {
@@ -3084,12 +3095,12 @@ impl ClassArchive {
         if path.is_dir() {
             let root = path
                 .canonicalize()
-                .with_context(|| format!("cannot open class directory {}", path.display()))?;
+                .with_context(|| format!("cannot open class directory {}", file_label(path)))?;
             return Ok(Self::Directory(root));
         }
-        let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("cannot open {}", file_label(path)))?;
         let archive = ZipArchive::new(file)
-            .with_context(|| format!("invalid ZIP/JAR: {}", path.display()))?;
+            .with_context(|| format!("invalid ZIP/JAR: {}", file_label(path)))?;
         Ok(Self::Zip(archive))
     }
 
@@ -3354,7 +3365,7 @@ fn read_jar_entry(
     let mut archive = ClassArchive::open(path).with_context(|| {
         format!(
             "indexed JAR is no longer a valid ZIP or class directory: {}",
-            path.display()
+            file_label(path)
         )
     })?;
     let Some(mut entry) = archive.by_name(entry_path)? else {
