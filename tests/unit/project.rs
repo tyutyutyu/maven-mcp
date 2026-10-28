@@ -536,6 +536,7 @@ fn explains_offline_artifact_resolution_without_misclassifying_other_runs() {
 
 #[tokio::test]
 async fn discovers_and_runs_focused_tests_with_structured_surefire_results() {
+    // Synthetic minimal Surefire XML with only the elements the parser reads.
     let report = r#"<testsuite tests="3" failures="1" errors="1" skipped="0">
             <testcase classname="org.example.FooTest" name="passes"/>
             <testcase classname="org.example.FooTest" name="fails"><failure message="expected true"/></testcase>
@@ -843,7 +844,8 @@ async fn parses_dependency_tree_and_normalizes_classpath_coordinates() {
     // mvn -s settings.xml -B -ntp -Dmaven.repo.local=<fixture-repository>
     //   org.apache.maven.plugins:maven-dependency-plugin:3.8.1:tree -DoutputType=text
     // settings.xml is <settings/>; the fixture repository contains synthetic JARs/POMs.
-    // Expected nodes below are handwritten from the captured output.
+    // Expected nodes below are handwritten from the captured output. The ignored
+    // tests/real_maven_smoke.rs regenerates the capture with the pinned Maven.
     let tree_script = format!(
         "#!/bin/sh\ncat <<'TREE'\n{}TREE\n",
         include_str!("../fixtures/dependency_tree.txt")
@@ -969,6 +971,9 @@ async fn dependency_diagnostics_preserve_transitive_depth_and_report_failures_an
 
 #[test]
 fn explains_conflicts_management_duplicates_exclusions_and_multiple_module_paths() {
+    // Synthetic, not a Maven capture: hand-written `-Dverbose` annotations; the header uses
+    // the older `maven-dependency-plugin:3.8.1:tree` form instead of Maven 3.9's
+    // `dependency:3.8.1:tree`. The expectations below are written by hand.
     let (_root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
     let project = MavenRunner::discover(&config).unwrap().project().clone();
     let output = r#"
@@ -1123,6 +1128,7 @@ async fn dependency_explanation_reports_empty_failure_truncation_and_invalid_out
 
 #[test]
 fn reads_multimodule_jacoco_coverage_and_ranks_gaps() {
+    // Synthetic minimal JaCoCo XML with only the counters the parser reads.
     let (root, config) = wrapper_project("#!/bin/sh\nexit 0\n");
     let core_report = root.path().join("core/target/site/jacoco/jacoco.xml");
     let web_report = root.path().join("apps/web/target/site/jacoco/jacoco.xml");

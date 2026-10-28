@@ -29,6 +29,10 @@ cargo llvm-cov --locked --all-targets --no-report
 cargo llvm-cov report --locked --json --summary-only --output-path "${COVERAGE_DIR}/summary.json"
 cargo llvm-cov report --locked --html --output-dir "${COVERAGE_DIR}"
 python3 -I "${SCRIPT_DIR}/check-coverage.py" "${COVERAGE_DIR}/summary.json" "${COVERAGE_THRESHOLD}"
+# Branch instrumentation (cargo llvm-cov --branch) needs a nightly rustc, so the
+# report's branch totals stay zero and must not be read as branch coverage.
+echo "Branch coverage: not measured (cargo llvm-cov --branch requires a nightly toolchain)."
+echo "Not run by this gate: scripts/real-maven-smoke.sh (ignored real Maven tests) and scripts/run-agent-eval.sh."
 
 echo "MCP search report: ${PROJECT_ROOT}/target/mcp-test-report/report.md"
 echo "Coverage report: ${COVERAGE_DIR}/html/index.html"
