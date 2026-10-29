@@ -3,6 +3,7 @@ pub mod blocking;
 pub mod build_info;
 pub mod config;
 pub mod index;
+pub mod index_cache;
 pub mod log_analysis;
 pub mod project;
 pub mod project_cache;

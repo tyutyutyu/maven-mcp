@@ -10,10 +10,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::ErrorData;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use walkdir::WalkDir;
 
@@ -28,7 +29,7 @@ const RUNNER_BASE_BYTES: u64 = 16 * 1024;
 const PATH_ENTRY_OVERHEAD_BYTES: u64 = 96;
 
 /// Cheap identity of one file: size and modification time with nanosecond resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct FileStamp {
     len: u64,
     modified_ns: u128,
@@ -49,7 +50,7 @@ fn stamp(path: &Path) -> Option<FileStamp> {
 
 /// Stamps of a fixed set of paths. A missing path is part of the identity, so creating or
 /// deleting a file changes the fingerprint just like editing it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProjectFingerprint {
     stamps: BTreeMap<PathBuf, Option<FileStamp>>,
 }
@@ -93,6 +94,24 @@ impl ProjectFingerprint {
         self.stamps
             .iter()
             .all(|(path, recorded)| stamp(path) == *recorded)
+    }
+
+    /// Whether every existing stamped file is old enough that a later change must produce a
+    /// new stamp; see [`crate::index::SETTLED_AGE`].
+    pub fn is_settled(&self) -> bool {
+        self.stamps
+            .values()
+            .flatten()
+            .all(|stamp| crate::index::is_settled(stamp.modified_ns))
+    }
+
+    /// Whether every existing stamped file was already settled at `moment`: a file that
+    /// changed after a reader started at `moment` is never mistaken for what it read.
+    pub fn was_settled_at(&self, moment: SystemTime) -> bool {
+        self.stamps
+            .values()
+            .flatten()
+            .all(|stamp| crate::index::was_settled_at(stamp.modified_ns, moment))
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
@@ -254,6 +273,8 @@ struct ProjectState {
     runner: Option<RunnerEntry>,
     index: Option<Arc<CachedIndex>>,
     in_flight: Option<InFlight>,
+    /// Set by an explicit refresh: the next published build must not reuse on-disk records.
+    full_rebuild: bool,
     last_used_tick: u64,
     last_used_unix_ms: u128,
 }
@@ -273,6 +294,15 @@ pub struct ProjectCache {
     misses: u64,
     evictions: u64,
     invalidations: u64,
+    persisted: PersistedCounters,
+}
+
+/// How builds of this process used the on-disk index cache.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PersistedCounters {
+    pub classpath_hits: u64,
+    pub record_hits: u64,
+    pub record_misses: u64,
 }
 
 impl ProjectCache {
@@ -289,7 +319,20 @@ impl ProjectCache {
             misses: 0,
             evictions: 0,
             invalidations: 0,
+            persisted: PersistedCounters::default(),
         }
+    }
+
+    /// Adds one build's use of the on-disk cache to the published counters.
+    pub fn record_persisted_use(
+        &mut self,
+        classpath_hit: bool,
+        record_hits: u64,
+        record_misses: u64,
+    ) {
+        self.persisted.classpath_hits += u64::from(classpath_hit);
+        self.persisted.record_hits += record_hits;
+        self.persisted.record_misses += record_misses;
     }
 
     pub fn runner(&mut self, root: &Path) -> Option<RunnerSnapshot> {
@@ -369,6 +412,30 @@ impl ProjectCache {
             .and_then(|state| state.runner.as_mut())
         {
             runner.revalidate = true;
+        }
+    }
+
+    /// Makes the project's builds read every archive again until one of them is published.
+    pub fn require_full_rebuild(&mut self, root: &Path) {
+        let generation = self.fresh_generation();
+        self.states
+            .entry(root.to_owned())
+            .or_insert_with(|| ProjectState::new(generation))
+            .full_rebuild = true;
+    }
+
+    pub fn requires_full_rebuild(&self, root: &Path) -> bool {
+        self.states
+            .get(root)
+            .is_some_and(|state| state.full_rebuild)
+    }
+
+    /// Clears [`Self::require_full_rebuild`] after a build of `generation` was published.
+    pub fn finish_full_rebuild(&mut self, root: &Path, generation: u64) {
+        if let Some(state) = self.states.get_mut(root)
+            && state.generation == generation
+        {
+            state.full_rebuild = false;
         }
     }
 
@@ -580,6 +647,9 @@ impl ProjectCache {
                 .values()
                 .filter(|state| state.runner.is_some())
                 .count(),
+            persisted_classpath_hits: self.persisted.classpath_hits,
+            persisted_record_hits: self.persisted.record_hits,
+            persisted_record_misses: self.persisted.record_misses,
         }
     }
 
@@ -743,6 +813,7 @@ impl ProjectState {
             runner: None,
             index: None,
             in_flight: None,
+            full_rebuild: false,
             last_used_tick: 0,
             last_used_unix_ms: unix_ms(),
         }

@@ -20,8 +20,10 @@ use walkdir::WalkDir;
 use zip::ZipArchive;
 
 mod declaration_source;
+mod persisted;
 
 use declaration_source::{SliceOutcome, SourceLanguage, SourceOutline};
+pub use persisted::{PersistableRecord, PersistedRecords, SETTLED_AGE, is_settled, was_settled_at};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct ArtifactKey {
@@ -49,6 +51,8 @@ struct JarRecord {
     /// Effective physical classfile entry per logical entry path
     /// (see [`effective_class_entries`]).
     class_entries: BTreeMap<String, String>,
+    /// Whether the manifest declares `Multi-Release: true`; `class_entries` follows from it.
+    multi_release: bool,
     fact_strings: Vec<Arc<str>>,
     class_facts: Vec<IndexedClassFacts>,
     providers: Vec<IndexedProvider>,
@@ -310,7 +314,9 @@ pub struct JarContentSearch {
     pub scanned_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Ord, PartialOrd,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeRelation {
     Extends,
@@ -558,7 +564,8 @@ impl MavenIndex {
             .into_iter()
             .filter_map(|path| repository_identity(root, &path).map(|identity| (path, identity)))
             .collect::<Vec<_>>();
-        Self::build_from_jars(root, jars, max_results, max_source_bytes)
+        Self::build_from_jars(root, jars, max_results, max_source_bytes, None)
+            .map(|(index, _)| index)
     }
 
     /// Builds an index limited to the effective classpath of one project: artifacts below
@@ -572,6 +579,27 @@ impl MavenIndex {
         classpath: &[PathBuf],
         max_results: usize,
         max_source_bytes: usize,
+    ) -> Result<ScopedIndex> {
+        Self::build_scoped_with(
+            repository_root,
+            reactor,
+            classpath,
+            max_results,
+            max_source_bytes,
+            None,
+        )
+    }
+
+    /// Like [`Self::build_scoped`], but reuses every record in `persisted` that was derived
+    /// from exactly the current artifact, and returns the freshly built records that may be
+    /// persisted. Without `persisted` nothing is stamped or encoded.
+    pub fn build_scoped_with(
+        repository_root: Option<&Path>,
+        reactor: &ReactorLayout<'_>,
+        classpath: &[PathBuf],
+        max_results: usize,
+        max_source_bytes: usize,
+        persisted: Option<&dyn PersistedRecords>,
     ) -> Result<ScopedIndex> {
         let mut jars = BTreeMap::new();
         let mut unindexed = Vec::new();
@@ -603,13 +631,18 @@ impl MavenIndex {
             jars.insert(path, identity);
         }
         let root = repository_root.unwrap_or(reactor.root);
-        let index = Self::build_from_jars(
+        let (index, records) = Self::build_from_jars(
             root,
             jars.into_iter().collect(),
             max_results,
             max_source_bytes,
+            persisted,
         )?;
-        Ok(ScopedIndex { index, unindexed })
+        Ok(ScopedIndex {
+            index,
+            unindexed,
+            records,
+        })
     }
 
     fn build_from_jars(
@@ -617,7 +650,8 @@ impl MavenIndex {
         jars: Vec<(PathBuf, JarIdentity)>,
         max_results: usize,
         max_source_bytes: usize,
-    ) -> Result<Self> {
+        persisted: Option<&dyn PersistedRecords>,
+    ) -> Result<(Self, RecordReuse)> {
         let mut index = Self {
             root: root.to_owned(),
             jars: Vec::new(),
@@ -634,8 +668,26 @@ impl MavenIndex {
         let mut jars = jars;
         jars.sort_by(|left, right| left.0.cmp(&right.0));
         let mut records = Vec::new();
+        let mut reuse = RecordReuse::default();
         for (path, identity) in &jars {
             crate::blocking::checkpoint()?;
+            let validity = persisted.and_then(|_| persisted::ArtifactValidity::capture(path));
+            if let (Some(stored), Some(validity)) = (
+                persisted.and_then(|records| records.load(path)),
+                validity.as_ref(),
+            ) && let Some(record) = persisted::restore(
+                &stored,
+                path,
+                identity,
+                validity,
+                max_source_bytes,
+                &mut budget,
+            )? {
+                reuse.reused.push(path.clone());
+                records.push(record);
+                continue;
+            }
+            let before = budget.clone();
             let preflight = if path.is_dir() {
                 preflight_directory(path, &mut budget)
             } else {
@@ -649,9 +701,20 @@ impl MavenIndex {
                     continue;
                 }
             }
-            if let Some(record) = load_jar_record(path, identity.clone(), max_source_bytes) {
-                records.push(record);
+            let Some(record) = load_jar_record(path, identity.clone(), max_source_bytes) else {
+                continue;
+            };
+            if let Some(validity) = validity {
+                reuse.built += 1;
+                let charge = persisted::PreflightCharge::between(&before, &budget);
+                reuse.persistable.extend(persisted::persistable(
+                    &record,
+                    validity,
+                    charge,
+                    max_source_bytes,
+                ));
             }
+            records.push(record);
         }
         records.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
@@ -682,7 +745,7 @@ impl MavenIndex {
         }
         index.children_by_parent = build_children_by_parent(&index.jars);
 
-        Ok(index)
+        Ok((index, reuse))
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -2078,6 +2141,7 @@ fn public_class_api(
         classes,
         entries,
         class_entries,
+        multi_release,
     } = read_jar_index_from(&mut archive)?;
     let jar = JarRecord {
         key,
@@ -2087,6 +2151,7 @@ fn public_class_api(
         classes,
         entries,
         class_entries,
+        multi_release,
         fact_strings: Vec::new(),
         class_facts: Vec::new(),
         providers: Vec::new(),
@@ -2123,6 +2188,7 @@ fn load_jar_record(
         classes,
         entries,
         class_entries,
+        multi_release,
     } = match read_jar_index(path) {
         Ok(content) => content,
         Err(error) => {
@@ -2143,6 +2209,7 @@ fn load_jar_record(
         classes,
         entries,
         class_entries,
+        multi_release,
         fact_strings,
         class_facts,
         providers,
@@ -2243,6 +2310,16 @@ impl ReactorLayout<'_> {
 pub struct ScopedIndex {
     pub index: MavenIndex,
     pub unindexed: Vec<UnindexedClasspathEntry>,
+    pub records: RecordReuse,
+}
+
+/// How a build used the persisted records: how many it reused, how many it read from the
+/// archives, and which of the latter may be persisted.
+#[derive(Debug, Default)]
+pub struct RecordReuse {
+    pub reused: Vec<PathBuf>,
+    pub built: usize,
+    pub persistable: Vec<PersistableRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2888,6 +2965,7 @@ impl std::fmt::Display for ArchiveLimit {
 }
 impl std::error::Error for ArchiveLimit {}
 
+#[derive(Clone)]
 struct ArchiveBudget {
     entries: usize,
     names: usize,
@@ -3221,6 +3299,7 @@ struct JarIndex {
     classes: Vec<String>,
     entries: Vec<String>,
     class_entries: BTreeMap<String, String>,
+    multi_release: bool,
 }
 
 fn read_jar_index(path: &Path) -> Result<JarIndex> {
@@ -3241,6 +3320,7 @@ fn read_jar_index_from(archive: &mut ClassArchive) -> Result<JarIndex> {
         classes,
         entries,
         class_entries,
+        multi_release,
     })
 }
 

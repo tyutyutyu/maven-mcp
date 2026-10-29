@@ -674,6 +674,26 @@ impl MavenRunner {
         paths
     }
 
+    /// Directories of the Maven installation that can change dependency resolution: the
+    /// global `conf` (settings, toolchains, properties) and `lib/ext` extensions. A system
+    /// executable's installation is `bin/..`; the Maven Wrapper's installations are every
+    /// distribution below `$MAVEN_USER_HOME/wrapper/dists` (default `~/.m2`).
+    pub fn installation_configuration(&self) -> Vec<PathBuf> {
+        let homes = match &self.executable {
+            MavenExecutable::System(executable) => executable
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_owned)
+                .into_iter()
+                .collect(),
+            MavenExecutable::Wrapper(_) => wrapper_distribution_homes(),
+        };
+        homes
+            .into_iter()
+            .flat_map(|home| [home.join("conf"), home.join("lib/ext")])
+            .collect()
+    }
+
     pub async fn run(&self, invocation: &MavenInvocation) -> MavenRunResult {
         let started = Instant::now();
         let arguments = match self.arguments(invocation) {
@@ -1210,6 +1230,9 @@ impl MavenRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for name in crate::config::SERVER_ONLY_ENVIRONMENT {
+            command.env_remove(name);
+        }
         if let Err(error) = self.configure_java_environment(&mut command).await {
             return ExecutedMaven {
                 result: self.runner_error(started, error.to_string()),
@@ -1724,6 +1747,31 @@ fn select_executable(root: &Path, configured: Option<&Path>) -> Result<MavenExec
         bail!("MAVEN_EXECUTABLE is not executable");
     }
     Ok(MavenExecutable::System(configured))
+}
+
+/// Deepest installation below `wrapper/dists`: `<distribution>/<hash>/<home>` (newer
+/// wrappers unpack one level higher).
+const WRAPPER_DISTRIBUTION_DEPTH: usize = 3;
+/// Upper bound of directories visited while looking for Maven Wrapper installations.
+const MAX_WRAPPER_DISTRIBUTION_ENTRIES: usize = 4096;
+
+/// Every Maven installation the Maven Wrapper has unpacked: a directory with `bin/mvn`.
+fn wrapper_distribution_homes() -> Vec<PathBuf> {
+    let user_home = std::env::var_os("MAVEN_USER_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".m2")));
+    let Some(user_home) = user_home else {
+        return Vec::new();
+    };
+    WalkDir::new(user_home.join("wrapper/dists"))
+        .follow_links(false)
+        .max_depth(WRAPPER_DISTRIBUTION_DEPTH)
+        .into_iter()
+        .filter_map(Result::ok)
+        .take(MAX_WRAPPER_DISTRIBUTION_ENTRIES)
+        .filter(|entry| entry.file_type().is_dir() && entry.path().join("bin/mvn").is_file())
+        .map(walkdir::DirEntry::into_path)
+        .collect()
 }
 
 fn is_executable(path: &Path) -> Result<bool> {

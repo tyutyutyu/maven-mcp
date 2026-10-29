@@ -5,12 +5,12 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 use super::*;
 
-const MULTI_RELEASE_MANIFEST: (&str, &[u8]) = (
+pub(super) const MULTI_RELEASE_MANIFEST: (&str, &[u8]) = (
     "META-INF/MANIFEST.MF",
     b"Manifest-Version: 1.0\r\nMulti-Release: true\r\n\r\n",
 );
 
-fn write_jar(path: &Path, entries: &[(&str, &[u8])]) {
+pub(super) fn write_jar(path: &Path, entries: &[(&str, &[u8])]) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut writer = ZipWriter::new(File::create(path).unwrap());
     for (name, content) in entries {
@@ -333,7 +333,7 @@ fn inspection_class(class_name: &str) -> Vec<u8> {
     bytes
 }
 
-fn hierarchy_class(class_name: &str, super_class: &str, interfaces: &[&str]) -> Vec<u8> {
+pub(super) fn hierarchy_class(class_name: &str, super_class: &str, interfaces: &[&str]) -> Vec<u8> {
     let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
     push_u16(&mut bytes, 0);
     push_u16(&mut bytes, 61);
@@ -359,7 +359,7 @@ fn hierarchy_class(class_name: &str, super_class: &str, interfaces: &[&str]) -> 
     bytes
 }
 
-fn referencing_class(class_name: &str, target: &str) -> Vec<u8> {
+pub(super) fn referencing_class(class_name: &str, target: &str) -> Vec<u8> {
     let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
     push_u16(&mut bytes, 0);
     push_u16(&mut bytes, 61);
@@ -388,7 +388,7 @@ fn referencing_class(class_name: &str, target: &str) -> Vec<u8> {
     bytes
 }
 
-fn module_info_class() -> Vec<u8> {
+pub(super) fn module_info_class() -> Vec<u8> {
     let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
     push_u16(&mut bytes, 0);
     push_u16(&mut bytes, 61);
@@ -985,7 +985,9 @@ fn compares_exact_versions_without_indexing_other_repository_artifacts() {
     let one = root.path().join("org/example/demo/1.0/demo-1.0.jar");
     let identity = repository_identity(root.path(), &one).unwrap();
     let index =
-        MavenIndex::build_from_jars(root.path(), vec![(one, identity)], 20, 64 * 1024).unwrap();
+        MavenIndex::build_from_jars(root.path(), vec![(one, identity)], 20, 64 * 1024, None)
+            .unwrap()
+            .0;
     assert_eq!(index.search_classes("NewOnly", None).len(), 0);
 
     let diff = MavenIndex::compare_artifact_api_at(
@@ -3416,7 +3418,7 @@ fn flagged_jar_without_base_entry_uses_highest_versioned_entry() {
     );
 }
 
-fn write_module_pom(directory: &Path, artifact_id: &str, version: &str) {
+pub(super) fn write_module_pom(directory: &Path, artifact_id: &str, version: &str) {
     std::fs::create_dir_all(directory).unwrap();
     std::fs::write(
         directory.join("pom.xml"),
@@ -3427,7 +3429,7 @@ fn write_module_pom(directory: &Path, artifact_id: &str, version: &str) {
     .unwrap();
 }
 
-fn write_class_directory(directory: &Path, entries: &[(&str, &[u8])]) {
+pub(super) fn write_class_directory(directory: &Path, entries: &[(&str, &[u8])]) {
     for (name, content) in entries {
         let path = directory.join(name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

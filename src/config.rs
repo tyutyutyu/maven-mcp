@@ -21,6 +21,7 @@ pub const DEFAULT_MAX_XML_BYTES: usize = 16_777_216;
 pub const DEFAULT_MAX_JAR_ENTRIES: usize = 200_000;
 pub const DEFAULT_MAX_INDEX_ENTRIES: usize = 20_000_000;
 pub const DEFAULT_MAX_INDEX_NAME_BYTES: usize = 2_147_483_648;
+pub const DEFAULT_MAX_INDEX_CACHE_BYTES: usize = 1_073_741_824;
 pub const MAX_ENTRY_NAME_BYTES: usize = 4096;
 
 static MAX_XML_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_XML_BYTES);
@@ -197,6 +198,14 @@ pub struct Config {
     /// Heavy jobs that may wait for a running slot; further jobs are rejected.
     pub max_queued_heavy_jobs: usize,
     pub execution: MavenExecutionConfig,
+    /// The on-disk index cache, or `None` when it is disabled or has no location.
+    pub index_cache: Option<IndexCacheConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCacheConfig {
+    pub directory: PathBuf,
+    pub max_bytes: u64,
 }
 
 impl Config {
@@ -233,8 +242,69 @@ impl Config {
                 DEFAULT_MAX_QUEUED_HEAVY_JOBS,
             )?,
             execution: maven_execution_from_env(use_jenv)?,
+            index_cache: index_cache_from_env()?,
         })
     }
+}
+
+/// Variables that configure only this server's own limits, logging, cache and stats. They
+/// are removed from every Maven child, so they cannot change a Maven result and are left out
+/// of the persisted classpath identity, which digests the rest of the environment.
+pub const SERVER_ONLY_ENVIRONMENT: [&str; 17] = [
+    "MAX_RESULTS",
+    "MAX_SOURCE_BYTES",
+    "MAX_PROJECT_INDEXES",
+    "MAX_PROJECT_INDEX_BYTES",
+    "MAX_HEAVY_JOBS",
+    "MAX_QUEUED_HEAVY_JOBS",
+    "MAX_XML_BYTES",
+    "MAX_JAR_ENTRIES",
+    "MAX_INDEX_ENTRIES",
+    "MAX_INDEX_NAME_BYTES",
+    "MAX_INDEX_CACHE_BYTES",
+    "MAX_MAVEN_OUTPUT_BYTES",
+    "MAVEN_TIMEOUT_SECONDS",
+    "MAVEN_MCP_INDEX_CACHE",
+    "MAVEN_MCP_CACHE_DIR",
+    "MAVEN_MCP_RUNTIME_DIR",
+    "RUST_LOG",
+];
+
+fn index_cache_from_env() -> Result<Option<IndexCacheConfig>> {
+    let max_bytes = positive_env("MAX_INDEX_CACHE_BYTES", DEFAULT_MAX_INDEX_CACHE_BYTES)?;
+    if !boolean_env_or("MAVEN_MCP_INDEX_CACHE", true)? {
+        return Ok(None);
+    }
+    let directory = index_cache_directory(
+        env::var_os("MAVEN_MCP_CACHE_DIR"),
+        env::var_os("XDG_CACHE_HOME"),
+        env::var_os("HOME"),
+    )?;
+    Ok(directory.map(|directory| IndexCacheConfig {
+        directory,
+        max_bytes: u64::try_from(max_bytes).unwrap_or(u64::MAX),
+    }))
+}
+
+/// `MAVEN_MCP_CACHE_DIR` when set (it must be absolute), otherwise `maven-mcp/index` below
+/// an absolute `XDG_CACHE_HOME` or `~/.cache`; `None` when no location is known.
+fn index_cache_directory(
+    configured: Option<OsString>,
+    xdg_cache_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<Option<PathBuf>> {
+    if let Some(configured) = configured {
+        let directory = PathBuf::from(configured);
+        if !directory.is_absolute() {
+            bail!("MAVEN_MCP_CACHE_DIR must be an absolute path");
+        }
+        return Ok(Some(directory));
+    }
+    let base = xdg_cache_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".cache")));
+    Ok(base.map(|base| base.join("maven-mcp/index")))
 }
 
 fn maven_execution_from_env(use_jenv: bool) -> Result<MavenExecutionConfig> {
@@ -300,11 +370,15 @@ fn canonicalize_absolute_directory(path: &Path) -> Result<PathBuf> {
 }
 
 fn boolean_env(name: &str) -> Result<bool> {
+    boolean_env_or(name, false)
+}
+
+fn boolean_env_or(name: &str, default: bool) -> Result<bool> {
     match env::var(name) {
         Ok(value) if value.eq_ignore_ascii_case("true") || value == "1" => Ok(true),
         Ok(value) if value.eq_ignore_ascii_case("false") || value == "0" => Ok(false),
         Ok(_) => bail!("{name} must be true, false, 1, or 0"),
-        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error).with_context(|| format!("cannot read {name}")),
     }
 }

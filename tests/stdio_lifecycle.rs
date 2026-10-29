@@ -15,6 +15,7 @@ use support::TestServer;
 #[tokio::test]
 async fn stdout_contains_only_json_rpc_and_eof_stops_the_server() -> Result<()> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .env("RUST_LOG", "maven_mcp=info")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -69,6 +70,7 @@ async fn stdout_contains_only_json_rpc_and_eof_stops_the_server() -> Result<()> 
 async fn stats_cli_reports_empty_runtime_as_successful_json() -> Result<()> {
     let runtime = tempfile::tempdir()?;
     let output = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .arg("stats")
         .arg("--json")
         .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
@@ -89,6 +91,7 @@ async fn stats_cli_reports_empty_runtime_as_successful_json() -> Result<()> {
 async fn stats_cli_reports_live_stdio_instance() -> Result<()> {
     let runtime = tempfile::tempdir()?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -121,6 +124,7 @@ async fn stats_cli_reports_live_stdio_instance() -> Result<()> {
         .context("server closed before initialize response")?;
 
     let output = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .arg("stats")
         .arg("--json")
         .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
@@ -158,6 +162,7 @@ async fn sigterm_stops_the_stdio_server_cleanly() -> Result<()> {
     };
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -283,6 +288,7 @@ async fn eof_does_not_leave_an_active_maven_process_group() -> Result<()> {
     std::fs::set_permissions(&wrapper, permissions)?;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .env(
             "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
             fixture.trusted_project_directory().unwrap(),
@@ -389,6 +395,7 @@ async fn exited_parent_pipe_holders_stop_on_eof_sigterm_and_request_cancellation
             let holder = support::PipeHolder::new(project, redirections)?;
             let other = fixture.add_trusted_project("recovery")?;
             let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+                .env("MAVEN_MCP_INDEX_CACHE", "false")
                 .env(
                     "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
                     fixture.trusted_project_directory().unwrap(),
@@ -497,6 +504,7 @@ async fn blocked_index_work_does_not_keep_the_server_alive_after_eof_or_sigterm(
         let project = fixture.project_path().unwrap();
         let _blocked = support::install_blocked_classpath(project)?;
         let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+            .env("MAVEN_MCP_INDEX_CACHE", "false")
             .env(
                 "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
                 fixture.trusted_project_directory().unwrap(),
@@ -582,6 +590,7 @@ async fn debug_logging_and_responses_never_reveal_credentials_or_project_paths()
         ),
     )?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
         .env("RUST_LOG", "trace")
         .env(
             "MAVEN_TRUSTED_PROJECT_DIRECTORIES",

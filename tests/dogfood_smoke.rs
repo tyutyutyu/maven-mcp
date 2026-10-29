@@ -3,7 +3,8 @@
 //! private project manifest and the result directory are outside the repository. It is
 //! ignored by the deterministic gate.
 //!
-//! Every project gets a freshly started server (a cold, cache-free process) trusted for
+//! Every project gets a freshly started server (a cold, cache-free process unless the
+//! manifest sets `MAVEN_MCP_INDEX_CACHE`) trusted for
 //! exactly that project. The suite checks initialize, tools/list, project inspection,
 //! index build and reuse, class source, dependency tree, classpath, effective POM, Maven
 //! and JDK versions through `run_maven`, and an optional focused test and lifecycle phase,
@@ -266,8 +267,10 @@ async fn start_session<'a>(
 ) -> Result<Session<'a>> {
     let manifest = &environment.manifest;
     let command = tokio::process::Command::new(&environment.binary).configure(|command| {
+        // Cold by default; a manifest may enable the on-disk index cache explicitly.
         command
             .args(&manifest.server_arguments)
+            .env("MAVEN_MCP_INDEX_CACHE", "false")
             .envs(&manifest.server_environment)
             .env("MAVEN_TRUSTED_PROJECT_DIRECTORIES", &project.path)
             .env("MAVEN_MCP_RUNTIME_DIR", runtime_dir)

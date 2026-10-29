@@ -59,6 +59,15 @@ pub struct RuntimeCacheStatus {
     pub max_bytes: u64,
     #[serde(default)]
     pub runners: usize,
+    /// Builds that reused a classpath from the on-disk index cache instead of running Maven.
+    #[serde(default)]
+    pub persisted_classpath_hits: u64,
+    /// JAR and class-directory records reused from the on-disk index cache.
+    #[serde(default)]
+    pub persisted_record_hits: u64,
+    /// Records read from their archives because the on-disk cache had no valid copy.
+    #[serde(default)]
+    pub persisted_record_misses: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +218,12 @@ pub fn format_runtime_report(report: &RuntimeReport) -> String {
             instance.cache.retained_bytes,
             instance.config.max_project_index_bytes,
             instance.cache.runners
+        ));
+        output.push_str(&format!(
+            "  persisted: classpath_hits={} record_hits={} record_misses={}\n",
+            instance.cache.persisted_classpath_hits,
+            instance.cache.persisted_record_hits,
+            instance.cache.persisted_record_misses
         ));
         for project in &instance.projects {
             output.push_str(&format!(

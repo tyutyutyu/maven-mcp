@@ -42,3 +42,35 @@ fn trusted_project_directories_reject_relative_paths() {
 
     assert!(error.to_string().contains("entries must be absolute paths"));
 }
+
+#[test]
+fn index_cache_directory_prefers_the_override_then_xdg_then_home() {
+    let directory = |configured: Option<&str>, xdg: Option<&str>, home: Option<&str>| {
+        index_cache_directory(
+            configured.map(OsString::from),
+            xdg.map(OsString::from),
+            home.map(OsString::from),
+        )
+    };
+
+    assert_eq!(
+        directory(Some("/cache"), Some("/xdg"), Some("/home/u")).unwrap(),
+        Some(PathBuf::from("/cache"))
+    );
+    assert_eq!(
+        directory(None, Some("/xdg"), Some("/home/u")).unwrap(),
+        Some(PathBuf::from("/xdg/maven-mcp/index"))
+    );
+    assert_eq!(
+        directory(None, Some("relative"), Some("/home/u")).unwrap(),
+        Some(PathBuf::from("/home/u/.cache/maven-mcp/index")),
+        "a relative XDG_CACHE_HOME is ignored"
+    );
+    assert_eq!(directory(None, None, None).unwrap(), None);
+    assert!(
+        directory(Some("relative"), None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("MAVEN_MCP_CACHE_DIR must be an absolute path")
+    );
+}

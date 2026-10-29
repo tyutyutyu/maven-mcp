@@ -4161,3 +4161,657 @@ printf 'Proxy-Authorization: Basic {SECRET_MARKER}\n' >&2
     client.cancel().await?;
     Ok(())
 }
+
+/// Limits of a server process that uses the TestServer's on-disk index cache.
+const PERSISTED: &[(&str, &str)] = &[
+    ("MAVEN_TIMEOUT_SECONDS", "30"),
+    support::PERSISTENT_INDEX_CACHE,
+];
+
+/// A controlled project with `alpha` and `beta` on the classpath and a root `target/classes`
+/// reactor output, every file old enough to be persisted.
+async fn persisted_project() -> Result<(TestServer, PathBuf)> {
+    let (server, project) = controlled_project().await?;
+    let classes = project.join("target/classes");
+    support::write_class_directory(&classes, &class_list(&["org/example/ReactorOne"]))?;
+    support::set_controlled_classpath(
+        &project,
+        &[
+            repository_jar(&project, "alpha"),
+            repository_jar(&project, "beta"),
+            classes,
+        ],
+    )?;
+    support::settle_tree(&project)?;
+    Ok((server, project))
+}
+
+/// One search in a fresh STDIO process: its class names and the process's cache counters.
+async fn search_in_new_process(
+    server: &TestServer,
+    project: &Path,
+    query: &str,
+    limits: &[(&str, &str)],
+) -> Result<(BTreeSet<String>, Value)> {
+    let runtime = tempfile::tempdir()?;
+    let runtime_dir = runtime.path().to_str().unwrap().to_owned();
+    let mut limits = limits.to_vec();
+    limits.push(("MAVEN_MCP_RUNTIME_DIR", &runtime_dir));
+    let (client, pid) = server.connect_with_limits(&limits).await?;
+    let found = class_names(&client, project, query).await;
+    let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+    client.cancel().await?;
+    Ok((found?, cache))
+}
+
+fn persisted_counters(cache: &Value) -> (u64, u64, u64) {
+    let counter = |name: &str| cache[name].as_u64().unwrap_or_default();
+    (
+        counter("persisted_classpath_hits"),
+        counter("persisted_record_hits"),
+        counter("persisted_record_misses"),
+    )
+}
+
+fn integrity(database: &Path) -> Result<String> {
+    Ok(rusqlite::Connection::open(database)?
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))?)
+}
+
+fn every_class() -> BTreeSet<String> {
+    names(&["org.example.ReactorOne", "org.t.AlphaOne", "org.t.BetaOne"])
+}
+
+#[tokio::test]
+async fn a_new_stdio_process_reuses_the_persisted_index_without_maven_or_a_startup_scan()
+-> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (server, project) = persisted_project().await?;
+    let repository = repository_snapshot(&project)?;
+    let database = server.index_cache_database();
+
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache), (0, 0, 3), "cold build");
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+    let mode =
+        |path: &Path| std::fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o777);
+    assert_eq!(mode(&database)?, 0o600);
+    assert_eq!(mode(database.parent().unwrap())?, 0o700);
+
+    // Starting a process and serving a project-independent request reads no cache.
+    let modified = std::fs::metadata(&database)?.modified()?;
+    let runtime = tempfile::tempdir()?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            support::PERSISTENT_INDEX_CACHE,
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+        ])
+        .await?;
+    call(
+        &client,
+        "inspect_maven_project",
+        json!({ "project_path": project.display().to_string() }),
+    )
+    .await?;
+    let idle = runtime_status(runtime.path(), pid)?["cache"].clone();
+    assert_eq!(persisted_counters(&idle), (0, 0, 0));
+    assert_eq!(idle["misses"], 0);
+    client.cancel().await?;
+
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache), (1, 3, 0), "warm first search");
+    assert_eq!(
+        support::controlled_classpath_runs(&project),
+        1,
+        "no Maven run"
+    );
+    assert!(std::fs::metadata(&database)?.modified()? >= modified);
+    assert_eq!(
+        repository_snapshot(&project)?,
+        repository,
+        "repository unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_entries_never_serve_changed_artifacts_poms_or_reactor_outputs() -> Result<()> {
+    let (server, project) = persisted_project().await?;
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+
+    // A modified repository JAR is re-read; the other entries and the classpath are reused.
+    support::write_class_jar(
+        &repository_jar(&project, "alpha"),
+        &class_list(&["org/t/AlphaOne", "org/t/AlphaTwo"]),
+    )?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "Alpha", PERSISTED).await?;
+    assert_eq!(found, names(&["org.t.AlphaOne", "org.t.AlphaTwo"]));
+    assert_eq!(persisted_counters(&cache), (1, 2, 1));
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+
+    // Added and deleted reactor class files are visible to the next process.
+    let classes = project.join("target/classes");
+    support::write_class_directory(&classes, &class_list(&["org/example/ReactorTwo"]))?;
+    std::fs::remove_file(classes.join("org/example/ReactorOne.class"))?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "Reactor", PERSISTED).await?;
+    assert_eq!(found, names(&["org.example.ReactorTwo"]));
+    assert_eq!(persisted_counters(&cache), (1, 2, 1));
+
+    // A deleted classpath artifact makes the persisted classpath invalid: Maven decides again.
+    std::fs::remove_file(repository_jar(&project, "beta"))?;
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha"), classes])?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, names(&["org.t.AlphaOne"]));
+    assert_eq!(persisted_counters(&cache), (0, 2, 0));
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    // A POM edit (a new or removed module edits a POM too) resolves the classpath again,
+    // while the unchanged artifact records stay reusable.
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha")])?;
+    let pom = project.join("pom.xml");
+    let edited = std::fs::read_to_string(&pom)?.replace("</project>", "<!-- edit --></project>");
+    std::fs::write(&pom, edited)?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, names(&["org.t.AlphaOne"]));
+    assert_eq!(persisted_counters(&cache), (0, 1, 0));
+    assert_eq!(support::controlled_classpath_runs(&project), 3);
+    Ok(())
+}
+
+/// A new process rebuilds every entry, runs Maven for the `runs`-th time and leaves an
+/// intact database.
+async fn assert_full_rebuild(server: &TestServer, project: &Path, runs: usize) -> Result<()> {
+    let (found, cache) = search_in_new_process(server, project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache), (0, 0, 3), "full rebuild");
+    assert_eq!(support::controlled_classpath_runs(project), runs);
+    assert_eq!(integrity(&server.index_cache_database())?, "ok");
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_damaged_or_incompatible_caches_are_rebuilt_automatically() -> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let database = server.index_cache_database();
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+
+    let rebuilt = |runs| assert_full_rebuild(&server, &project, runs);
+
+    // Absence: the whole cache directory was deleted.
+    std::fs::remove_dir_all(database.parent().unwrap())?;
+    rebuilt(2).await?;
+
+    // Corruption: the database file is garbage.
+    std::fs::write(&database, vec![0x5a; 16 * 1024])?;
+    rebuilt(3).await?;
+
+    // Downgrade: entries written by a newer version are not reused, and are kept for it.
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute("UPDATE entries SET tool = '99.0.0+newer'", [])?;
+    drop(connection);
+    rebuilt(4).await?;
+    let newer: i64 = rusqlite::Connection::open(&database)?.query_row(
+        "SELECT COUNT(*) FROM entries WHERE tool = '99.0.0+newer'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        newer, 4,
+        "three records and the classpath of the newer version"
+    );
+
+    // Incompatibility: a database of another format is replaced.
+    rusqlite::Connection::open(&database)?
+        .execute("UPDATE meta SET value = '999' WHERE name = 'format'", [])?;
+    rebuilt(5).await?;
+    Ok(())
+}
+
+async fn wait_for_path(path: &Path) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("{} did not appear", path.display()))
+}
+
+#[tokio::test]
+async fn concurrent_processes_and_an_interrupted_write_never_expose_a_partial_cache() -> Result<()>
+{
+    let (server, project) = persisted_project().await?;
+    let database = server.index_cache_database();
+
+    // Two processes resolve, build and publish the same cold project at the same time.
+    std::fs::write(project.join("gate"), "")?;
+    let (first, _) = server.connect_with_limits(PERSISTED).await?;
+    let (second, _) = server.connect_with_limits(PERSISTED).await?;
+    let searches = [
+        spawn_search(&first, &project).await?,
+        spawn_search(&second, &project).await?,
+    ];
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while support::controlled_classpath_runs(&project) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    std::fs::remove_file(project.join("gate"))?;
+    for search in searches {
+        assert_eq!(search.await??["results"].as_array().unwrap().len(), 3);
+    }
+    first.cancel().await?;
+    second.cancel().await?;
+    assert_eq!(integrity(&database)?, "ok");
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache), (1, 3, 0));
+
+    // A process killed while its write transaction waits for the commit lock leaves only a
+    // journal, which rolls back: no partial entry becomes visible.
+    support::write_class_jar(
+        &repository_jar(&project, "alpha"),
+        &class_list(&["org/t/AlphaOne", "org/t/AlphaTwo"]),
+    )?;
+    support::settle_tree(&project)?;
+    let reader = rusqlite::Connection::open(&database)?;
+    reader.execute_batch("BEGIN; SELECT COUNT(*) FROM entries;")?;
+    let (writer, pid) = server.connect_with_limits(PERSISTED).await?;
+    let interrupted = spawn_search(&writer, &project).await?;
+    let mut journal = database.clone().into_os_string();
+    journal.push("-journal");
+    wait_for_path(Path::new(&journal)).await?;
+    std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()?;
+    assert!(
+        interrupted.await?.is_err(),
+        "the killed process did not answer"
+    );
+    reader.execute_batch("COMMIT;")?;
+    drop(reader);
+
+    let (found, cache) = search_in_new_process(&server, &project, "Alpha", PERSISTED).await?;
+    assert_eq!(found, names(&["org.t.AlphaOne", "org.t.AlphaTwo"]));
+    assert_eq!(
+        persisted_counters(&cache),
+        (1, 2, 1),
+        "the lost record is rebuilt"
+    );
+    assert_eq!(integrity(&database)?, "ok");
+    let (_, cache) = search_in_new_process(&server, &project, "Alpha", PERSISTED).await?;
+    assert_eq!(persisted_counters(&cache), (1, 3, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_persisted_cache_is_size_bounded_and_forgotten_by_maven_runs_and_refreshes()
+-> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let database = server.index_cache_database();
+    let stored_bytes = || -> Result<i64> {
+        Ok(rusqlite::Connection::open(&database)?.query_row(
+            "SELECT COALESCE(SUM(bytes), 0) FROM entries",
+            [],
+            |row| row.get(0),
+        )?)
+    };
+
+    // A budget below one entry keeps nothing, and searches stay correct.
+    let tiny = [PERSISTED, &[("MAX_INDEX_CACHE_BYTES", "1")]].concat();
+    for runs in 1..=2 {
+        let (found, cache) = search_in_new_process(&server, &project, "One", &tiny).await?;
+        assert_eq!(found, every_class());
+        assert_eq!(persisted_counters(&cache), (0, 0, 3));
+        assert_eq!(support::controlled_classpath_runs(&project), runs);
+        assert_eq!(stored_bytes()?, 0);
+    }
+
+    // run_maven makes every process resolve the classpath again; records stay reusable.
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert!(stored_bytes()? > 0);
+    let (client, _) = server.connect_with_limits(PERSISTED).await?;
+    call(
+        &client,
+        "run_maven",
+        json!({ "project_path": project.display().to_string(), "arguments": ["-v"] }),
+    )
+    .await?;
+    client.cancel().await?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache), (0, 3, 0));
+    assert_eq!(support::controlled_classpath_runs(&project), 4);
+
+    // An explicit refresh re-reads every archive and replaces the stored records.
+    let runtime = tempfile::tempdir()?;
+    let limits = [
+        PERSISTED,
+        &[("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap())],
+    ]
+    .concat();
+    let (client, pid) = server.connect_with_limits(&limits).await?;
+    assert_refreshed(
+        &call(
+            &client,
+            "refresh_maven_project",
+            json!({ "project_path": project.display().to_string() }),
+        )
+        .await?,
+    );
+    let cache = runtime_status(runtime.path(), pid)?["cache"].clone();
+    assert_eq!(persisted_counters(&cache), (0, 0, 3));
+    assert_eq!(support::controlled_classpath_runs(&project), 5);
+    assert_eq!(class_names(&client, &project, "One").await?, every_class());
+    client.cancel().await?;
+    let (_, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(persisted_counters(&cache), (1, 3, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_changed_inherited_environment_or_maven_installation_resolves_the_classpath_again()
+-> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let classes = project.join("target/classes");
+    let alpha_only = [repository_jar(&project, "alpha"), classes];
+    let reactor_and_alpha = names(&["org.example.ReactorOne", "org.t.AlphaOne"]);
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+
+    // A variable the build reads (here: the classpath the wrapper prints) selects another
+    // dependency set; the stored classpath of the old environment is not served.
+    let alpha_line = alpha_only
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    std::fs::write(project.join("classpath-alpha.txt"), alpha_line)?;
+    support::settle_tree(&project)?;
+    let alpha_environment = [PERSISTED, &[("CLASSPATH_VARIANT", "alpha")]].concat();
+    let (found, cache) =
+        search_in_new_process(&server, &project, "One", &alpha_environment).await?;
+    assert_eq!(found, reactor_and_alpha);
+    assert_eq!(persisted_counters(&cache).0, 0, "no stored classpath");
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+    // The first environment still has its own valid classpath.
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache).0, 1);
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    // The global settings of a system Maven installation are resolution inputs too.
+    let installation = tempfile::tempdir()?;
+    let maven = installation.path().join("bin/mvn");
+    std::fs::create_dir_all(maven.parent().unwrap())?;
+    std::fs::copy(project.join("mvnw"), &maven)?;
+    std::fs::remove_file(project.join("mvnw"))?;
+    let settings = installation.path().join("conf/settings.xml");
+    std::fs::create_dir_all(settings.parent().unwrap())?;
+    std::fs::write(&settings, "<settings/>")?;
+    support::settle_tree(installation.path())?;
+    let system_maven = [PERSISTED, &[("MAVEN_EXECUTABLE", maven.to_str().unwrap())]].concat();
+    search_in_new_process(&server, &project, "One", &system_maven).await?;
+    let (_, cache) = search_in_new_process(&server, &project, "One", &system_maven).await?;
+    assert_eq!(persisted_counters(&cache).0, 1, "an unchanged installation");
+    assert_eq!(support::controlled_classpath_runs(&project), 3);
+
+    std::fs::write(&settings, "<settings><offline>true</offline></settings>")?;
+    support::settle_tree(installation.path())?;
+    support::set_controlled_classpath(&project, &alpha_only)?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", &system_maven).await?;
+    assert_eq!(found, reactor_and_alpha, "no stale match");
+    assert_eq!(persisted_counters(&cache).0, 0);
+    assert_eq!(support::controlled_classpath_runs(&project), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn edited_or_deleted_external_parents_and_imported_boms_resolve_the_classpath_again()
+-> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let classes = project.join("target/classes");
+    let repository = project.join("execution-repository/org/t");
+    let parent = repository.join("corp-parent/1/corp-parent-1.pom");
+    let bom = repository.join("corp-bom/3/corp-bom-3.pom");
+    for (pom, artifact) in [(&parent, "corp-parent"), (&bom, "corp-bom")] {
+        std::fs::create_dir_all(pom.parent().unwrap())?;
+        std::fs::write(
+            pom,
+            format!(
+                "<project><groupId>org.t</groupId><artifactId>{artifact}</artifactId></project>"
+            ),
+        )?;
+    }
+    std::fs::write(
+        project.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion>\
+         <parent><groupId>org.t</groupId><artifactId>corp-parent</artifactId><version>1</version><relativePath/></parent>\
+         <artifactId>fixture-project</artifactId><version>1.0</version>\
+         <dependencyManagement><dependencies><dependency><groupId>org.t</groupId>\
+         <artifactId>corp-bom</artifactId><version>${bom.version}</version><type>pom</type>\
+         <scope>import</scope></dependency></dependencies></dependencyManagement></project>",
+    )?;
+    support::settle_tree(&project)?;
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(
+        persisted_counters(&cache).0,
+        1,
+        "parents and BOMs are reusable"
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+
+    // An edited parent outside the reactor makes Maven decide again.
+    std::fs::write(
+        &parent,
+        std::fs::read_to_string(&parent)?.replace("</project>", "<!-- edit --></project>"),
+    )?;
+    support::set_controlled_classpath(
+        &project,
+        &[repository_jar(&project, "alpha"), classes.clone()],
+    )?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, names(&["org.example.ReactorOne", "org.t.AlphaOne"]));
+    assert_eq!(persisted_counters(&cache).0, 0);
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    // So does a deleted imported BOM, whose version only Maven decides.
+    std::fs::remove_file(&bom)?;
+    support::set_controlled_classpath(
+        &project,
+        &[
+            repository_jar(&project, "alpha"),
+            repository_jar(&project, "beta"),
+            classes,
+        ],
+    )?;
+    support::settle_tree(&project)?;
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache).0, 0);
+    assert_eq!(support::controlled_classpath_runs(&project), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resolution_input_changed_after_maven_read_it_is_never_persisted() -> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let beta_pom = project.join("execution-repository/org/t/beta/1.0/beta-1.0.pom");
+
+    // Maven has read its inputs and holds the old classpath; then the POM of a classpath
+    // artifact changes and stays unchanged for longer than the settling age, through the
+    // rest of the resolution and the index build.
+    std::fs::write(project.join("gate"), "")?;
+    let (client, _) = server.connect_with_limits(PERSISTED).await?;
+    let search = spawn_search(&client, &project).await?;
+    wait_for_path(&project.join("classpath-started")).await?;
+    std::fs::write(
+        &beta_pom,
+        "<project><artifactId>beta</artifactId></project>",
+    )?;
+    support::set_controlled_classpath(
+        &project,
+        &[
+            repository_jar(&project, "alpha"),
+            project.join("target/classes"),
+        ],
+    )?;
+    tokio::time::sleep(maven_mcp::index::SETTLED_AGE + std::time::Duration::from_millis(200)).await;
+    std::fs::remove_file(project.join("gate"))?;
+    assert_eq!(search.await??["results"].as_array().unwrap().len(), 3);
+    client.cancel().await?;
+
+    let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+    assert_eq!(
+        found,
+        names(&["org.example.ReactorOne", "org.t.AlphaOne"]),
+        "no stale match"
+    );
+    assert_eq!(persisted_counters(&cache).0, 0, "nothing stale was stored");
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_processes_recover_one_damaged_or_incompatible_cache_once() -> Result<()> {
+    const PROCESSES: usize = 4;
+    let (server, project) = persisted_project().await?;
+    let database = server.index_cache_database();
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+
+    for damage in ["garbage", "incompatible"] {
+        match damage {
+            "garbage" => std::fs::write(&database, vec![0x5a; 16 * 1024])?,
+            _ => {
+                rusqlite::Connection::open(&database)?
+                    .execute("UPDATE meta SET value = '999' WHERE name = 'format'", [])?;
+            }
+        }
+        // Every process diagnoses the same damage before any of them rebuilds.
+        std::fs::write(project.join("gate"), "")?;
+        let runs = support::controlled_classpath_runs(&project);
+        let mut clients = Vec::new();
+        let mut searches = Vec::new();
+        for _ in 0..PROCESSES {
+            let (client, _) = server.connect_with_limits(PERSISTED).await?;
+            searches.push(spawn_search(&client, &project).await?);
+            clients.push(client);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while support::controlled_classpath_runs(&project) < runs + PROCESSES {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        std::fs::remove_file(project.join("gate"))?;
+        for search in searches {
+            assert_eq!(search.await??["results"].as_array().unwrap().len(), 3);
+        }
+        for client in clients {
+            client.cancel().await?;
+        }
+        assert_eq!(integrity(&database)?, "ok", "{damage}");
+        let (found, cache) = search_in_new_process(&server, &project, "One", PERSISTED).await?;
+        assert_eq!(found, every_class());
+        assert_eq!(
+            persisted_counters(&cache),
+            (1, 3, 0),
+            "{damage}: stored once, intact"
+        );
+    }
+    Ok(())
+}
+
+/// Startup, cold, warm and incremental first-search costs of the on-disk cache across real
+/// STDIO processes. Run with `cargo test --test mcp_interface --locked measure_ -- --nocapture`.
+#[tokio::test]
+async fn measure_persistent_cache_startup_cold_warm_and_incremental_costs() -> Result<()> {
+    const JARS: usize = 3;
+    const CLASSES_PER_JAR: usize = 3_000;
+
+    let (server, project) = controlled_project().await?;
+    let classpath = (0..JARS)
+        .map(|jar| {
+            let path = repository_jar(&project, &format!("bulk{jar}"));
+            let classes = (0..CLASSES_PER_JAR)
+                .map(|class| format!("org/t/bulk{jar}/Generated{class}"))
+                .collect::<Vec<_>>();
+            support::write_class_jar(&path, &classes).map(|()| path)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    support::set_controlled_classpath(&project, &classpath)?;
+    support::settle_tree(&project)?;
+    let first_search = |label: &'static str, persistence: &'static str| {
+        let (server, project) = (&server, &project);
+        async move {
+            let runtime = tempfile::tempdir()?;
+            let started = std::time::Instant::now();
+            let (client, pid) = server
+                .connect_with_limits(&[
+                    ("MAVEN_MCP_INDEX_CACHE", persistence),
+                    ("MAVEN_TIMEOUT_SECONDS", "30"),
+                    ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+                ])
+                .await?;
+            let startup = started.elapsed();
+            let started = std::time::Instant::now();
+            let found = call(
+                &client,
+                "search_classes",
+                json!({ "project_path": project.display().to_string(), "query": "Generated2999" }),
+            )
+            .await?;
+            let query = started.elapsed();
+            assert_eq!(found["results"].as_array().unwrap().len(), JARS, "{label}");
+            let status = runtime_status(runtime.path(), pid)?;
+            client.cancel().await?;
+            anyhow::Ok((startup, query, status))
+        }
+    };
+
+    // The earlier behavior: every new process resolves the classpath and indexes every JAR.
+    let (_, uncached, uncached_status) = first_search("uncached", "false").await?;
+    let (startup, cold, cold_status) = first_search("cold", "true").await?;
+    let (_, warm, warm_status) = first_search("warm", "true").await?;
+    assert_eq!(persisted_counters(&warm_status["cache"]), (1, 3, 0));
+    support::write_class_jar(
+        &classpath[0],
+        &(0..CLASSES_PER_JAR)
+            .map(|class| format!("org/t/bulk0/Generated{class}"))
+            .chain(["org/t/bulk0/Extra".to_owned()])
+            .collect::<Vec<_>>(),
+    )?;
+    support::settle_tree(&project)?;
+    let (_, incremental, incremental_status) = first_search("incremental", "true").await?;
+    assert_eq!(persisted_counters(&incremental_status["cache"]), (1, 2, 1));
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    let rss = |status: &Value, key: &str| status["memory"][key].as_u64().unwrap_or_default();
+    eprintln!(
+        "MEASUREMENT persistent_cache fixture_jars={JARS} classes_per_jar={CLASSES_PER_JAR} \
+         startup_ms={} uncached_first_query_ms={} cold_first_query_ms={} warm_first_query_ms={} \
+         incremental_first_query_ms={} cache_file_bytes={} uncached_peak_rss_bytes={} \
+         cold_peak_rss_bytes={} warm_peak_rss_bytes={} incremental_peak_rss_bytes={}",
+        startup.as_millis(),
+        uncached.as_millis(),
+        cold.as_millis(),
+        warm.as_millis(),
+        incremental.as_millis(),
+        std::fs::metadata(server.index_cache_database())?.len(),
+        rss(&uncached_status, "peak_rss_bytes"),
+        rss(&cold_status, "peak_rss_bytes"),
+        rss(&warm_status, "peak_rss_bytes"),
+        rss(&incremental_status, "peak_rss_bytes"),
+    );
+    Ok(())
+}

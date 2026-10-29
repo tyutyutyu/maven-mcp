@@ -31,6 +31,7 @@ pub const REPORT_SCHEMA_VERSION: &str = "1.0";
 pub const PROJECT_PATH_VARIABLE: &str = "PROJECT_PATH";
 const PROJECT_PATH_PLACEHOLDER: &str = "${PROJECT_PATH}";
 const TRUSTED_DIRECTORIES_VARIABLE: &str = "MAVEN_TRUSTED_PROJECT_DIRECTORIES";
+const INDEX_CACHE_VARIABLE: &str = "MAVEN_MCP_INDEX_CACHE";
 
 /// Most differing values listed per side in a failed identity check.
 const IDENTITY_SAMPLE_LIMIT: usize = 10;
@@ -426,6 +427,11 @@ pub async fn run_benchmark(
     let mut mcp_command = Command::new(&options.mcp_command);
     if let Some(project_path) = &options.project_path {
         mcp_command.env(TRUSTED_DIRECTORIES_VARIABLE, project_path);
+    }
+    // Every invocation measures a cold first call unless the caller opts into the on-disk
+    // index cache explicitly.
+    if std::env::var_os(INDEX_CACHE_VARIABLE).is_none() {
+        mcp_command.env(INDEX_CACHE_VARIABLE, "false");
     }
     let client = match TokioChildProcess::new(mcp_command) {
         Ok(transport) => match tokio::time::timeout(options.timeout, ().serve(transport)).await {

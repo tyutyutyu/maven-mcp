@@ -233,9 +233,102 @@ so editing, adding or removing a nested `.class` file also counts. Any differenc
 example a module added to the POM shows up in `inspect_maven_project` — and drops
 the index, which is rebuilt on demand. `run_maven` and `run_maven_lifecycle`
 always re-read the model and drop the index afterwards, because Maven may have
-changed POMs, dependencies or reactor outputs. Parent POMs outside the project,
-`settings.xml` and the contents of the local repository beyond the classpath JARs
-are not watched; use `run_maven` (or restart the server) after changing them.
+changed POMs, dependencies or reactor outputs. Parent POMs outside the project and
+the contents of the local repository beyond the classpath JARs are not watched by
+the in-process cache; use `refresh_maven_project` after changing them. The
+[persistent index cache](#persistent-index-cache) adds its own, stricter checks
+before a new process reuses a stored classpath.
+
+### Persistent index cache
+
+Every new STDIO process would otherwise pay the full cold cost of its first
+project search: resolving the classpath through Maven and reading every JAR. The
+server therefore keeps a versioned, user-private **on-disk index cache** of derived
+data that all its processes share. It is not a startup scan: nothing is read
+before the first index-dependent request of a project, and only that project's
+classpath entries are looked up. The local Maven repository stays the
+authoritative source and is only read, never written.
+
+The cache holds two kinds of entries, each keyed by the writing `maven-mcp`
+version:
+
+- one **record** per indexed JAR, sources JAR or reactor class directory, keyed by
+  its canonical path. A record is reused only while the file's size and
+  nanosecond modification time (for a class directory: of the directory and
+  every entry below it), its Maven coordinate and the result-shaping limits
+  (`MAX_SOURCE_BYTES`, `MAX_JAR_ENTRIES`, `MAX_XML_BYTES`) are unchanged. Reused
+  records are still charged against `MAX_INDEX_ENTRIES` and
+  `MAX_INDEX_NAME_BYTES`, so a limit fails the same way as for a fresh read.
+- one **classpath** per project context, keyed by the canonical project root,
+  the classpath scope, `MAVEN_EXECUTABLE`, `MAVEN_EXECUTION_REPO_PATH`,
+  `MAVEN_EXECUTION_NETWORK`, the Java selection (inherited or `--jenv` with its
+  root) and a digest of the whole inherited environment (only the digest is
+  stored), because POMs, settings, `mavenrc` files and `JAVA_TOOL_OPTIONS` may
+  read any variable. Only the server's own settings (`MAX_*` limits,
+  `MAVEN_TIMEOUT_SECONDS`, `MAVEN_MCP_*`, `RUST_LOG`) are left out; they are
+  removed from every Maven child. It is reused instead of running Maven only
+  while the project fingerprint (see [Project index cache](#project-index-cache))
+  is identical, every resolution input is unchanged, and every classpath entry
+  still exists. The resolution inputs are `~/.m2/settings.xml`,
+  `~/.m2/toolchains.xml`, `~/.m2/extensions.xml`, `~/.mavenrc`, `/etc/mavenrc`,
+  the Maven installation's `conf` and `lib/ext` directories (of `MAVEN_EXECUTABLE`,
+  or of every Maven Wrapper distribution below
+  `${MAVEN_USER_HOME:-~/.m2}/wrapper/dists`), the jenv version files
+  (`$JENV_ROOT/version` and `.java-version` in the project and its ancestors),
+  the POM beside every repository artifact on the classpath, and — followed
+  transitively from the reactor POMs and those artifact POMs — every parent POM
+  (a reactor POM's `relativePath` and the repository copy) and every BOM imported
+  through `dependencyManagement`, including the imports of every profile. A
+  parent or import whose version Maven decides (a property, a range, a SNAPSHOT)
+  stamps every version of that artifact in the repository. When a parent or
+  import cannot be identified (a groupId or artifactId that needs other
+  properties, an unparsable POM, no known repository), the classpath is not
+  stored and every process resolves it through Maven.
+
+So a new or edited POM, parent or imported BOM, a deleted classpath artifact, a
+changed setting or environment variable resolves the classpath through Maven
+again, and a modified JAR or reactor output re-reads only that entry; every other
+valid record is reused. The resolution inputs are stamped as Maven returns the
+classpath and must all have been at least two seconds old when Maven started, and
+they must still carry those stamps when the classpath is stored; otherwise the
+classpath is used but not stored, because Maven may have read an older version of
+a file that changed during the run or the index build. Likewise, files modified
+less than two seconds before a build are indexed but not persisted, because a
+coarse filesystem clock could hide a second change with the same stamp.
+`run_maven` and `run_maven_lifecycle` also forget the project's stored classpath
+(records stay valid by their stamps), and `refresh_maven_project` additionally
+re-reads every archive of the project and replaces its stored records.
+
+Location and lifecycle:
+
+- Directory: `MAVEN_MCP_CACHE_DIR` when set (must be absolute), otherwise
+  `$XDG_CACHE_HOME/maven-mcp/index` or `~/.cache/maven-mcp/index`. The directory
+  is made `0700` and the SQLite database `index-v1.sqlite3` is `0600`; it contains
+  local paths, class and entry names, never source content. The file name carries
+  the cache format, so an older or newer binary with another format never reads it.
+- Disable with `MAVEN_MCP_INDEX_CACHE=false`; every process then starts cold, as
+  before. With no known location (neither variable nor `HOME`) the cache is off.
+- Size: `MAX_INDEX_CACHE_BYTES` (default 1 GiB) bounds the stored entry bytes;
+  after each write the least recently used entries are evicted. A budget smaller
+  than an entry keeps nothing and only costs the cache's benefit.
+- Deletion: the cache is derived data. Delete the directory at any time, also
+  while servers run; the next build recreates it.
+- Integrity: each build's entries are written in one SQLite transaction, so a
+  crashed or killed process, or two processes building the same project at once,
+  never expose a partial entry. Every payload is a zlib stream whose checksum is
+  verified on read. A missing, unreadable, corrupt or incompatible database is
+  deleted and rebuilt automatically, and a damaged or mismatching entry is a miss
+  that is rebuilt; none of these is ever served as a result. Rebuilding a damaged
+  database is serialized between processes by an exclusive lock on the private
+  `index-v1.sqlite3.lock` file, which counts the rebuilds: a process deletes the
+  database only when no other process rebuilt it since its own diagnosis, and
+  creates the new schema before releasing the lock, so concurrent recoveries never
+  delete each other's new database or its journal. A failed cache write only loses
+  the cached copy: the search still answers from the index it built.
+
+`maven-mcp stats` reports per process how many builds reused a stored classpath
+(`persisted_classpath_hits`) and how many records were reused or read from their
+archives (`persisted_record_hits`, `persisted_record_misses`).
 
 ### Explicit refresh
 
@@ -249,8 +342,10 @@ operation and then, for that project only:
    that started earlier can never publish (the project gets a new generation);
 2. re-discovers the runner (POMs, reactor modules, Maven Wrapper or `mvn`
    selection, `.mvn` configuration);
-3. rebuilds the index. This **starts Maven** (`dependency:build-classpath`)
-   through the shared execution permit, so it waits behind a running Maven
+3. rebuilds the index from every archive, without reusing persisted records,
+   and replaces the project's entries in the
+   [persistent index cache](#persistent-index-cache). This **starts Maven**
+   (`dependency:build-classpath`) through the shared execution permit, so it waits behind a running Maven
    process like any cold request and uses the same Java selection, timeout and
    output limits. It never touches any other project's cached state.
 
@@ -375,8 +470,10 @@ time, for example `maven-mcp 0.1.0 (commit <40-hex commit>)`, or
 command reads user-private runtime status files for live host-managed STDIO
 instances and reports PIDs, the package version, embedded commit and resolved
 executable path of each instance, process RSS where the platform exposes it,
-active project indexes, index sizes, estimated retained bytes, and cache
-hit/miss/eviction/invalidation counters. If no server is running, it exits
+active project indexes, index sizes, estimated retained bytes, cache
+hit/miss/eviction/invalidation counters, and the persistent index cache counters
+(`persisted_classpath_hits`, `persisted_record_hits`, `persisted_record_misses`;
+additive JSON fields). If no server is running, it exits
 successfully with an empty report.
 
 For local source-tree inspection, the bundled helper builds the binary and lets
@@ -687,6 +784,9 @@ Surefire failures follow the existing report-error contract.
 | `MAVEN_TIMEOUT_SECONDS` | `300` | Maximum runtime of one Maven child process. |
 | `MAX_MAVEN_OUTPUT_BYTES` | `1048576` | Separate upper limit for stdout and stderr. |
 | `MAVEN_MCP_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime` | User-private directory for live runtime status files consumed by `maven-mcp stats`. |
+| `MAVEN_MCP_INDEX_CACHE` | `true` | `false` (or `0`) disables the [persistent index cache](#persistent-index-cache); every process then builds its first project index cold. |
+| `MAVEN_MCP_CACHE_DIR` | `$XDG_CACHE_HOME/maven-mcp/index` or `$HOME/.cache/maven-mcp/index` | Absolute, user-private directory of the persistent index cache; safe to delete. |
+| `MAX_INDEX_CACHE_BYTES` | `1073741824` | Positive byte budget of the persistent index cache entries; least recently used entries are evicted after each write. |
 | `MAVEN_MCP_BUILD_COMMIT` | none | Build time only, not read at runtime. Full 40-character lowercase commit embedded into `--version`, `serverInfo.version` and stats; set by `install:candidate`. Any other value fails the build. |
 | `MAVEN_MCP_INSTALL_ROOT` | `${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp` | Used only by `scripts/local-install.sh` and `scripts/dogfood-smoke.sh`: absolute versioned installation root outside the source worktree. |
 | `JENV_ROOT` | `$HOME/.jenv` | jenv installation root used only when the server starts with `--jenv`; must be an absolute path when explicitly set. |
@@ -943,9 +1043,11 @@ runs (`runs`, summarized as the reuse measurement). The report states this in
 
 - The MCP first call for a project in the freshly started server includes the
   Maven classpath resolution and project index construction. Later cases on the
-  same project, and all later calls, reuse the cached index; there is no
-  persistent index cache across benchmark invocations, so every invocation
-  starts cold and is repeatable. Only the first case measures the MCP cold
+  same project, and all later calls, reuse the cached index. The benchmark starts
+  the MCP command with `MAVEN_MCP_INDEX_CACHE=false` unless that variable is set,
+  so by default there is no persistent index cache across benchmark invocations
+  and every invocation starts cold and is repeatable; set
+  `MAVEN_MCP_INDEX_CACHE=true` to measure a warm first call instead. Only the first case measures the MCP cold
   cost; case order matters.
 - Shell commands have no cache: the first call and every reuse run repeat all of
   their own work, including the Maven classpath resolution in the bundled
@@ -1193,7 +1295,9 @@ project list, paths, logs or results. Manifest format:
 ```
 
 Each project gets a freshly started STDIO server (no cache from earlier
-projects) whose `MAVEN_TRUSTED_PROJECT_DIRECTORIES` is exactly that project. The
+projects; the [persistent index cache](#persistent-index-cache) is off unless the
+manifest's `server_environment` sets `MAVEN_MCP_INDEX_CACHE`) whose
+`MAVEN_TRUSTED_PROJECT_DIRECTORIES` is exactly that project. The
 ignored Cargo test `tests/dogfood_smoke.rs` checks `initialize` (the reported
 `serverInfo.version` must equal the binary's installation id), `tools/list`,
 `inspect_maven_project` against the declared layout, the cold first

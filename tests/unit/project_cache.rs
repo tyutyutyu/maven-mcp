@@ -625,3 +625,69 @@ fn abandoned_build_work_keeps_its_generation_owned_until_it_stops() {
     drop(work);
     assert!(retry.try_lock().is_ok());
 }
+
+#[test]
+fn a_required_full_rebuild_lasts_until_a_build_of_the_current_generation_is_published() {
+    let (_directory, root, runner) = project("full-rebuild");
+    let mut cache = ProjectCache::new(limits(4, 16, u64::MAX));
+    assert!(!cache.requires_full_rebuild(&root));
+
+    cache.require_full_rebuild(&root);
+    let snapshot = install(&mut cache, &root, &runner);
+    assert!(cache.requires_full_rebuild(&root));
+    let IndexLookup::Build { generation, .. } = cache.lookup_index(&root, &snapshot.fingerprint)
+    else {
+        panic!("expected a cold lookup");
+    };
+    cache.finish_full_rebuild(&root, generation + 1);
+    assert!(
+        cache.requires_full_rebuild(&root),
+        "an older build does not clear it"
+    );
+    cache.finish_full_rebuild(&root, generation);
+    assert!(!cache.requires_full_rebuild(&root));
+}
+
+#[test]
+fn persisted_cache_use_is_published_in_the_runtime_counters() {
+    let mut cache = ProjectCache::new(limits(4, 16, u64::MAX));
+
+    cache.record_persisted_use(true, 5, 1);
+    cache.record_persisted_use(false, 0, 6);
+
+    let status = cache.runtime_cache();
+    assert_eq!(
+        (
+            status.persisted_classpath_hits,
+            status.persisted_record_hits,
+            status.persisted_record_misses
+        ),
+        (1, 5, 7)
+    );
+}
+
+#[test]
+fn fingerprints_are_settled_only_when_every_existing_stamp_is_old_enough() {
+    let directory = TempDir::new().unwrap();
+    let file = directory.path().join("pom.xml");
+    fs::write(&file, "x").unwrap();
+    let missing = directory.path().join("missing.xml");
+    assert!(!ProjectFingerprint::capture([file.clone(), missing.clone()]).is_settled());
+
+    fs::File::open(&file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+
+    assert!(ProjectFingerprint::capture([file.clone(), missing]).is_settled());
+
+    // A reader that started before the last change did not read what is stamped now.
+    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    fs::File::open(&file)
+        .unwrap()
+        .set_modified(hour_ago)
+        .unwrap();
+    let fingerprint = ProjectFingerprint::capture([file]);
+    assert!(fingerprint.was_settled_at(hour_ago + Duration::from_secs(60)));
+    assert!(!fingerprint.was_settled_at(hour_ago - Duration::from_secs(60)));
+}

@@ -635,6 +635,7 @@ dependencies = [
  "anyhow",
  "cafebabe",
  "clap",
+ "flate2",
  "insta",
  "nix",
  "quick-xml",
