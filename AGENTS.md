@@ -28,7 +28,8 @@ agent-specific development rules.
 
 ## Repository Map
 
-- `src/build_info.rs`: build identity (package version and the commit embedded
+- `src/build_info.rs`: build identity (package name and version from `Cargo.toml`,
+  the only version source, and the commit embedded
   through `MAVEN_MCP_BUILD_COMMIT`) for `--version`, `serverInfo.version` and stats.
 - `src/config.rs`: environment configuration and request-independent limits.
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
@@ -57,6 +58,11 @@ agent-specific development rules.
   `tests/local_install.rs`), and multi-project dogfood smoke
   (`dogfood-smoke.sh`, driving the ignored `tests/dogfood_smoke.rs`) entry points.
   Dogfood manifests and results are private and stay outside the repository.
+- `scripts/release.sh`, `.github/workflows/release.yml`, `tests/release.rs`:
+  native versioned releases (version identity, changelog notes, package and
+  archive privacy checks, reproducible archives); see "Releases" in `README.md`.
+- `CHANGELOG.md`: user-facing changes; add an `Unreleased` entry for every
+  user-facing change.
 
 ## Important Architectural Contracts
 

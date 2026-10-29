@@ -484,6 +484,170 @@ Toolchains:
   schedule (see [Dependency Maintenance](#dependency-maintenance)). Every update
   must pass `CI`.
 
+## Releases
+
+`maven-mcp` is in **beta**. Releases are native Linux builds for the
+[supported targets](#supported-platforms) and are published to two channels:
+
+| Channel | What it contains | Install |
+| --- | --- | --- |
+| [GitHub Releases](https://github.com/tyutyutyu/maven-mcp/releases) | one archive per target, `maven-mcp-<version>-x86_64-unknown-linux-gnu.tar.gz` and `maven-mcp-<version>-aarch64-unknown-linux-gnu.tar.gz`, each with a `.sha256` checksum file | download, verify, extract (below) |
+| [crates.io](https://crates.io/crates/maven-mcp) | the source package | `cargo install maven-mcp --version <version> --locked` |
+
+Every beta release is marked as a GitHub pre-release. A release archive holds
+the commit-identified `maven-mcp` server binary plus `LICENSE`, `README.md`,
+and `CHANGELOG.md`, and nothing else. The binary is the native STDIO MCP
+server; a release is not an OCI image, and no container image is published.
+There is no in-app self-update: upgrades are explicit user actions.
+
+The mandatory integrity artifact is the SHA-256 checksum of each archive.
+Releases are not signed, and no SBOM or build-provenance attestation is
+published, because no channel or user requirement exists for them yet. The
+archives are reproducible instead: rebuilding the release tag with the pinned
+toolchain (`task release:archive` on the tag checkout) produces the same
+SHA-256 (see [Creating a release](#creating-a-release)).
+
+### Versioning and compatibility
+
+- The `version` in `Cargo.toml` is the only version source. `Cargo.lock`, the
+  `CHANGELOG.md` section, the `v<version>` Git tag, the archive names,
+  `maven-mcp --version`, and the MCP `initialize` `serverInfo` (name
+  `maven-mcp`, version `<version>`) all derive from it. Release archives and
+  [local installations](#versioned-local-installation) embed the source commit,
+  so their `serverInfo.version` is `<version>+<12-hex commit>` as SemVer build
+  metadata; `cargo install` builds report the plain `<version>` and
+  `(commit unknown)`. `tests/mcp_interface.rs` and `scripts/release.sh check`
+  fail when these sources disagree.
+- Versions follow [Semantic Versioning 2.0.0](https://semver.org/). The beta
+  is the `0.y.z` series, starting with `0.1.0`. While the major version is `0`,
+  a minor bump (`0.1.x` to `0.2.0`) may contain breaking changes, and a patch
+  bump (`0.1.0` to `0.1.1`) contains only backward-compatible fixes and
+  additions. A pre-release suffix such as `0.2.0-rc.1` marks a candidate.
+  `1.0.0` ends the beta; from then on, only a major bump may break the public
+  interface.
+- The public interface is: MCP tool names, their input schemas, `outputSchema`
+  and structured response shapes, and error semantics; the `maven-mcp`,
+  `maven-agent-log`, and `maven-benchmark` commands and flags, including the
+  `stats --json` fields; the [environment variables](#environment-variables);
+  and the supported platforms. Adding an optional input or an additive JSON
+  output field is backward compatible. Not public: the Rust library API of the
+  `maven_mcp` crate, human-readable text and log output, runtime status files,
+  and the on-disk index cache format, which is derived data and is rebuilt when
+  it changes.
+
+### Changelog and release notes
+
+[`CHANGELOG.md`](CHANGELOG.md) follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Every pull request
+with a user-facing change adds an entry under `## [Unreleased]`, in the `Added`,
+`Changed`, `Deprecated`, `Removed`, `Fixed`, or `Security` group. A user-facing
+change is anything in the public interface above, a default or limit, the
+platform support, the packaging, or documented behavior; a breaking change
+starts with **Breaking:**. Changes with no user-visible effect (internal
+refactors, tests, CI) need no entry. The pull request template asks for this
+confirmation.
+
+A release moves the `Unreleased` entries into a `## [<version>] - YYYY-MM-DD`
+section and leaves an empty `Unreleased` heading. That section, printed by
+`scripts/release.sh notes <version>`, is the GitHub Release body. The release
+check refuses a tag without a dated, non-empty section for its version.
+
+### Upgrade and rollback
+
+Upgrades and rollbacks only replace the binary that the MCP host starts. A host
+session that is already running keeps its binary, so restart the host session
+(or its MCP server) afterwards. Configuration is environment variables only,
+and no data needs migration: the [persistent index cache](#persistent-index-cache)
+keeps the entries of each tool version apart and rebuilds on a format change,
+so both upgrading and downgrading reuse or rebuild it safely.
+
+From GitHub Releases, keep each version in its own directory and point the MCP
+host at a `current` symlink:
+
+```bash
+version=0.1.0                      # the release to install
+target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu
+archive="maven-mcp-${version}-${target}.tar.gz"
+url="https://github.com/tyutyutyu/maven-mcp/releases/download/v${version}"
+curl -fLO "${url}/${archive}" -fLO "${url}/${archive}.sha256"
+sha256sum --check "${archive}.sha256"
+
+releases="${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp/releases"
+mkdir -p "${releases}"
+tar -xzf "${archive}" -C "${releases}"
+"${releases}/maven-mcp-${version}-${target}/maven-mcp" --version
+ln -sfn "maven-mcp-${version}-${target}" "${releases}/current"
+```
+
+Configure the host command as `<releases>/current/maven-mcp`. To upgrade, run
+the same steps with the new version; the previous directory stays in place. To
+roll back, point `current` at the previous directory again, for example
+`ln -sfn maven-mcp-0.1.0-x86_64-unknown-linux-gnu "${releases}/current"`.
+Verify either step with `"${releases}/current/maven-mcp" --version`, which must
+print the selected version and its commit, and with the `serverInfo.version`
+the host reports after the restart. From a source checkout,
+`scripts/release.sh verify-archive <archive>` (`task release:verify-archive
+ARCHIVE=<archive>`) additionally checks the exact archive contents and that the
+extracted binary reports the archive's version.
+
+From crates.io, `cargo install` builds the selected version from source with
+the locked dependencies into `~/.cargo/bin`:
+
+```bash
+cargo install maven-mcp --version 0.1.0 --locked              # install or upgrade
+cargo install maven-mcp --version <previous> --locked --force # roll back
+maven-mcp --version
+```
+
+Add `--bin maven-mcp` to install only the server; otherwise the package's other
+binaries (`maven-agent-log`, `maven-benchmark`, and the `maven-eval-fixture`
+test helper) are installed too. The crates.io build needs Rust 1.89 (the
+minimum supported Rust version) or newer on a
+[supported platform](#supported-platforms).
+
+### Creating a release
+
+Maintainers create a release in three steps; publication needs the approval of
+the protected `release` GitHub environment, which holds the
+`CARGO_REGISTRY_TOKEN` crates.io API token.
+
+1. On a branch, set the new `version` in `Cargo.toml`, run
+   `cargo update --workspace --offline` so `Cargo.lock` records it, move the
+   `Unreleased` changelog entries into the dated version section, and check the
+   result with `task release:check TAG=v<version>`. Merge the pull request after
+   `CI` passes.
+2. Tag the merge commit on `main` and push the tag:
+   `git tag -a v<version> -m "maven-mcp <version>"` and
+   `git push origin v<version>`.
+3. The `Release` workflow (`.github/workflows/release.yml`) then runs the
+   complete `CI` on the tag, requires the tag to be on `main`, runs
+   `scripts/release.sh check --tag` and `cargo publish --dry-run --locked`, and
+   creates a draft GitHub pre-release with the changelog notes. On a native
+   runner per target, `scripts/release.sh archive` builds the clean tag with the
+   commit embedded, remapped source paths, and `SOURCE_DATE_EPOCH` set to the
+   commit time, checks the binary with `scripts/check-linux-binary.sh`, writes
+   a deterministic archive (sorted entries, fixed owner, mode, and mtime, and
+   `gzip -n`) and its `.sha256`, verifies them, and uploads both. After the
+   `release` environment is approved, the workflow runs `cargo publish --locked`
+   and publishes the GitHub Release.
+
+`scripts/release.sh check` also checks the crates.io package manifest
+(`cargo package --list`), and `verify-archive` checks every archive entry: a
+release must not contain private workspace data (`.backlog/`, `.brv/`, private
+`docs/` such as `docs/decisions/` and `docs/testing.md`, local agent
+configuration), build, test log, or evaluation output (`target/`, Promptfoo
+results and reports, MCP test reports, coverage, benchmark results, `*.log`),
+or credential files (`.env*`, `.npmrc`, `.netrc`, `credentials*`,
+`settings-security.xml`, private keys). The package itself is an allowlist:
+`Cargo.toml` `include` admits only `src/**/*.rs`, `Cargo.lock`, `LICENSE`,
+`README.md`, and `CHANGELOG.md`.
+
+If a job fails before the crates.io publication, delete the draft release and
+the tag, fix the problem on `main`, and tag again. A published crates.io version
+is immutable: fix a broken release with a new patch version, and `cargo yank`
+the broken one if needed. Creating a local candidate installation never
+publishes anything.
+
 ## Native STDIO startup
 
 ```bash
@@ -1174,11 +1338,19 @@ task install:promote
 task install:rollback
 
 task dogfood:smoke MANIFEST=/private/dogfood.json OUTPUT=/private/dogfood-results
+
+task release:check
+task release:check TAG=v0.1.0
+task release:notes VERSION=0.1.0
+task release:archive                       # OUTPUT=target/dist by default
+task release:verify-archive ARCHIVE=target/dist/maven-mcp-0.1.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 The `install` tasks are described in
-[Versioned local installation](#versioned-local-installation), and
-`dogfood:smoke` in [Multi-project dogfood smoke](#multi-project-dogfood-smoke).
+[Versioned local installation](#versioned-local-installation),
+`dogfood:smoke` in [Multi-project dogfood smoke](#multi-project-dogfood-smoke),
+and the `release` tasks in [Releases](#releases). They wrap
+`scripts/release.sh`; none of them tags, uploads, or publishes.
 
 The repository includes a default `benchmark.json` specification for common
 Maven inspection commands, parameterized with `${PROJECT_PATH}`; the project
@@ -1393,6 +1565,13 @@ toolchain pinned in `rust-toolchain.toml`, except `MSRV`:
 
 The workflow has read-only repository permissions, does not persist checkout
 credentials, and uses no dependency cache.
+
+A pushed `v<version>` tag starts the separate `Release` workflow
+(`.github/workflows/release.yml`), which runs this complete `CI` workflow
+first and then builds and publishes the release (see
+[Creating a release](#creating-a-release)). Only its `prepare`, `artifacts`, and
+`publish` jobs get write access to repository contents, and only `publish`
+uses the `release` environment and its crates.io token.
 
 The active default-branch ruleset requires a pull request and a successful,
 up-to-date `CI` check before merging. It requires zero approving reviews for

@@ -3,7 +3,10 @@
 
 use std::sync::LazyLock;
 
-/// The Cargo package version.
+/// The Cargo package name, also the MCP `serverInfo.name`.
+pub const PACKAGE_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The Cargo package version: `Cargo.toml` is the only version source.
 pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Length of a full hexadecimal Git (SHA-1) commit id.

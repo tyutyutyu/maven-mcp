@@ -1794,13 +1794,13 @@ impl MavenMcpServer {
     }
 }
 
-const SERVER_NAME: &str = "maven-mcp";
 const SERVER_INSTRUCTIONS: &str = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MavenMcpServer {
-    /// `serverInfo.version` carries the embedded build commit, so a host can identify the
-    /// exact installed binary it started.
+    /// `serverInfo` is the Cargo package name and version (the single version source), and
+    /// the version carries the embedded build commit, so a host can identify the exact
+    /// installed binary it started.
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
@@ -1808,7 +1808,7 @@ impl ServerHandler for MavenMcpServer {
                 .build(),
         )
         .with_server_info(rmcp::model::Implementation::new(
-            SERVER_NAME,
+            build_info::PACKAGE_NAME,
             build_info::server_version(),
         ))
         .with_instructions(SERVER_INSTRUCTIONS.to_owned())

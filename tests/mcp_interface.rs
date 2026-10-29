@@ -339,6 +339,81 @@ async fn initialize_reports_the_embedded_build_identity() -> Result<()> {
     Ok(())
 }
 
+/// The `[package]` value of `key`, read from the `Cargo.toml` file instead of the
+/// compile-time Cargo environment.
+fn manifest_package_field(manifest: &str, key: &str) -> Option<String> {
+    manifest
+        .lines()
+        .skip_while(|line| *line != "[package]")
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .find_map(|line| {
+            let value = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+            Some(
+                value
+                    .trim()
+                    .strip_prefix('"')?
+                    .strip_suffix('"')?
+                    .to_owned(),
+            )
+        })
+}
+
+/// The version `Cargo.lock` records for the package `name`.
+fn locked_package_version(lock: &str, name: &str) -> Option<String> {
+    let entry = format!("name = \"{name}\"");
+    let mut lines = lock.lines().skip_while(|line| *line != entry).skip(1);
+    let version = lines
+        .next()?
+        .strip_prefix("version = \"")?
+        .strip_suffix('"')?;
+    Some(version.to_owned())
+}
+
+#[tokio::test]
+async fn package_manifest_lock_and_mcp_server_report_one_version() -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    let name = manifest_package_field(&manifest, "name").expect("Cargo.toml package name");
+    let version = manifest_package_field(&manifest, "version").expect("Cargo.toml package version");
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))?;
+    assert_eq!(
+        locked_package_version(&lock, &name).as_deref(),
+        Some(version.as_str()),
+        "Cargo.lock must record the Cargo.toml version"
+    );
+
+    let server = TestServer::start().await?;
+    let client = server.connect().await?;
+    let server_info = client
+        .peer_info()
+        .and_then(|info| info.server_info.clone())
+        .expect("initialize must return the server implementation");
+    client.cancel().await?;
+    assert_eq!(server_info.name, name);
+    let (reported, build_metadata) = server_info
+        .version
+        .split_once('+')
+        .unwrap_or((&server_info.version, ""));
+    assert_eq!(
+        reported, version,
+        "serverInfo.version must be the package version"
+    );
+    assert!(
+        build_metadata.is_empty() || build_metadata.len() == 12,
+        "build metadata must be the short commit: {build_metadata:?}"
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+        .arg("--version")
+        .output()?;
+    assert!(
+        String::from_utf8(output.stdout)?.starts_with(&format!("{name} {version} (commit ")),
+        "--version must name the package version"
+    );
+    Ok(())
+}
+
 #[test]
 fn version_flag_names_the_package_version_and_build_commit() -> Result<()> {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp"))

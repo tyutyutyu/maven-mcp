@@ -13,6 +13,8 @@ includes:
     taskfile: ./.tasks/business/install.yml
   dogfood:
     taskfile: ./.tasks/business/dogfood.yml
+  release:
+    taskfile: ./.tasks/business/release.yml
 
 tasks:
   default:

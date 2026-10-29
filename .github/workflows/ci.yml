@@ -7,6 +7,8 @@ on:
   pull_request:
     branches:
       - main
+  # The Release workflow runs the complete CI on the release tag before building artifacts.
+  workflow_call:
 
 permissions:
   contents: read
