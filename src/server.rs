@@ -3,6 +3,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::SystemTime,
 };
 
 use rmcp::{
@@ -24,9 +25,13 @@ use crate::index::{
     ArtifactApiDiff, ArtifactHealth, ArtifactOutsideRepository, ClassDescription, ClassList,
     ClassLocation, ClassMemberMatch, ClassReference, ClassReferenceKind, DeclarationSourceLookup,
     EntryMatch, IndexStats, JarContentSearch, JarEntryContent, JarSummary, MavenIndex,
-    PomDescriptorLookup, ProviderDescriptorKind, ProviderFact, ReactorLayout, ReferenceDirection,
-    SourceResult, SourceSearch, TypeHierarchyMatch, UnindexedClasspathEntry, UnindexedReason,
-    validate_exact_coordinate,
+    PersistedRecords, PomDescriptorLookup, ProviderDescriptorKind, ProviderFact, ReactorLayout,
+    RecordReuse, ReferenceDirection, SourceResult, SourceSearch, TypeHierarchyMatch,
+    UnindexedClasspathEntry, UnindexedReason, validate_exact_coordinate,
+};
+use crate::index_cache::{
+    CacheUpdate, ClasspathManifest, PersistentIndexCache, ResolutionSources, classpath_context,
+    decode_payload, encode_payload, resolution_inputs,
 };
 use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
@@ -436,8 +441,21 @@ pub struct MavenMcpServer {
     execution_permit: Arc<Semaphore>,
     heavy_work: HeavyWork,
     projects: Arc<Mutex<ProjectCache>>,
+    /// The on-disk index cache shared with other processes, unless disabled.
+    index_cache: Option<Arc<PersistentIndexCache>>,
     runtime_status: Arc<RuntimeStatusPublisher>,
     tool_router: ToolRouter<Self>,
+}
+
+/// Where a build's classpath came from.
+struct ResolvedClasspath {
+    paths: Vec<PathBuf>,
+    /// Read from a valid on-disk manifest instead of running Maven.
+    persisted: bool,
+    /// Stamps of every resolution input, captured as Maven returned the classpath; `None`
+    /// when an input is unidentifiable or changed after Maven started, so the classpath must
+    /// not be persisted.
+    inputs: Option<ProjectFingerprint>,
 }
 
 fn heavy_work_error(error: HeavyWorkError) -> ErrorData {
@@ -465,11 +483,18 @@ impl MavenMcpServer {
             running: config.max_heavy_jobs,
             queued: config.max_queued_heavy_jobs,
         });
+        let index_cache = config.index_cache.as_ref().map(|cache| {
+            Arc::new(PersistentIndexCache::new(
+                cache.directory.clone(),
+                cache.max_bytes,
+            ))
+        });
         Self {
             config,
             execution_permit: Arc::new(Semaphore::new(1)),
             heavy_work,
             projects: Arc::new(Mutex::new(projects)),
+            index_cache,
             runtime_status: Arc::new(runtime_status),
             tool_router: Self::tool_router(),
         }
@@ -639,6 +664,116 @@ impl MavenMcpServer {
         outcome
     }
 
+    /// The classpath of the project's current context: a valid on-disk manifest when one
+    /// exists, otherwise Maven's `dependency:build-classpath` output. `ownership` moves
+    /// through the blocking manifest lookup like through every other blocking job.
+    async fn resolve_classpath(
+        &self,
+        root: &Path,
+        snapshot: &RunnerSnapshot,
+        context: &str,
+        ownership: OwnedMutexGuard<()>,
+    ) -> Result<(ResolvedClasspath, OwnedMutexGuard<()>), ErrorData> {
+        let (persisted, ownership) = match self.index_cache.clone() {
+            Some(cache) => {
+                let context = context.to_owned();
+                let fingerprint = Arc::clone(&snapshot.fingerprint);
+                self.blocking(move || {
+                    let classpath = cache
+                        .load_classpath(&context)
+                        .and_then(|payload| decode_payload::<ClasspathManifest>(&payload).ok())
+                        .and_then(|manifest| manifest.reusable_classpath(&context, &fingerprint));
+                    (classpath, ownership)
+                })
+                .await?
+            }
+            None => (None, ownership),
+        };
+        if let Some((paths, inputs)) = persisted {
+            return Ok((
+                ResolvedClasspath {
+                    paths,
+                    persisted: true,
+                    inputs: Some(inputs),
+                },
+                ownership,
+            ));
+        }
+        let started = SystemTime::now();
+        let classpath = snapshot
+            .runner
+            .build_classpath_paths(None, ClasspathKind::Test)
+            .await;
+        if classpath.build.outcome != MavenBuildOutcome::Success {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "cannot build Maven classpath for project index: {}",
+                    maven_failure_detail(&classpath.build)
+                ),
+                None,
+            ));
+        }
+        if classpath.paths_incomplete {
+            return Err(ErrorData::invalid_params(
+                "Maven classpath output was truncated or malformed; the project index was not built because it would be incomplete",
+                None,
+            ));
+        }
+        let (inputs, ownership) = match self.index_cache {
+            Some(_) => {
+                self.capture_resolution_inputs(root, snapshot, &classpath.paths, started, ownership)
+                    .await?
+            }
+            None => (None, ownership),
+        };
+        Ok((
+            ResolvedClasspath {
+                paths: classpath.paths,
+                persisted: false,
+                inputs,
+            },
+            ownership,
+        ))
+    }
+
+    /// Stamps every input of the classpath Maven just returned. Only inputs that were already
+    /// settled when Maven `started` describe what Maven read: a file changed during the run
+    /// or the following index build yields `None`, so that classpath is never persisted.
+    async fn capture_resolution_inputs(
+        &self,
+        root: &Path,
+        snapshot: &RunnerSnapshot,
+        classpath: &[PathBuf],
+        started: SystemTime,
+        ownership: OwnedMutexGuard<()>,
+    ) -> Result<(Option<ProjectFingerprint>, OwnedMutexGuard<()>), ErrorData> {
+        let root = root.to_owned();
+        let config = self.config.clone();
+        let runner = Arc::clone(&snapshot.runner);
+        let project = Arc::clone(&snapshot.fingerprint);
+        let classpath = classpath.to_vec();
+        self.blocking(move || {
+            let repository_root = repository_root_for(&classpath, &root, &config);
+            let reactor_poms = runner
+                .fingerprint_paths()
+                .into_iter()
+                .filter(|path| path.file_name().is_some_and(|name| name == "pom.xml"))
+                .collect::<Vec<_>>();
+            let installation = runner.installation_configuration();
+            let inputs = resolution_inputs(&ResolutionSources {
+                root: &root,
+                config: &config,
+                classpath: &classpath,
+                repository_root: repository_root.as_deref(),
+                reactor_poms: &reactor_poms,
+                installation: &installation,
+            })
+            .filter(|inputs| project.was_settled_at(started) && inputs.was_settled_at(started));
+            (inputs, ownership)
+        })
+        .await
+    }
+
     /// `ownership` moves into every blocking job of the build, so it is released only when the
     /// build's blocking work has stopped, even after the request was cancelled.
     async fn try_build_index(
@@ -648,25 +783,14 @@ impl MavenMcpServer {
         generation: u64,
         ownership: OwnedMutexGuard<()>,
     ) -> BuildOutcome {
-        let classpath = snapshot
-            .runner
-            .build_classpath_paths(None, ClasspathKind::Test)
-            .await;
-        if classpath.build.outcome != MavenBuildOutcome::Success {
-            return BuildOutcome::Failed(ErrorData::invalid_params(
-                format!(
-                    "cannot build Maven classpath for project index: {}",
-                    maven_failure_detail(&classpath.build)
-                ),
-                None,
-            ));
-        }
-        if classpath.paths_incomplete {
-            return BuildOutcome::Failed(ErrorData::invalid_params(
-                "Maven classpath output was truncated or malformed; the project index was not built because it would be incomplete",
-                None,
-            ));
-        }
+        let context = classpath_context(root, &self.config);
+        let (classpath, ownership) = match self
+            .resolve_classpath(root, snapshot, &context, ownership)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return BuildOutcome::Failed(error),
+        };
         let repository_root = repository_root_for(&classpath.paths, root, &self.config);
         if !has_indexable_jars(&classpath.paths, root, repository_root.is_some()) {
             return BuildOutcome::Failed(ErrorData::invalid_params(
@@ -718,19 +842,34 @@ impl MavenMcpServer {
         let fingerprint = Arc::clone(&snapshot.fingerprint);
         let (max_results, max_source_bytes) =
             (self.config.max_results, self.config.max_source_bytes);
+        let reuse_records = !self
+            .lock_projects()
+            .is_ok_and(|projects| projects.requires_full_rebuild(root));
+        let cache = self.index_cache.clone();
+        let classpath_paths = classpath.paths.clone();
+        let indexed_repository = repository_root.clone();
         // The reservation moves into the job: an abandoned build keeps counting against the
         // memory budget until its blocking thread has really stopped.
         let built = self
             .blocking(move || {
-                let scoped = MavenIndex::build_scoped(
-                    repository_root.as_deref(),
+                let reader = cache.as_deref().and_then(PersistentIndexCache::reader);
+                // An explicit refresh reads every archive again; its fresh records replace the
+                // stored ones.
+                let persisted: Option<&dyn PersistedRecords> = match &reader {
+                    Some(_) if !reuse_records => Some(&NoPersistedRecords),
+                    Some(reader) => Some(reader),
+                    None => None,
+                };
+                let scoped = MavenIndex::build_scoped_with(
+                    indexed_repository.as_deref(),
                     &ReactorLayout {
                         root: &project_root,
                         modules: &modules,
                     },
-                    &classpath.paths,
+                    &classpath_paths,
                     max_results,
                     max_source_bytes,
+                    persisted,
                 );
                 // Files that changed while Maven and the indexer ran describe a different project.
                 let changed = !fingerprint.is_current() || !artifacts.is_current();
@@ -754,35 +893,132 @@ impl MavenMcpServer {
             ));
         }
         let index = Arc::new(scoped.index);
-        let Ok(mut projects) = self.lock_projects() else {
-            return BuildOutcome::Failed(ErrorData::internal_error(
-                "project cache is poisoned",
-                None,
-            ));
+        let publication = {
+            let Ok(mut projects) = self.lock_projects() else {
+                return BuildOutcome::Failed(ErrorData::internal_error(
+                    "project cache is poisoned",
+                    None,
+                ));
+            };
+            if changed {
+                projects.invalidate_generation(root, generation);
+                return BuildOutcome::Stale;
+            }
+            if self.index_cache.is_some() {
+                projects.record_persisted_use(
+                    classpath.persisted,
+                    scoped.records.reused.len() as u64,
+                    scoped.records.built as u64,
+                );
+            }
+            let publication = projects.publish(
+                root,
+                generation,
+                &index,
+                artifacts,
+                Arc::clone(&snapshot.fingerprint),
+                reservation,
+            );
+            if publication != Publication::Stale {
+                projects.finish_full_rebuild(root, generation);
+            }
+            publication
         };
-        if changed {
-            projects.invalidate_generation(root, generation);
-            return BuildOutcome::Stale;
-        }
-        match projects.publish(
-            root,
-            generation,
-            &index,
-            artifacts,
-            Arc::clone(&snapshot.fingerprint),
-            reservation,
-        ) {
+        match publication {
             Publication::Stale => BuildOutcome::Stale,
-            Publication::Retained | Publication::Uncached => BuildOutcome::Built(index),
+            Publication::Retained | Publication::Uncached => {
+                self.persist_build(PersistedBuild {
+                    root,
+                    generation,
+                    context,
+                    fingerprint: Arc::clone(&snapshot.fingerprint),
+                    classpath: classpath.paths,
+                    inputs: classpath.inputs,
+                    records: scoped.records,
+                })
+                .await;
+                BuildOutcome::Built(index)
+            }
+        }
+    }
+
+    /// Writes a published build's new records, its classpath manifest and the reuse of its
+    /// cached records to the on-disk cache. A failure only loses the cached copy. The
+    /// manifest is written only while every resolution input still has the stamp captured
+    /// with Maven's run. When Maven invalidated the project while the write ran, the manifest
+    /// is forgotten again.
+    async fn persist_build(&self, build: PersistedBuild<'_>) {
+        let Some(cache) = self.index_cache.clone() else {
+            return;
+        };
+        let context = build.context.clone();
+        let written = self
+            .blocking(move || {
+                let manifest = build
+                    .inputs
+                    .filter(ProjectFingerprint::is_current)
+                    .and_then(|inputs| {
+                        ClasspathManifest::settled(
+                            &build.context,
+                            &build.fingerprint,
+                            inputs,
+                            build.classpath,
+                        )
+                    })
+                    .and_then(|manifest| encode_payload(&manifest).ok());
+                let RecordReuse {
+                    reused,
+                    persistable,
+                    ..
+                } = build.records;
+                cache.write(&CacheUpdate {
+                    classpath: manifest.map(|payload| (build.context.as_str(), payload)),
+                    records: &persistable,
+                    reused: &reused,
+                })
+            })
+            .await;
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %format!("{error:#}"), "cannot write the index cache");
+            }
+            Err(error) => tracing::warn!(%error.message, "cannot write the index cache"),
+        }
+        let current = self
+            .lock_projects()
+            .is_ok_and(|projects| projects.is_current(build.root, build.generation));
+        if !current {
+            self.forget_persisted_classpath(context).await;
+        }
+    }
+
+    /// Makes the next build of this project context resolve its classpath through Maven,
+    /// in this process and in every other process sharing the on-disk cache.
+    async fn forget_persisted_classpath(&self, context: String) {
+        let Some(cache) = self.index_cache.clone() else {
+            return;
+        };
+        match self
+            .blocking(move || cache.forget_classpath(&context))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %format!("{error:#}"), "cannot forget a cached classpath");
+            }
+            Err(error) => tracing::warn!(%error.message, "cannot forget a cached classpath"),
         }
     }
 
     /// Maven may have changed dependencies, sources, outputs or POMs: drop the project's
     /// index, abandon its running build and re-read the model on the next request.
-    fn invalidate_project(&self, project_path: &str) -> Result<(), ErrorData> {
+    async fn invalidate_project(&self, project_path: &str) -> Result<(), ErrorData> {
         let root = self.validate_project_path(project_path)?;
         self.lock_projects()?.invalidate_after_maven(&root);
         self.publish_runtime_status();
+        self.forget_persisted_classpath(classpath_context(&root, &self.config))
+            .await;
         Ok(())
     }
 
@@ -792,8 +1028,14 @@ impl MavenMcpServer {
     /// every failure says the cache is already invalidated, so it is never reported as success.
     async fn refresh_project(&self, project_path: &str) -> Result<IndexStats, ErrorData> {
         let root = self.trusted_project_root(project_path)?;
-        self.lock_projects()?.invalidate_after_maven(&root);
+        {
+            let mut projects = self.lock_projects()?;
+            projects.invalidate_after_maven(&root);
+            projects.require_full_rebuild(&root);
+        }
         self.publish_runtime_status();
+        self.forget_persisted_classpath(classpath_context(&root, &self.config))
+            .await;
         let index = self.index_for(project_path).await.map_err(|error| {
             ErrorData::new(
                 error.code,
@@ -841,6 +1083,27 @@ impl MavenMcpServer {
             .runtime_status
             .update_cache(projects.runtime_cache(), projects.runtime_projects());
     }
+}
+
+/// The records of a build that must read every archive again: nothing is reused, but the
+/// fresh records are still stamped and persisted.
+struct NoPersistedRecords;
+
+impl PersistedRecords for NoPersistedRecords {
+    fn load(&self, _: &Path) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// A published build whose derived data goes to the on-disk cache.
+struct PersistedBuild<'a> {
+    root: &'a Path,
+    generation: u64,
+    context: String,
+    fingerprint: Arc<ProjectFingerprint>,
+    classpath: Vec<PathBuf>,
+    inputs: Option<ProjectFingerprint>,
+    records: RecordReuse,
 }
 
 const MAX_MAVEN_FAILURE_DETAIL_CHARS: usize = 2_048;
@@ -1352,7 +1615,7 @@ impl MavenMcpServer {
             .await
             .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?;
         // Arbitrary goals may change dependencies, sources or classpath.
-        self.invalidate_project(&request.project_path)?;
+        self.invalidate_project(&request.project_path).await?;
         Ok(Json(result))
     }
 
@@ -1372,7 +1635,7 @@ impl MavenMcpServer {
             })
             .await;
         // Packaging and verification change the reactor outputs on the classpath.
-        self.invalidate_project(&request.project_path)?;
+        self.invalidate_project(&request.project_path).await?;
         Ok(Json(MavenBuildResult::from_run(run)))
     }
 

@@ -19,6 +19,9 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 
 pub struct TestServer {
     repository: TempDir,
+    /// Private on-disk index cache shared by every process of this server; persistence is
+    /// off unless a test enables it with [`PERSISTENT_INDEX_CACHE`].
+    index_cache: TempDir,
     trusted_project_directory: Option<TempDir>,
     project_path: Option<PathBuf>,
     jenv_root: Option<TempDir>,
@@ -33,6 +36,7 @@ impl TestServer {
             project_path: None,
             jenv_root: None,
             inherited_java_home: None,
+            index_cache: TempDir::new()?,
         })
     }
 
@@ -61,6 +65,7 @@ impl TestServer {
             project_path: Some(project_path),
             jenv_root: None,
             inherited_java_home: None,
+            index_cache: TempDir::new()?,
         })
     }
 
@@ -119,7 +124,9 @@ impl TestServer {
                 command
                     .env("MAX_RESULTS", "50")
                     .env("MAX_SOURCE_BYTES", "1024")
-                    .env("RUST_LOG", "maven_mcp=warn");
+                    .env("RUST_LOG", "maven_mcp=warn")
+                    .env("MAVEN_MCP_CACHE_DIR", self.index_cache.path())
+                    .env("MAVEN_MCP_INDEX_CACHE", "false");
                 if let (Some(trusted_directory), Some(project_path)) =
                     (&self.trusted_project_directory, &self.project_path)
                 {
@@ -166,6 +173,11 @@ impl TestServer {
     #[allow(dead_code)]
     pub fn repository_path(&self) -> &Path {
         self.repository.path()
+    }
+
+    /// The SQLite database of this server's on-disk index cache.
+    pub fn index_cache_database(&self) -> PathBuf {
+        self.index_cache.path().join("index-v1.sqlite3")
     }
 
     /// Replaces the source entries of the project-scoped `org.libs:helper:2.0` artifact.
@@ -269,6 +281,30 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
 
 /// Holds the first Maven child until the test has issued its competing request.
 /// Poll intervals only observe markers; elapsed time never releases the child.
+/// Server limits that enable the on-disk index cache of a [`TestServer`].
+pub const PERSISTENT_INDEX_CACHE: (&str, &str) = ("MAVEN_MCP_INDEX_CACHE", "true");
+
+/// Moves the modification time of every entry below `root` that changed during the last
+/// minute an hour into the past, so the on-disk cache treats the fixture as settled (see
+/// `maven_mcp::index::SETTLED_AGE`). Entries settled earlier keep their stamp, and every newly
+/// settled entry gets a stamp no earlier entry had.
+pub fn settle_tree(root: &Path) -> Result<()> {
+    let now = std::time::SystemTime::now();
+    let recent = now - Duration::from_secs(60);
+    let past = now - Duration::from_secs(3600);
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .contents_first(true)
+    {
+        let entry = entry?;
+        if entry.path_is_symlink() || entry.metadata()?.modified()? < recent {
+            continue;
+        }
+        File::open(entry.path())?.set_modified(past)?;
+    }
+    Ok(())
+}
+
 pub struct MavenReportGate {
     directory: PathBuf,
 }
@@ -699,7 +735,8 @@ fn write_jar(path: &Path, entries: &[(&str, &[u8])]) -> Result<()> {
 }
 
 /// Wrapper whose `dependency:build-classpath` output and timing are driven by marker files in
-/// the project: `classpath.txt` (the printed classpath), `gate` (block until removed), `slow`
+/// the project: `classpath.txt` (the printed classpath; `classpath-<variant>.txt` when the
+/// inherited `CLASSPATH_VARIANT` is set), `gate` (block until removed), `slow`
 /// (sleep) and `fail-classpath` (fail the run, after the gate and the sleep so that a failing
 /// build has the same window for concurrent requests as a successful one). Every classpath run
 /// appends a line to
@@ -709,7 +746,7 @@ pub const CONTROLLED_WRAPPER: &str = r#"#!/bin/sh
 case " $* " in
   *" dependency:build-classpath "*)
     echo run >> "$PWD/classpath-runs"
-    classpath=$(cat "$PWD/classpath.txt")
+    classpath=$(cat "$PWD/classpath${CLASSPATH_VARIANT:+-$CLASSPATH_VARIANT}.txt")
     : > "$PWD/classpath-started"
     while [ -f "$PWD/gate" ]; do sleep 0.05; done
     if [ -f "$PWD/slow" ]; then sleep 0.5; fi

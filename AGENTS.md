@@ -25,6 +25,10 @@ agent-specific development rules.
 - `src/config.rs`: environment configuration and request-independent limits.
 - `src/index.rs`: Maven layout recognition, JAR/ZIP processing, the in-memory
   index, and all search operations.
+- `src/index/persisted.rs`: the persistable, stamp-validated form of one indexed JAR or
+  class directory.
+- `src/index_cache.rs`: the versioned, user-private on-disk index cache (SQLite): records,
+  per-project classpath manifests, atomic writes, rebuild on damage, and the byte budget.
 - `src/project_cache.rs`: per-project runner and index cache: file fingerprints,
   generations, single-flight index builds, and the shared memory budget.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
@@ -50,6 +54,12 @@ agent-specific development rules.
 
 - Do not build a complete local repository index at startup. Project-scoped
   repository indexes are created from explicit request context only.
+- The on-disk index cache is derived, deletable data: a stored record or classpath is
+  reused only when every stamp, identity and setting it was derived from is unchanged,
+  writes are single SQLite transactions, damage or incompatibility rebuilds instead of
+  failing, and the Maven repository is never written. Bump `INDEX_CACHE_FORMAT` when a
+  stored shape or record derivation changes. Integration tests use a private cache per
+  `TestServer` and enable persistence only with `support::PERSISTENT_INDEX_CACHE`.
 - Request project identity is explicit: every repository- or project-dependent
   MCP request requires an absolute `project_path`, which must canonicalize to a
   directory containing `pom.xml`.
@@ -95,6 +105,10 @@ Java-selection flag are:
   absolute directory trees. Maven-backed project operations are disabled when
   unset; a canonical `project_path` must be equal to or below one configured
   directory.
+- `MAVEN_MCP_INDEX_CACHE`, default `true`; `false` disables the on-disk index cache.
+- `MAVEN_MCP_CACHE_DIR`, optional absolute on-disk index cache directory; default
+  `$XDG_CACHE_HOME/maven-mcp/index` or `~/.cache/maven-mcp/index`.
+- `MAX_INDEX_CACHE_BYTES`, default `1073741824`; must be a positive integer.
 - `MAVEN_MCP_RUNTIME_DIR`, optional user-private directory for `maven-mcp stats`
   runtime status files.
 - `--jenv`, optional STDIO-server flag that resolves Java per canonical request

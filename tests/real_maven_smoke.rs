@@ -221,6 +221,7 @@ async fn connect(
                 .env("MAVEN_EXECUTABLE", &environment.maven)
                 .env("MAVEN_TIMEOUT_SECONDS", MAVEN_TIMEOUT_SECONDS)
                 .env("MAVEN_SKIP_RC", "1")
+                .env("MAVEN_MCP_INDEX_CACHE", "false")
                 .env("RUST_LOG", "maven_mcp=warn");
             for name in IGNORED_MAVEN_ENVIRONMENT {
                 command.env_remove(name);
