@@ -2695,7 +2695,9 @@ fn parse_dependency_tree(output: &str) -> Vec<DependencyNode> {
             if !prefix.len().is_multiple_of(3)
                 || !prefix
                     .as_bytes()
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .all(|chunk| chunk == b"|  " || chunk == b"   ")
             {
                 return None;
@@ -3048,11 +3050,11 @@ fn coverage_gaps(parsed: ParsedCoverageReports, limit: usize) -> CoverageGapResu
 
 fn coverage_basis_points(counter: &CoverageCounter) -> u64 {
     let total = counter.missed + counter.covered;
-    if total == 0 {
-        u64::MAX
-    } else {
-        counter.covered.saturating_mul(10_000) / total
-    }
+    counter
+        .covered
+        .saturating_mul(10_000)
+        .checked_div(total)
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

@@ -1,15 +1,18 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{build_info, config::Config, index::IndexStats};
+
+/// Linux procfs, the only supported source of process liveness and memory figures.
+const PROC_ROOT: &str = "/proc";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeReport {
@@ -155,6 +158,8 @@ impl Drop for RuntimeStatusPublisher {
 }
 
 pub fn read_runtime_report() -> Result<RuntimeReport> {
+    let proc_root = Path::new(PROC_ROOT);
+    ensure_procfs(proc_root)?;
     let directory = runtime_dir()?;
     let mut instances = Vec::new();
     if !directory.is_dir() {
@@ -174,7 +179,7 @@ pub fn read_runtime_report() -> Result<RuntimeReport> {
         let Some(status) = status else {
             continue;
         };
-        if process_is_alive(status.pid) {
+        if process_is_alive(proc_root, status.pid) {
             instances.push(status);
         } else {
             let _ = fs::remove_file(entry.path());
@@ -266,8 +271,20 @@ fn running_executable() -> Option<String> {
         .map(|path| path.display().to_string())
 }
 
-fn process_is_alive(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).is_dir()
+/// Without a mounted procfs no instance could be proven live or stale, so the report fails
+/// instead of claiming that every instance is gone and deleting their status files.
+fn ensure_procfs(proc_root: &Path) -> Result<()> {
+    if proc_root.join("self").is_dir() {
+        return Ok(());
+    }
+    bail!(
+        "maven-mcp stats requires a mounted Linux procfs at {} to tell live instances from stale ones",
+        proc_root.display()
+    )
+}
+
+fn process_is_alive(proc_root: &Path, pid: u32) -> bool {
+    proc_root.join(pid.to_string()).is_dir()
 }
 
 fn process_memory() -> ProcessMemoryStatus {
@@ -288,3 +305,7 @@ fn proc_status_kb(status: &str, key: &str) -> Option<u64> {
 fn bytes_label(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/runtime_stats.rs"]
+mod tests;

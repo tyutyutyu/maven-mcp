@@ -51,8 +51,8 @@ tasks:
     preconditions:
       - sh: command -v cargo
         msg: cargo is required
-      - sh: command -v npx
-        msg: npx is required for MCP Inspector
+      - sh: command -v npm
+        msg: Node.js and npm (version pinned in .node-version) are required for MCP Inspector
       - sh: test -x scripts/run-inspector.sh
         msg: scripts/run-inspector.sh must be executable
     cmds:
@@ -64,8 +64,8 @@ tasks:
     preconditions:
       - sh: command -v cargo
         msg: cargo is required
-      - sh: command -v npx
-        msg: npx is required for Promptfoo
+      - sh: command -v npm
+        msg: Node.js and npm (version pinned in .node-version) are required for Promptfoo
       - sh: test -x scripts/run-agent-eval.sh
         msg: scripts/run-agent-eval.sh must be executable
     cmds:

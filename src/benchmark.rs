@@ -751,14 +751,27 @@ where
         if read == 0 {
             return Ok(());
         }
-        let reserved = budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining - remaining.min(read))
-            })
-            .map_or(0, |remaining| remaining.min(read));
+        let reserved = reserve_budget(budget, read);
         stored.extend_from_slice(&buffer[..reserved]);
         if reserved < read {
             truncated.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Takes up to `wanted` bytes from the shared output budget and returns the reserved amount.
+fn reserve_budget(budget: &AtomicUsize, wanted: usize) -> usize {
+    let mut remaining = budget.load(Ordering::Relaxed);
+    loop {
+        let reserved = remaining.min(wanted);
+        match budget.compare_exchange_weak(
+            remaining,
+            remaining - reserved,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return reserved,
+            Err(actual) => remaining = actual,
         }
     }
 }

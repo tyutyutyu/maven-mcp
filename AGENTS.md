@@ -12,10 +12,18 @@ agent-specific development rules.
 
 ## Technology and Prerequisites
 
-- Rust `1.89` or later, using the 2024 edition.
+- Rust: the exact toolchain pinned in `rust-toolchain.toml` (rustup selects it
+  automatically), using the 2024 edition. The MSRV is `rust-version` in
+  `Cargo.toml` (1.89), checked by the separate `MSRV` CI job; do not use language
+  or library features newer than the MSRV.
 - Cargo; always use the versioned `Cargo.lock` file and the `--locked` flag for
   reproducible commands.
-- Inspector and agent evaluation require `node` and `npx`.
+- Supported platforms: Linux `x86_64-unknown-linux-gnu` and
+  `aarch64-unknown-linux-gnu` (glibc, mounted `/proc`). Other operating systems
+  fail to compile on purpose; see "Supported Platforms" in `README.md`.
+- Inspector and agent evaluation require the Node.js version in `.node-version`
+  and the npm version in `tools/package.json`. The scripts install the locked
+  tools with `npm ci` (`scripts/node-tools.sh`); do not call `npx`.
 - The project has no database and no separate build-time code generation step.
 
 ## Repository Map
@@ -206,9 +214,10 @@ scripts/test-pyramid.sh
 It runs formatting, warning-as-error Clippy, and every Cargo test target under
 `cargo llvm-cov`, then requires at least 80% aggregate Rust line coverage
 (unrounded covered/total lines of `src/`, child-process binaries included, no
-module exclusions; checked by `scripts/check-coverage.py`). Prerequisites:
-`rustup component add llvm-tools-preview`, `cargo install cargo-llvm-cov
---version 0.8.5 --locked`, and `python3`; a missing tool fails the gate. Reports
+module exclusions; checked by `scripts/check-coverage.py`). Prerequisites: the
+`llvm-tools-preview` component (part of the `rust-toolchain.toml` pin),
+`cargo install cargo-llvm-cov --version 0.8.5 --locked`, and `python3`; a
+missing tool fails the gate. Reports
 are in `target/coverage/` (`html/index.html`, `summary.json`). The
 integration, lifecycle, scenario, and snapshot targets all start the production
 binary through a real child-process STDIO MCP client.

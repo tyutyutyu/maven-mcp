@@ -1,0 +1,15 @@
+{
+  "name": "maven-mcp-dev-tools",
+  "private": true,
+  "description": "Pinned Node.js tools for the optional MCP Inspector and Promptfoo agent evaluation scripts; installed with npm ci from package-lock.json.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=26.13.0 <27",
+    "npm": ">=11.20.0 <12"
+  },
+  "packageManager": "npm@11.20.0",
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "2.12.0",
+    "promptfoo": "0.125.1"
+  }
+}

@@ -7,7 +7,7 @@
   "schedule": ["before 6am on monday"],
   "timezone": "Europe/Budapest",
   "prConcurrentLimit": 5,
-  "enabledManagers": ["cargo", "github-actions", "npm", "dockerfile", "custom.regex"],
+  "enabledManagers": ["cargo", "github-actions", "npm", "nodenv", "dockerfile", "custom.regex"],
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 6am on the first day of the month"]
@@ -30,39 +30,38 @@
       "groupName": "github actions"
     },
     {
-      "description": "Group pinned npx tool versions used by scripts",
-      "matchManagers": ["custom.regex"],
-      "groupName": "npx tools",
-      "matchDatasources": ["npm"]
+      "description": "Group the pinned Node.js version with the locked npm tools in tools/",
+      "matchManagers": ["npm", "nodenv"],
+      "groupName": "node tools"
     },
     {
-      "description": "Group cargo-deny with GitHub Actions updates",
+      "description": "Group CI-installed Cargo tools with GitHub Actions updates",
       "matchManagers": ["custom.regex"],
       "matchDatasources": ["crate"],
-      "matchPackageNames": ["cargo-deny"],
+      "matchPackageNames": ["cargo-deny", "cargo-llvm-cov"],
       "groupName": "github actions"
+    },
+    {
+      "description": "Pinned developer and CI Rust toolchain; the MSRV in Cargo.toml changes only by decision",
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["rust-lang/rust"],
+      "groupName": "rust toolchain"
     }
   ],
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Pinned npx tools and Promptfoo script, test and documentation versions",
-      "managerFilePatterns": ["/^scripts/.+\\.sh$/", "/^tests/promptfoo_config\\.rs$/", "/^README\\.md$/"],
-      "matchStrings": [
-        "npx --yes (?<depName>@?[a-z0-9./-]+)@(?<currentValue>[0-9][^\\s\"\\\\]*)",
-        "PROMPTFOO_VERSION=\"?(?<currentValue>[0-9][^\\s\"]*)\"?",
-        "PROMPTFOO_VERSION=\\\\\"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)",
-        "The script pins Promptfoo `(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)`"
-      ],
-      "datasourceTemplate": "npm",
-      "depNameTemplate": "{{#if depName}}{{{depName}}}{{else}}promptfoo{{/if}}"
+      "description": "Rust toolchain pinned in rust-toolchain.toml",
+      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
+      "matchStrings": ["channel = \"(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)\""],
+      "depNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
     },
     {
       "customType": "regex",
-      "description": "cargo-deny pinned in CI workflows",
-      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
-      "matchStrings": ["cargo install cargo-deny --version (?<currentValue>[0-9][^\\s]*)"],
-      "depNameTemplate": "cargo-deny",
+      "description": "Cargo tools pinned in CI workflows, the gate script and their documentation",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/", "/^scripts/.+\\.sh$/", "/^README\\.md$/", "/^AGENTS\\.md$/"],
+      "matchStrings": ["cargo install (?<depName>cargo-(?:deny|llvm-cov)) --version (?<currentValue>[0-9][^\\s]*)"],
       "datasourceTemplate": "crate"
     }
   ]
