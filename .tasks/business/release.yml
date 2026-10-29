@@ -1,0 +1,52 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+# Native versioned releases. These tasks only check and build locally; the Release
+# workflow uploads and publishes after a pushed tag (README.md, "Releases").
+tasks:
+  check:
+    desc: Check version identity (Cargo.toml, Cargo.lock, CHANGELOG.md, optional TAG) and the package manifest
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: test -x scripts/release.sh
+        msg: scripts/release.sh must be executable
+    cmds:
+      - scripts/release.sh check {{if .TAG}}--tag "{{.TAG}}"{{end}}
+
+  notes:
+    desc: Print the CHANGELOG.md release notes of VERSION
+    requires:
+      vars: [VERSION]
+    preconditions:
+      - sh: test -x scripts/release.sh
+        msg: scripts/release.sh must be executable
+    cmds:
+      - scripts/release.sh notes "{{.VERSION}}"
+
+  archive:
+    desc: Build the reproducible native release archive and checksum of the clean HEAD (OUTPUT, default target/dist)
+    vars:
+      OUTPUT: '{{.OUTPUT | default "target/dist"}}'
+      TARGET:
+        sh: "rustc -vV | sed -n 's/^host: //p'"
+    preconditions:
+      - sh: command -v cargo
+        msg: cargo is required
+      - sh: command -v git
+        msg: git is required
+      - sh: test -x scripts/release.sh
+        msg: scripts/release.sh must be executable
+    cmds:
+      - scripts/release.sh archive "{{.TARGET}}" "{{.OUTPUT}}"
+
+  verify-archive:
+    desc: Verify a downloaded or built release ARCHIVE against its .sha256, entry list and version
+    requires:
+      vars: [ARCHIVE]
+    preconditions:
+      - sh: test -x scripts/release.sh
+        msg: scripts/release.sh must be executable
+    cmds:
+      - scripts/release.sh verify-archive "{{.ARCHIVE}}"

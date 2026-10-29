@@ -1,0 +1,136 @@
+name: Release
+
+# A pushed v<version> tag on a main commit produces one native beta release (README.md,
+# "Releases"): the complete CI, a draft GitHub pre-release with the CHANGELOG.md notes, one
+# reproducible archive and SHA-256 checksum per supported Linux target, and, after approval
+# of the `release` environment, the crates.io package and the published GitHub Release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  prepare:
+    name: Prepare release
+    needs: ci
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Require a tag on the main branch
+        run: git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
+
+      - name: Check version identity, changelog and package manifest
+        run: scripts/release.sh check --tag "${TAG}"
+
+      - name: Verify the crates.io package
+        run: cargo publish --dry-run --locked
+
+      # The beta series: every release is a GitHub pre-release until 1.0.0.
+      - name: Create the draft GitHub Release
+        run: |
+          scripts/release.sh notes "${TAG#v}" > "${RUNNER_TEMP}/release-notes.md"
+          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --verify-tag --draft \
+            --prerelease --title "maven-mcp ${TAG}" --notes-file "${RUNNER_TEMP}/release-notes.md"
+
+  artifacts:
+    name: Archive (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-26.04-arm
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: ${{ matrix.target }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Build and verify the reproducible release archive
+        run: scripts/release.sh archive "${TARGET}" "${RUNNER_TEMP}/dist"
+
+      - name: Upload the archive and checksum to the draft release
+        run: |
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            "${RUNNER_TEMP}/dist/maven-mcp-${TAG#v}-${TARGET}.tar.gz" \
+            "${RUNNER_TEMP}/dist/maven-mcp-${TAG#v}-${TARGET}.tar.gz.sha256"
+
+  publish:
+    name: Publish
+    needs: artifacts
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    # Publishing needs an explicit approval of this protected environment, which holds the
+    # CARGO_REGISTRY_TOKEN secret.
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Publish the GitHub Release
+        run: gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false
