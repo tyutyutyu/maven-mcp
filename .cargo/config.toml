@@ -1,0 +1,5 @@
+# x86_64-unknown-linux-gnu already links with rustc's bundled rust-lld. The aarch64
+# default is GNU ld, which turns std's weak glibc 2.39 references into a hard
+# requirement; scripts/cc-rust-lld.sh links with the bundled rust-lld instead.
+[target.aarch64-unknown-linux-gnu]
+linker = "scripts/cc-rust-lld.sh"

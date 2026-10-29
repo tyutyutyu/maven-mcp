@@ -444,6 +444,10 @@ Runtime requirements on both targets: a Linux kernel with a mounted procfs at
 `/proc`, and glibc 2.34 or newer (for example Ubuntu 22.04, Debian 12, or RHEL
 9). That is the newest glibc symbol version the release binaries require; newer
 functions such as `pidfd_spawnp` are weak references used only when present.
+Both targets link with the `rust-lld` bundled in the pinned toolchain (on
+`aarch64-unknown-linux-gnu` through `scripts/cc-rust-lld.sh`, configured in
+`.cargo/config.toml`), because GNU ld would turn those weak references into a
+hard glibc 2.39 requirement.
 The binaries link only `libc`, `libm`, `libgcc_s`, and the dynamic loader;
 SQLite is compiled in. `scripts/check-linux-binary.sh` fails CI when a release
 binary needs a newer glibc symbol version or links another shared library. The

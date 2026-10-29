@@ -123,6 +123,23 @@ fn ci_builds_and_tests_every_supported_linux_target_natively() -> Result<()> {
 }
 
 #[test]
+fn aarch64_links_with_the_bundled_lld_to_keep_newer_glibc_references_weak() -> Result<()> {
+    let config = read(".cargo/config.toml")?;
+    let aarch64 = config
+        .split("[target.aarch64-unknown-linux-gnu]")
+        .nth(1)
+        .context(".cargo/config.toml must configure aarch64-unknown-linux-gnu")?;
+    assert_eq!(
+        quoted_value(aarch64, "linker"),
+        Some("scripts/cc-rust-lld.sh")
+    );
+    let wrapper = read("scripts/cc-rust-lld.sh")?;
+    assert!(wrapper.contains("-fuse-ld=lld"));
+    assert!(wrapper.contains("bin/gcc-ld"));
+    Ok(())
+}
+
+#[test]
 fn required_ci_check_passes_only_when_every_job_passes() -> Result<()> {
     let workflow = ci_workflow()?;
     let jobs = workflow["jobs"].as_mapping().context("jobs")?;
