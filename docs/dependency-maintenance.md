@@ -2,20 +2,32 @@
 
 ## Automated updates
 
-Renovate (`renovate.json`) opens update pull requests for Cargo crates,
-GitHub Actions (pinned by digest), cargo-deny, and npx tool versions pinned in
-`scripts/`. Promptfoo updates also update the matching test assertion and README.
-No npm manifest or container image is used today; the `npm` and `dockerfile`
-managers are enabled so they are covered automatically if added.
+Renovate (`renovate.json`) opens update pull requests for:
+
+- Cargo crates and `Cargo.lock`;
+- the developer and CI Rust toolchain pinned in `rust-toolchain.toml`
+  (`rust-lang/rust` releases);
+- GitHub Actions (pinned by digest) and the CI Cargo tools `cargo-deny` and
+  `cargo-llvm-cov` (in the workflows, `scripts/`, `README.md`, and `AGENTS.md`);
+- the Node.js version in `.node-version` and the locked Node.js tools in
+  `tools/package.json` and `tools/package-lock.json` (MCP Inspector, Promptfoo,
+  and the npm `packageManager` pin).
+
+The minimum supported Rust version (`rust-version` in `Cargo.toml`) is not
+updated automatically. Raise it only by a deliberate decision; the `MSRV` CI job
+checks it. No container image is used today; the `dockerfile` manager is enabled
+so a future image is covered automatically.
 
 - Schedule: Mondays before 06:00 Europe/Budapest; at most 5 open PRs.
-- Grouping: Cargo minor/patch updates, GitHub Actions with cargo-deny, and npx
-  tools are each grouped; major updates get separate PRs.
+- Grouping: Cargo minor/patch updates, GitHub Actions with the CI Cargo tools,
+  the Rust toolchain, and the Node.js version with the npm tools are each
+  grouped. Major updates get separate PRs.
 - Lockfile maintenance runs monthly.
 - Security vulnerability PRs are raised immediately, labelled `security`.
 
-Every update PR must pass the required `CI` check, including dependency policy,
-before squash merge.
+Every update PR must pass the required `CI` check before squash merge. That
+check includes the dependency policy, the native Linux platform matrix, the MSRV
+check, and the locked Node.js tool install.
 
 ## Policy gate
 

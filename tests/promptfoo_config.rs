@@ -34,16 +34,20 @@ fn promptfoo_agent_eval_is_versioned_and_covers_required_request_classes() -> Re
             .is_some_and(|path| path.contains("PROMPTFOO_PROJECT_PATH"))
     }));
 
-    let script = std::fs::read_to_string("scripts/run-agent-eval.sh")?;
-    let promptfoo_version = script
-        .lines()
-        .find_map(|line| line.strip_prefix("PROMPTFOO_VERSION=\""))
-        .and_then(|rest| rest.strip_suffix('"'))
-        .expect("run-agent-eval.sh must pin PROMPTFOO_VERSION");
+    let tools: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string("tools/package.json")?)?;
+    let promptfoo_version = tools["devDependencies"]["promptfoo"]
+        .as_str()
+        .expect("tools/package.json must pin promptfoo");
     assert!(
         is_exact_semver(promptfoo_version),
-        "PROMPTFOO_VERSION must be an exact MAJOR.MINOR.PATCH pin, got {promptfoo_version:?}"
+        "promptfoo must be an exact MAJOR.MINOR.PATCH pin, got {promptfoo_version:?}"
     );
+
+    let script = std::fs::read_to_string("scripts/run-agent-eval.sh")?;
+    assert!(script.contains("node_tools_prepare"));
+    assert!(script.contains("\"$NODE_TOOLS_BIN/promptfoo\" eval"));
+    assert!(!script.contains("npx"));
     assert!(script.contains("MAVEN_TRUSTED_PROJECT_DIRECTORIES"));
     assert!(script.contains("MAVEN_EXECUTION_REPO_PATH"));
     assert!(script.contains("PROMPTFOO_PROJECT_PATH"));

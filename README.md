@@ -429,6 +429,57 @@ read error fails the request instead of being reported as a missing match.
 `META-INF/spring/*.imports`. Spring `.handlers` and `.schemas` files are not
 provider descriptors and therefore are not included in this structured view.
 
+## Supported Platforms
+
+The first release supports Linux only, as native binaries (a container image is
+not a substitute platform). Every target below is built and tested natively in
+the required `CI` check:
+
+| Target | CI runner | Verified in CI |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | `ubuntu-26.04` | full gate (format, Clippy, every test target, 80% line coverage), release build, binary check |
+| `aarch64-unknown-linux-gnu` | `ubuntu-26.04-arm` | every test target, release build, binary check |
+
+Runtime requirements on both targets: a Linux kernel with a mounted procfs at
+`/proc`, and glibc 2.34 or newer (for example Ubuntu 22.04, Debian 12, or RHEL
+9). That is the newest glibc symbol version the release binaries require; newer
+functions such as `pidfd_spawnp` are weak references used only when present.
+The binaries link only `libc`, `libm`, `libgcc_s`, and the dynamic loader;
+SQLite is compiled in. `scripts/check-linux-binary.sh` fails CI when a release
+binary needs a newer glibc symbol version or links another shared library. The
+test suite itself runs on the Ubuntu 26.04 CI runners only. Maven runs in its own process group, which is killed on timeout,
+cancellation, EOF, SIGINT, and SIGTERM; `maven-mcp stats` decides whether an
+instance is live from `/proc/<pid>` and reads RSS from `/proc/self/status`.
+Without a mounted procfs, `maven-mcp stats` exits with an error instead of
+reporting any instance as live or stale.
+
+Not supported: macOS, Windows, the BSDs, and other operating systems. The
+process-group cleanup and procfs checks above are Linux-specific, so building
+for any non-Linux target stops with an explicit `compile_error!` that names this
+section rather than producing a binary with untested behavior. Linux targets
+outside the table (for example musl/Alpine, 32-bit, or other architectures) are
+untested and have no CI coverage or release artifacts. A new platform needs a
+separate product decision plus its own CI job.
+
+Toolchains:
+
+- Rust: development and CI use the exact toolchain pinned in
+  `rust-toolchain.toml` (rustup installs it, with `clippy`, `rustfmt`, and
+  `llvm-tools-preview`, on first use). The minimum supported Rust version is
+  `rust-version` in `Cargo.toml` (1.89). A separate `MSRV` CI job checks every
+  target with that version and the unchanged `Cargo.lock`.
+- Node.js (only for MCP Inspector and the Promptfoo agent eval): the version
+  pinned in `.node-version`, with the npm version pinned by `packageManager` in
+  `tools/package.json`. The scripts reject a different Node.js major version
+  and any npm version other than the exact `packageManager` pin; the `Node tools`
+  CI job installs exactly that npm version and checks it. The tools are installed only by `npm ci` from
+  `tools/package-lock.json`, which verifies every package against its recorded
+  integrity hash. The scripts never call `npx`.
+- Renovate proposes updates to the Rust toolchain pin, the Node.js version, the
+  locked npm tools, Cargo crates, CI Cargo tools, and GitHub Actions on its weekly
+  schedule (see [Dependency Maintenance](#dependency-maintenance)). Every update
+  must pass `CI`.
+
 ## Native STDIO startup
 
 ```bash
@@ -1151,8 +1202,9 @@ PROMPTFOO_PROVIDER="openai:responses:gpt-5-mini" task dev:agent-eval
 ```
 
 `dev:verify` runs the complete existing `scripts/test-pyramid.sh` gate. The
-Inspector and agent-eval tasks require `npx`; both launch the MCP binary
-directly over STDIO.
+Inspector and agent-eval tasks require the Node.js and npm versions pinned in
+`.node-version` and `tools/package.json`. They install the locked tools with
+`npm ci`, and both launch the MCP binary directly over STDIO.
 
 ## Local Development
 
@@ -1317,12 +1369,26 @@ execution is not a sandbox: plugins and tests run with your permissions.
 
 GitHub Actions runs the same verification gate from
 `.github/workflows/ci.yml` for pushes to `main` and pull requests targeting
-`main`. The workflow installs Rust `1.89.0`, uses the committed `Cargo.lock`,
-and runs `scripts/test-pyramid.sh` on Ubuntu, including the same 80% line
-coverage gate. The `target/coverage/` report is uploaded as the
-`rust-coverage-report` artifact even when the gate fails. It has read-only repository
-permissions, does not persist checkout credentials, and uses no dependency
-cache. Its job and status-check context are both named `CI`.
+`main`. Every job uses the committed `Cargo.lock` and installs the Rust
+toolchain pinned in `rust-toolchain.toml`, except `MSRV`:
+
+- `Gate (x86_64-unknown-linux-gnu)` runs `cargo deny` and
+  `scripts/test-pyramid.sh`, including the same 80% line coverage gate. The
+  `target/coverage/` report is uploaded as the `rust-coverage-report` artifact
+  even when the gate fails.
+- `Platform (<target>)` builds the release binary natively for every
+  [supported target](#supported-platforms) and checks it with
+  `scripts/check-linux-binary.sh`. On `aarch64-unknown-linux-gnu`, it also runs
+  every Cargo test target.
+- `MSRV` runs `cargo check --locked --all-targets --all-features` with the
+  `rust-version` from `Cargo.toml`.
+- `Node tools` installs the pinned Node.js, runs `npm ci` for the locked tools,
+  and lists the server's tools through the MCP Inspector CLI. No model provider
+  is called.
+- `CI` passes only when every job above passed. It is the required status check.
+
+The workflow has read-only repository permissions, does not persist checkout
+credentials, and uses no dependency cache.
 
 The active default-branch ruleset requires a pull request and a successful,
 up-to-date `CI` check before merging. It requires zero approving reviews for
@@ -1332,7 +1398,8 @@ for `CI`, then squash merge. The repository deletes the branch after merging.
 
 ### Dependency Maintenance
 
-Renovate opens grouped update pull requests. The required `CI` job runs
+Renovate opens grouped update pull requests, including the pinned Rust
+toolchain, Node.js version, and locked npm tools. The required `CI` check runs
 `cargo deny` for advisories, licenses and sources on every pull request and push
 to `main`; the `Dependency policy` workflow also scans daily. See
 [docs/dependency-maintenance.md](docs/dependency-maintenance.md) for the policy,
@@ -1352,7 +1419,7 @@ export OPENAI_API_KEY="..." # or the standard environment secret for your provid
 scripts/run-agent-eval.sh
 ```
 
-The script pins Promptfoo `0.125.1`, regenerates a marker-protected,
+The script runs the Promptfoo version locked in `tools/package-lock.json`, regenerates a marker-protected,
 request-scoped project fixture under `target/promptfoo/fixture` from Rust,
 configures its trusted project directory and local execution repository, and
 passes the generated absolute `project_path` to every MCP request. Promptfoo
@@ -1369,8 +1436,9 @@ upload it as a CI artifact.
 Neither `scripts/test-pyramid.sh` nor the `CI` workflow runs this evaluation;
 only the offline check of its configuration file is part of the gate. It calls
 a real, usually paid model provider, so run it only when that cost is
-intentionally accepted. Without `PROMPTFOO_PROVIDER` or `npx`, the script stops
-with exit code 2 before building anything.
+intentionally accepted. Without `PROMPTFOO_PROVIDER`, or without Node.js of the
+pinned major version and exactly the pinned npm version, the script stops with
+exit code 2 before building anything.
 
 Start MCP Inspector with the fixture repository:
 

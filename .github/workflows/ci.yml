@@ -15,9 +15,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The supported native platform matrix is Linux on x86_64 and aarch64 (glibc). Every job
+# installs the Rust toolchain pinned in rust-toolchain.toml unless it checks the MSRV. The
+# required status check is the final `CI` job, which passes only when every job passed.
 jobs:
-  verify:
-    name: CI
+  gate:
+    name: Gate (x86_64-unknown-linux-gnu)
     runs-on: ubuntu-26.04
     timeout-minutes: 30
 
@@ -27,10 +30,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust toolchain
+      - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt,llvm-tools-preview
-          rustup default 1.89.0
+          rustup toolchain install
+          rustc --version
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.0 --locked
@@ -56,3 +59,127 @@ jobs:
           path: target/coverage/
           if-no-files-found: warn
           retention-days: 14
+
+  platform:
+    name: Platform (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The gate already runs every test target on x86_64 under coverage.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+            run-tests: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-26.04-arm
+            run-tests: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Require a native build for the target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "${host}" = "${TARGET}"
+
+      - name: Run every Cargo test target
+        if: matrix.run-tests
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Check release binary platform requirements
+        run: |
+          scripts/check-linux-binary.sh target/release/maven-mcp \
+            target/release/maven-agent-log target/release/maven-benchmark \
+            target/release/maven-eval-fixture
+          target/release/maven-mcp --version
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The MSRV is the Cargo.toml rust-version; it is checked with the unchanged Cargo.lock.
+      - name: Check every target with the minimum supported Rust version
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "${msrv}"
+          rustup toolchain install "${msrv}" --profile minimal
+          cargo "+${msrv}" --version
+          cargo "+${msrv}" check --locked --all-targets --all-features
+
+  node-tools:
+    name: Node tools
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      # The npm bundled with Node.js may differ from the packageManager pin; install the
+      # exact pinned version so the locked install always runs under it.
+      - name: Install pinned npm
+        run: |
+          pinned_npm="$(node -p 'require("./tools/package.json").packageManager.replace(/^npm@/, "")')"
+          npm install -g "npm@${pinned_npm}"
+          test "$(npm --version)" = "${pinned_npm}"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      # npm ci installs the locked, integrity-checked Inspector and Promptfoo; the
+      # Inspector CLI then lists the tools of the real binary. No provider is called.
+      - name: List MCP tools through the locked Inspector
+        run: |
+          mkdir -p target
+          scripts/run-inspector.sh --cli --method tools/list > target/inspector-tools.json
+          grep -q '"name": "search_classes"' target/inspector-tools.json
+          tools/node_modules/.bin/promptfoo --version
+
+  ci:
+    name: CI
+    if: always()
+    needs: [gate, platform, msrv, node-tools]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Require every platform and toolchain job
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            test "${result}" = success
+          done
