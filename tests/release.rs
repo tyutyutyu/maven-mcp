@@ -635,6 +635,10 @@ fn readme_documents_the_beta_channels_versioning_upgrade_and_rollback() -> Resul
         "sha256sum --check",
         "cargo install maven-mcp --version",
         "CHANGELOG.md",
+        "### Maturity, support and deprecation",
+        "**Breaking:**",
+        "`Deprecated:`",
+        "only the latest release is supported",
     ] {
         assert!(readme.contains(statement), "README.md misses {statement:?}");
     }

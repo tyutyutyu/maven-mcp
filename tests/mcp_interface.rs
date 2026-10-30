@@ -2923,6 +2923,93 @@ async fn failed_refresh_is_an_error_and_leaves_the_project_invalidated() -> Resu
     Ok(())
 }
 
+/// The `json` code blocks below one README heading, in order, up to the next heading.
+fn readme_json_blocks(heading: &str) -> Result<Vec<Value>> {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))?;
+    anyhow::ensure!(
+        readme.lines().any(|line| line == heading),
+        "README.md misses {heading:?}"
+    );
+    let mut lines = readme.lines().skip_while(|line| *line != heading).skip(1);
+    let mut blocks = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.starts_with('#') {
+            break;
+        }
+        if let Some(language) = line.strip_prefix("```") {
+            let block: Vec<&str> = lines.by_ref().take_while(|line| *line != "```").collect();
+            if language == "json" {
+                blocks.push(serde_json::from_str(&block.join("\n"))?);
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+fn object_keys(value: &Value) -> BTreeSet<&str> {
+    value
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_documented_refresh_example_runs_and_reports_the_documented_fields() -> Result<()> {
+    let blocks = readme_json_blocks("### Explicit refresh")?;
+    let [request, documented] = blocks.as_slice() else {
+        panic!("Explicit refresh must document one request and one response: {blocks:?}");
+    };
+    assert_eq!(request["method"], "tools/call", "{request}");
+    let tool = request["params"]["name"]
+        .as_str()
+        .expect("the example names a tool");
+    let mut arguments = request["params"]["arguments"].clone();
+    assert_eq!(object_keys(&arguments), BTreeSet::from(["project_path"]));
+    assert!(
+        arguments["project_path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute()),
+        "the documented project_path must be absolute: {arguments}"
+    );
+
+    let (server, project) = controlled_project().await?;
+    let (client, _) = server.connect_with_limits(LONG_MAVEN).await?;
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.AlphaOne"])
+    );
+    // A classpath change that no stamp shows, the case the refresh workflow exists for.
+    support::set_controlled_classpath(&project, &[repository_jar(&project, "beta")])?;
+    arguments["project_path"] = json!(project.display().to_string());
+    let refreshed = call(&client, tool, arguments).await?;
+
+    assert_eq!(object_keys(&refreshed), object_keys(documented));
+    assert_eq!(
+        object_keys(&refreshed["index"]),
+        object_keys(&documented["index"])
+    );
+    for (field, value) in documented.as_object().expect("a JSON object") {
+        if field != "index" {
+            assert_eq!(&refreshed[field], value, "{field} in {refreshed}");
+        }
+    }
+    for (field, count) in refreshed["index"].as_object().expect("index statistics") {
+        assert!(count.is_u64(), "{field} must be a count: {refreshed}");
+    }
+    assert_eq!(refreshed["index"]["jar_count"], 1, "{refreshed}");
+    assert_eq!(
+        class_names(&client, &project, "One").await?,
+        names(&["org.t.BetaOne"]),
+        "after the documented refresh the next search sees the change"
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    client.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn incomplete_classpath_output_is_an_error_and_never_cached_as_complete() -> Result<()> {
     let (server, project) = controlled_project().await?;
