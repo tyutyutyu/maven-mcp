@@ -221,6 +221,61 @@ truncated or malformed (for example cut off by `MAX_MAVEN_OUTPUT_BYTES`), the
 request fails with an explicit error instead of caching an index that would be
 incomplete; nothing is cached, so the next request retries.
 
+### Index lifecycle
+
+The project index goes through these stages. The sections that follow describe
+each check in detail.
+
+1. **Server startup.** The MCP host starts the process. Startup reads only the
+   environment configuration. It does not scan `~/.m2/repository`, select a
+   project, or start Maven. `initialize` and `tools/list` answer right away.
+   Tools that need no index never build one: `inspect_maven_project`,
+   `get_artifact_pom`, `diagnose_artifact`, `compare_artifact_api`, the JaCoCo
+   tools, and the Maven execution and diagnostic tools. The Maven tools start
+   Maven only for their own request.
+2. **First index-dependent request of a project.** The index-dependent tools are
+   `index_stats`, every `search_*` tool, `list_jar_classes`,
+   `list_artifact_versions`, `get_class_source`, `get_jar_entry`,
+   `get_declaration_source`, `describe_class` and `refresh_maven_project`. The
+   first such request for a canonical `project_path` reads the reactor model and
+   resolves the project's classpath. If the
+   [persistent index cache](#persistent-index-cache) holds a valid classpath for
+   the project, that classpath is reused. Otherwise Maven runs
+   `dependency:build-classpath`. Then the index is built from the classpath
+   entries, reusing every valid stored record, and is kept in memory for that
+   project. Concurrent first requests share one build.
+3. **Later requests in the same process.** Every request checks the stamps listed
+   in [Project index cache](#project-index-cache). While they are unchanged, the
+   in-memory index is reused without starting Maven. The memory limits can also
+   evict an index. The next request then rebuilds it like a first request.
+4. **A new process.** Restarting the host session or its MCP server, a crash, or
+   an upgrade all start with empty in-memory caches. The first request of each
+   project starts again at step 2. The persistent cache can only shorten that
+   step, and only when all of its checks pass.
+
+How a change reaches the index:
+
+| Change | Detected | Effect |
+| --- | --- | --- |
+| Root or module `pom.xml` edited, added or removed | automatically, on the next request | The reactor model is read again and the index is dropped. The classpath is resolved through Maven again, because the stored classpath is keyed by the same POM stamps. |
+| Maven Wrapper (`mvnw`, `.mvn/wrapper/maven-wrapper.properties`), Maven executable, `.mvn/maven.config`, `.mvn/jvm.config`, `.mvn/extensions.xml` | automatically, on the next request | Same as a POM change. The runner, including the wrapper or `mvn` selection, is rediscovered. |
+| A classpath JAR or its `-sources.jar` modified, or a `.class` file below a classpath class directory edited, added or removed | automatically, on the next request | The index is dropped and rebuilt. With the persistent cache, a still-valid stored classpath is reused, so Maven does not run, and only the changed entry is read again. Without the persistent cache, Maven resolves the classpath again. |
+| A classpath JAR deleted | automatically, on the next request | The index is dropped, and the stored classpath is not reused, so Maven resolves the classpath again. |
+| `run_maven` or `run_maven_lifecycle` finished | always | The model is read again, the index is dropped, and the project's stored classpath is forgotten. |
+| A parent POM outside the project, `settings.xml`, `toolchains.xml`, a Maven installation's `conf`, an imported BOM, or a dependency re-resolved outside this server (for example a new SNAPSHOT) | not by the in-memory cache | Call `refresh_maven_project` (see [Explicit refresh](#explicit-refresh)). After a restart, the persistent cache checks most of these inputs before it reuses a classpath. Only the explicit refresh covers every case. |
+| Environment variables, `--jenv`, or the binary itself (an upgrade) | at process start only | Restart the host session or its MCP server. Configuration is read once, at startup. |
+
+Two workflows follow from this:
+
+- **Refresh.** `refresh_maven_project` brings one project up to date in a
+  running server. It is a regular MCP tool call, so agents and scripts can
+  automate it. Other projects are not affected.
+- **Restart.** Restart the MCP server after a configuration change, an upgrade or
+  a rollback. To make every restart cold, disable the persistent cache with
+  `MAVEN_MCP_INDEX_CACHE=false` or delete its directory.
+
+No file watcher or background refresh runs. Every check happens inside a request.
+
 ### Project index cache
 
 The runner (reactor model) and the index of one project share a validity check
@@ -356,9 +411,44 @@ repository; with `MAVEN_EXECUTION_NETWORK=true` Maven may download missing
 artifacts into the configured repository (`MAVEN_EXECUTION_REPO_PATH` or
 `$HOME/.m2/repository`), exactly as any cold request would.
 
-The response is `{ "status": "refreshed", "invalidated": true,
-"model_reloaded": true, "index_rebuilt": true, "index": { ...index_stats } }` and
-is returned only after the new index exists. Failures come in two kinds:
+An MCP client starts a refresh with a regular `tools/call` request. Replace
+the `project_path` with the absolute root of a project inside
+`MAVEN_TRUSTED_PROJECT_DIRECTORIES`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "refresh_maven_project",
+    "arguments": { "project_path": "/home/me/projects/my-service" }
+  }
+}
+```
+
+The call returns only after the new index exists. Its `structuredContent` holds
+the outcome flags and the statistics of the rebuilt index; the counts depend on
+the project:
+
+```json
+{
+  "status": "refreshed",
+  "invalidated": true,
+  "model_reloaded": true,
+  "index_rebuilt": true,
+  "index": {
+    "jar_count": 42,
+    "source_jar_count": 17,
+    "class_count": 18250,
+    "unique_class_count": 18113,
+    "artifact_count": 42
+  }
+}
+```
+
+`tests/mcp_interface.rs` runs this example against the real server binary, so
+the request and the response fields stay accurate. Failures come in two kinds:
 
 - A `project_path` that fails validation (relative, missing, not a Maven project,
   or outside `MAVEN_TRUSTED_PROJECT_DIRECTORIES`) is a plain MCP error raised
@@ -534,6 +624,55 @@ SHA-256 (see [Creating a release](#creating-a-release)).
   `maven_mcp` crate, human-readable text and log output, runtime status files,
   and the on-disk index cache format, which is derived data and is rebuilt when
   it changes.
+
+### Maturity, support and deprecation
+
+- **Maturity.** `maven-mcp` is beta software. In the `0.y.z` releases, the
+  documented features work and are tested, but the public interface above can
+  still change between minor versions. GitHub marks every beta release as a
+  pre-release.
+- **Supported platforms.** Only the Linux targets in
+  [Supported Platforms](#supported-platforms) are supported. They are the only
+  targets that get release archives, CI coverage and fixes. Removing a supported
+  target is a breaking change. Adding a target needs a separate decision and its
+  own CI job. The minimum supported Rust version (1.89) applies to crates.io
+  builds. During the beta it is raised only in a minor release, and the raise is
+  listed under `Changed` in the changelog.
+- **Compatibility promise.** A patch release (`0.y.z` to `0.y.z+1`) never breaks
+  the public interface. A minor release (`0.y` to `0.y+1`) may break it. From
+  `1.0.0` on, only a major release may break it.
+- **Breaking changes.** A breaking change is any of these:
+  - a removed or renamed tool, input field, output field, command, flag,
+    `stats --json` field or environment variable;
+  - an optional input that becomes required;
+  - a changed type or meaning of a field;
+  - a stricter accepted input;
+  - a changed default that alters results;
+  - a change between an empty success and an MCP error;
+  - a removed supported platform.
+
+  Every breaking change ships in a minor release (a major one after `1.0.0`). Its
+  changelog entry starts with **Breaking:** and says what to change.
+- **Deprecation.** A part of the public interface that has a replacement is
+  deprecated before it is removed. The deprecation appears in four places:
+  - an entry in the changelog's `Deprecated` group that names the replacement;
+  - a note in this README;
+  - for MCP tools and fields, a description that starts with `Deprecated:`;
+  - for CLI flags and environment variables, a warning on stderr.
+
+  A deprecated part keeps working unchanged until it is removed. During the beta,
+  removal comes no earlier than the next minor release after the deprecation was
+  released. From `1.0.0` on, removal comes only in a major release. The removal
+  is a `Removed` changelog entry marked **Breaking:**. A part without a
+  replacement, or a change forced by a security problem, can skip the
+  deprecation step. It still follows the versioning rules: a minor release during
+  the beta, a major release after it.
+- **Support period.** During the beta, only the latest release is supported.
+  Fixes, including security fixes, ship only as a new release of the newest
+  `0.y` series. They are never backported to older series. Report a problem only
+  after you reproduce it on the latest release. Older archives stay downloadable.
+  A broken crates.io version may be yanked. There is no long-term support line.
+  The support period for stable versions will be published with `1.0.0`.
 
 ### Changelog and release notes
 

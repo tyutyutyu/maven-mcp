@@ -28,3 +28,6 @@ becomes the GitHub Release notes.
 - Versioned local installation with candidate, stable, and previous aliases.
 - Native Linux release archives for `x86_64-unknown-linux-gnu` and
   `aarch64-unknown-linux-gnu` with SHA-256 checksums, and the crates.io package.
+- Documented index lifecycle (startup, first request, reuse, change detection,
+  refresh and restart) and the beta maturity, compatibility, deprecation, and
+  support policy.
