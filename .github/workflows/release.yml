@@ -1,9 +1,10 @@
 name: Release
 
 # A pushed v<version> tag on a main commit produces one native beta release (README.md,
-# "Releases"): the complete CI, a draft GitHub pre-release with the CHANGELOG.md notes, one
-# reproducible archive and SHA-256 checksum per supported Linux target, and, after approval
-# of the `release` environment, the crates.io package and the published GitHub Release.
+# "Releases"): the complete Verify workflow, a draft GitHub pre-release with the CHANGELOG.md
+# notes, one reproducible archive and SHA-256 checksum per supported Linux target, and, after
+# approval of the `release` environment, the crates.io package and the published GitHub
+# Release.
 on:
   push:
     tags:
@@ -17,15 +18,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ci:
-    name: CI
-    uses: ./.github/workflows/ci.yml
+  verify:
+    name: Verify
+    uses: ./.github/workflows/verify.yml
     permissions:
       contents: read
 
   prepare:
     name: Prepare release
-    needs: ci
+    needs: verify
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:

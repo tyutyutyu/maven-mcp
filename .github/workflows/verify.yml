@@ -1,4 +1,4 @@
-name: CI
+name: Verify
 
 on:
   push:
@@ -7,19 +7,20 @@ on:
   pull_request:
     branches:
       - main
-  # The Release workflow runs the complete CI on the release tag before building artifacts.
+  # The Release workflow runs this complete workflow on the release tag before building
+  # artifacts.
   workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 # The supported native platform matrix is Linux on x86_64 and aarch64 (glibc). Every job
 # installs the Rust toolchain pinned in rust-toolchain.toml unless it checks the MSRV. The
-# required status check is the final `CI` job, which passes only when every job passed.
+# required status check is the final `verify` job, which passes only when every job passed.
 jobs:
   gate:
     name: Gate (x86_64-unknown-linux-gnu)
@@ -169,8 +170,8 @@ jobs:
           grep -q '"name": "search_classes"' target/inspector-tools.json
           tools/node_modules/.bin/promptfoo --version
 
-  ci:
-    name: CI
+  verify:
+    name: verify
     if: always()
     needs: [gate, platform, msrv, node-tools]
     runs-on: ubuntu-26.04

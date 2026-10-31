@@ -562,10 +562,10 @@ fn run_commands(job: &Yaml) -> String {
 
 #[test]
 fn release_workflow_gates_builds_and_publishes_the_selected_channels() -> Result<()> {
-    let ci = workflow("ci.yml")?;
+    let verify = workflow("verify.yml")?;
     assert!(
-        ci["on"].get("workflow_call").is_some(),
-        "the release must be able to run the complete CI"
+        verify["on"].get("workflow_call").is_some(),
+        "the release must be able to run the complete Verify workflow"
     );
 
     let release = workflow("release.yml")?;
@@ -581,10 +581,10 @@ fn release_workflow_gates_builds_and_publishes_the_selected_channels() -> Result
 
     let jobs = &release["jobs"];
     assert_eq!(
-        jobs["ci"]["uses"].as_str(),
-        Some("./.github/workflows/ci.yml")
+        jobs["verify"]["uses"].as_str(),
+        Some("./.github/workflows/verify.yml")
     );
-    assert_eq!(jobs["prepare"]["needs"].as_str(), Some("ci"));
+    assert_eq!(jobs["prepare"]["needs"].as_str(), Some("verify"));
     let prepare = run_commands(&jobs["prepare"]);
     for command in [
         "git merge-base --is-ancestor",
