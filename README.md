@@ -5,6 +5,105 @@ An MCP host such as Codex or GitHub Copilot starts the binary as a child process
 and communicates with it exclusively over STDIO. Startup does not scan
 `~/.m2/repository` and does not require a preselected project.
 
+## Getting started
+
+These steps take you from a published release archive to an MCP host that starts
+`maven-mcp` by itself over STDIO. You never start, stop or expose the server: there
+is no daemon, port, URL, Docker image or Compose file. The host starts the binary
+when a session needs it and stops it when the session ends.
+
+Releases are published on the
+[GitHub Releases](https://github.com/tyutyutyu/maven-mcp/releases) page (see
+[Releases](#releases)). If that page lists no release yet, no version has been
+published. In that case, build and install a commit-identified binary from a source
+checkout (see [Versioned local installation](#versioned-local-installation)), then
+continue at step 3 with `<root>/stable/maven-mcp` as the binary path.
+
+1. **Check the prerequisites.**
+   - Linux on `x86_64` or `aarch64` with glibc 2.34 or newer and a mounted `/proc`
+     (see [Supported Platforms](#supported-platforms)), plus `curl`, `sha256sum`
+     and `tar`.
+   - A JDK that your project builds with. Maven needs either the project's
+     Maven Wrapper (an executable `mvnw` plus
+     `.mvn/wrapper/maven-wrapper.properties`) or an installed Maven, passed as the
+     absolute path in `MAVEN_EXECUTABLE`.
+   - An MCP host: the [Codex CLI](#codex-project-configuration) or the
+     [GitHub Copilot CLI](#github-copilot-cli-configuration).
+
+2. **Download, verify and install the archive.** Set `version` to the newest
+   release, without the leading `v`, and `target` to your architecture:
+
+   ```bash
+   cd "$(mktemp -d)"
+   version=0.1.0                      # the release to install
+   target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu
+   archive="maven-mcp-${version}-${target}.tar.gz"
+   url="https://github.com/tyutyutyu/maven-mcp/releases/download/v${version}"
+   curl -fLO "${url}/${archive}" -fLO "${url}/${archive}.sha256"
+   sha256sum --check "${archive}.sha256"
+
+   releases="${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp/releases"
+   mkdir -p "${releases}"
+   tar -xzf "${archive}" -C "${releases}"
+   "${releases}/maven-mcp-${version}-${target}/maven-mcp" --version
+   ln -sfn "maven-mcp-${version}-${target}" "${releases}/current"
+   "${releases}/current/maven-mcp" --version
+   ```
+
+   `sha256sum --check` must print `OK`. Both `--version` calls must print
+   `maven-mcp <version> (commit <40-hex commit>)`. From now on, the host command is
+   the absolute path of `${releases}/current/maven-mcp`, for example
+   `/home/<user>/.local/share/maven-mcp/releases/current/maven-mcp`. Each version
+   keeps its own directory, so [upgrades and rollbacks](#upgrade-and-rollback) only
+   move the `current` symlink.
+
+3. **Choose the trusted tree and prepare the project.** Pick an existing absolute
+   directory that contains the Maven projects the agent may use, for example
+   `/home/<user>/work/trusted-projects`. It becomes
+   `MAVEN_TRUSTED_PROJECT_DIRECTORIES` in the host configuration. Without it, every
+   project tool is refused (see [Opt-in Project Execution](#opt-in-project-execution)).
+   Every tool call names its project by `project_path`: the absolute directory of
+   the root `pom.xml`, inside that tree. The structured Maven tools run Maven
+   offline by default, so fill the local Maven repository once while you are
+   online, from the project directory:
+
+   ```bash
+   cd /home/<user>/work/trusted-projects/my-service
+   ./mvnw -B dependency:go-offline dependency:sources
+   ```
+
+   Use `mvn` instead of `./mvnw` when the project has no wrapper.
+   `dependency:sources` downloads the `-sources.jar` files that the source tools
+   read; skip it if you do not need sources. If you prefer that Maven downloads
+   missing artifacts when it needs them, set `MAVEN_EXECUTION_NETWORK=true` in the
+   host configuration instead.
+
+4. **Configure the MCP host.** Add the project-level configuration of
+   [Codex](#codex-project-configuration) or
+   [GitHub Copilot CLI](#github-copilot-cli-configuration) to the repository you
+   open the agent in. Set `command` to the absolute binary path from step 2 and
+   `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to the tree from step 3. The examples pass
+   `--jenv`; keep it only if you select Java versions with jenv (see
+   [Request-scoped jenv Java selection](#request-scoped-jenv-java-selection)).
+   Without it, Maven uses the Java environment that the host passes to the
+   server; the host sections say which variables that includes.
+
+5. **Verify the connection.** In Codex, `codex mcp list`, run in the configured
+   repository, must list `maven-mcp`. Copilot CLI loads the workspace server when
+   a session starts in a trusted folder. Start a new agent session in that
+   repository and ask, for example:
+
+   > Use the maven-mcp `inspect_maven_project` tool with `project_path`
+   > `/home/<user>/work/trusted-projects/my-service`, then use `search_classes`
+   > for `RestController`.
+
+   `inspect_maven_project` answers at once, because it reads only the POMs. The
+   first `search_classes` call of a project resolves the classpath through Maven
+   and builds the project index. That takes seconds to a few minutes, depending
+   on the size of the classpath. Later calls reuse the index, and a new host
+   session reuses the [persistent index cache](#persistent-index-cache). If a step
+   fails, see [Troubleshooting](#troubleshooting).
+
 ## Features
 
 Every repository- or project-dependent MCP tool requires a `project_path`
@@ -701,26 +800,12 @@ keeps the entries of each tool version apart and rebuilds on a format change,
 so both upgrading and downgrading reuse or rebuild it safely.
 
 From GitHub Releases, keep each version in its own directory and point the MCP
-host at a `current` symlink:
-
-```bash
-version=0.1.0                      # the release to install
-target=x86_64-unknown-linux-gnu    # or aarch64-unknown-linux-gnu
-archive="maven-mcp-${version}-${target}.tar.gz"
-url="https://github.com/tyutyutyu/maven-mcp/releases/download/v${version}"
-curl -fLO "${url}/${archive}" -fLO "${url}/${archive}.sha256"
-sha256sum --check "${archive}.sha256"
-
-releases="${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp/releases"
-mkdir -p "${releases}"
-tar -xzf "${archive}" -C "${releases}"
-"${releases}/maven-mcp-${version}-${target}/maven-mcp" --version
-ln -sfn "maven-mcp-${version}-${target}" "${releases}/current"
-```
-
-Configure the host command as `<releases>/current/maven-mcp`. To upgrade, run
-the same steps with the new version; the previous directory stays in place. To
-roll back, point `current` at the previous directory again, for example
+host at a `current` symlink: the installation in step 2 of
+[Getting started](#getting-started) does exactly that, and checks the archive with
+`sha256sum --check`. Configure the host command as `<releases>/current/maven-mcp`.
+To upgrade, run the same step with the new version; the previous directory stays
+in place. To roll back, point `current` at the previous directory again, for
+example
 `ln -sfn maven-mcp-0.1.0-x86_64-unknown-linux-gnu "${releases}/current"`.
 Verify either step with `"${releases}/current/maven-mcp" --version`, which must
 print the selected version and its commit, and with the `serverInfo.version`
@@ -801,8 +886,9 @@ task dev:build-release
 
 `task dev:build` creates a debug binary under `target/debug/` instead.
 
-For day-to-day use, install a verified, versioned copy instead of pointing an
-MCP host at the source worktree (see
+For day-to-day use, install a release archive (see
+[Getting started](#getting-started)) or a verified, versioned local copy instead
+of pointing an MCP host at the source worktree (see
 [Versioned local installation](#versioned-local-installation)). Configure the
 MCP host to run the installed binary and pass request `project_path` values in
 tool calls. The host owns process startup, shutdown, and STDIO; there is no port,
@@ -896,34 +982,56 @@ alias path.
 
 ### Codex project configuration
 
-In a trusted project, add `.codex/config.toml` with the absolute path of the
-selected alias and the trusted Maven project directories:
+Add `.codex/config.toml` to the root of the repository that you open Codex in.
+Codex reads a project's `.codex/config.toml` only after you trust the project;
+it asks the first time you start Codex there. Use absolute paths:
 
 ```toml
 [mcp_servers.maven-mcp]
-command = "/home/<user>/.local/share/maven-mcp/stable/maven-mcp"
+command = "/home/<user>/.local/share/maven-mcp/releases/current/maven-mcp"
 args = ["--jenv"]
-env = { MAVEN_TRUSTED_PROJECT_DIRECTORIES = "/absolute/path/to/trusted-projects" }
-startup_timeout_sec = 300
+env = { MAVEN_TRUSTED_PROJECT_DIRECTORIES = "/home/<user>/work/trusted-projects" }
+tool_timeout_sec = 300
 ```
 
-Alternatively, register the same STDIO command with `codex mcp add`. Verify it
-with `codex mcp get maven-mcp`, `codex mcp list`, or `/mcp`. See the
+`tool_timeout_sec` gives the first index-dependent call of a project (see
+[Index lifecycle](#index-lifecycle)) as long as one Maven run may take
+(`MAVEN_TIMEOUT_SECONDS`, 300 by default). Codex's default tool timeout is
+shorter. Startup itself takes milliseconds, so the default startup timeout is
+enough. Codex starts STDIO servers with a reduced environment: only `HOME`,
+`LANG`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER` and the `env` entries are
+passed on. Without `--jenv`, add `JAVA_HOME` to `env` when Maven must not use the
+`java` found on `PATH`.
+
+Alternatively, register the same STDIO command as a user server:
+
+```bash
+codex mcp add \
+  --env MAVEN_TRUSTED_PROJECT_DIRECTORIES=/home/<user>/work/trusted-projects \
+  maven-mcp -- /home/<user>/.local/share/maven-mcp/releases/current/maven-mcp --jenv
+```
+
+Verify it with `codex mcp get maven-mcp`, `codex mcp list`, or `/mcp` in a
+session, run in the configured repository. A project-level server is listed only
+in a trusted project. By default, Codex asks you to approve each MCP tool call; a
+non-interactive `codex exec` run with `approval_policy = "never"` fails those
+calls unless the server sets `default_tools_approval_mode = "approve"`. See the
 [official Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
 
 ### GitHub Copilot CLI configuration
 
-Copilot CLI defaults local commands to STDIO. In a trusted folder, add the same
-alias as a workspace server in `.github/mcp.json` (or `.mcp.json`):
+Copilot CLI defaults local commands to STDIO. Add the server as a workspace
+server in `.github/mcp.json` (or `.mcp.json`) of the repository that you open
+Copilot in:
 
 ```json
 {
   "mcpServers": {
     "maven-mcp": {
       "type": "local",
-      "command": "/home/<user>/.local/share/maven-mcp/stable/maven-mcp",
+      "command": "/home/<user>/.local/share/maven-mcp/releases/current/maven-mcp",
       "args": ["--jenv"],
-      "env": { "MAVEN_TRUSTED_PROJECT_DIRECTORIES": "/absolute/path/to/trusted-projects" },
+      "env": { "MAVEN_TRUSTED_PROJECT_DIRECTORIES": "/home/<user>/work/trusted-projects" },
       "tools": ["*"],
       "timeout": 300000
     }
@@ -931,17 +1039,26 @@ alias as a workspace server in `.github/mcp.json` (or `.mcp.json`):
 }
 ```
 
+Copilot loads workspace servers only in a trusted folder: trust the folder when
+Copilot asks at the start of a session, or pass `--trust-folder` to a single
+`copilot -p` run. `timeout` (milliseconds) plays the role of Codex's
+`tool_timeout_sec` above. Copilot CLI passes its own environment to the server,
+together with the `env` entries, so the server inherits `JAVA_HOME` and `PATH`
+from the shell that started Copilot.
+
 Alternatively, register it as a user server:
 
 ```bash
 copilot mcp add \
   --timeout 300000 \
-  maven-mcp -- /home/<user>/.local/share/maven-mcp/stable/maven-mcp --jenv
+  --env MAVEN_TRUSTED_PROJECT_DIRECTORIES=/home/<user>/work/trusted-projects \
+  maven-mcp -- /home/<user>/.local/share/maven-mcp/releases/current/maven-mcp --jenv
 copilot mcp get maven-mcp
 ```
 
-Use the `candidate` alias instead of `stable` in either host to try a candidate.
-See the
+With a [versioned local installation](#versioned-local-installation), use
+`<root>/stable/maven-mcp`, or `<root>/candidate/maven-mcp` to try a candidate, as
+the command in either host. See the
 [official GitHub Copilot CLI MCP documentation](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
 
 ## Opt-in Project Execution
@@ -1155,6 +1272,146 @@ is present in the local repository. For Maven projects, these artifacts can be
 downloaded with commands such as `mvn dependency:sources`. Missing source entries
 produce empty results; unreadable source archives or entries are reported as MCP
 errors.
+
+## Troubleshooting
+
+First find out which stage fails. **Startup** covers everything up to
+`initialize` and `tools/list`: the host cannot run the binary, or the server
+rejects its configuration and exits. Startup reads only the environment, so it
+takes milliseconds and never waits for Maven. The **first project request** is
+the first tool call that names a `project_path`. It checks trust and the project
+root, and the first index-dependent call also runs Maven to resolve the classpath
+(see [Index lifecycle](#index-lifecycle)). A host that lists the `maven-mcp`
+tools has passed startup.
+
+To check startup outside the host, run the configured command with the same
+environment and an empty standard input:
+
+```bash
+MAVEN_TRUSTED_PROJECT_DIRECTORIES=/home/<user>/work/trusted-projects \
+  /home/<user>/.local/share/maven-mcp/releases/current/maven-mcp --jenv </dev/null
+```
+
+A valid configuration logs `MCP server ready` on stderr, then exits with
+`Error: cannot start STDIO MCP server` and `connection closed: initialize
+request`, because no host is connected. An invalid configuration exits before
+`MCP server ready` with `Error:` and the variable that is wrong, for example
+`MAVEN_TRUSTED_PROJECT_DIRECTORIES contains an unreadable directory`,
+`MAVEN_TRUSTED_PROJECT_DIRECTORIES entries must be absolute paths`,
+`MAVEN_MCP_CACHE_DIR must be an absolute path`, or
+`JENV_ROOT must be an absolute path when --jenv is enabled`.
+
+**Binary access.**
+
+- The host command must be an absolute path to an executable file. Run it with
+  `--version`; it must print `maven-mcp <version> (commit <commit>)`. A
+  `No such file or directory` usually means that the `current` symlink points at a
+  directory that does not exist, or that the host still has an old path.
+  `Permission denied` means a missing execute bit (`chmod 755`) or a file system
+  mounted `noexec`.
+- A loader error that version `GLIBC_2.34` is not found means that the system's
+  glibc is older than the [supported minimum](#supported-platforms). On glibc 2.34
+  to 2.38, the loader instead prints a warning on stderr at every start, saying
+  that the weak version `GLIBC_2.39` is not found. That warning is harmless: the
+  binary uses those newer functions only when they exist.
+- A running host session keeps the binary it started. After an install, upgrade
+  or rollback, restart the session (or its MCP server) and compare the host's
+  `serverInfo.version` with `--version`. `maven-mcp stats` lists the
+  `executable` of every live instance. Codex does not pass `XDG_RUNTIME_DIR` to
+  its servers, so instances that Codex started are listed by
+  `env -u XDG_RUNTIME_DIR maven-mcp stats`; setting the same
+  `MAVEN_MCP_RUNTIME_DIR` in the host and in your shell also works.
+- Codex: a project-level server that `codex mcp list` does not show belongs to a
+  project that Codex does not trust yet. Copilot CLI: workspace servers in
+  `.github/mcp.json` or `.mcp.json` load only in a trusted folder.
+
+**Startup and tool timeouts.** Startup never needs a long timeout. A host that
+times out while starting the server either could not run the binary or is
+waiting for a binary that exited with a configuration error; check both as shown
+above. A long first call is the first project index: classpath resolution
+through Maven plus reading every classpath JAR, from seconds to a few minutes.
+Keep the host's tool timeout (Codex `tool_timeout_sec`, Copilot `timeout`) at
+least as long as `MAVEN_TIMEOUT_SECONDS` (300 seconds by default). A Maven run
+that reaches `MAVEN_TIMEOUT_SECONDS` is stopped together with its process group
+and reported as `Maven failed with outcome Timeout`. Later calls and new sessions
+are fast, because they reuse the in-memory index and the
+[persistent index cache](#persistent-index-cache).
+
+**Trusted tree and project root.** Every message names the rule that failed:
+
+| Message | Fix |
+| --- | --- |
+| `project_path is not inside a directory configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES` | Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` in the host configuration (it is not read from your shell or from the host's working directory) to a directory that contains the project. Symlinks are resolved before the check: the real project directory must be inside the trusted tree, so a link inside the tree that points to a project outside it is rejected. |
+| `project_path must be an absolute path` | Pass the full path, for example `/home/<user>/work/trusted-projects/my-service`. |
+| `project_path must contain a pom.xml` | Pass the directory of the root `pom.xml`; in a multi-module build, that is the reactor root. |
+| `MAVEN_EXECUTABLE must be an absolute executable path when no Maven Wrapper is available` | Add the Maven Wrapper to the project (executable `mvnw` and `.mvn/wrapper/maven-wrapper.properties`), or set `MAVEN_EXECUTABLE` to the absolute path of `mvn`. |
+
+**Java and jenv.** With `--jenv`, Java is selected for each request from the
+project's `.java-version`, through `JENV_ROOT/bin/jenv` (default `$HOME/.jenv`).
+`configured jenv executable is missing or unreadable` means that jenv is not
+installed at that root. `jenv could not resolve Java for project_path` means that
+the project's `.java-version` names a version that `jenv versions` does not list.
+Without `--jenv`, Maven uses the `JAVA_HOME` and `PATH` of the server process,
+which come from the host, not from your interactive shell.
+
+**Maven cache.** The structured tools, including the classpath resolution behind
+the first index, run Maven with `--offline`. A cold or incomplete local
+repository therefore fails the first index-dependent call with
+`cannot build Maven classpath for project index:` followed by Maven's own
+message, for example `Cannot access central (...) in offline mode and the
+artifact ... has not been downloaded from it before`. Fill the repository once
+online with `./mvnw -B dependency:go-offline` from the project directory (see
+[Getting started](#getting-started)), or set `MAVEN_EXECUTION_NETWORK=true`. When
+`MAVEN_EXECUTION_REPO_PATH` is set, pass the same directory as
+`-Dmaven.repo.local=...` when you fill it. `diagnose_artifact` explains the local
+state of one artifact (missing JAR, `.lastUpdated` markers, checksums, corrupt
+archives). The server never writes the Maven repository. Its own
+[persistent index cache](#persistent-index-cache) is derived data: delete the
+directory, or start with `MAVEN_MCP_INDEX_CACHE=false`, to rule it out.
+
+**Permissions.** Maven runs as the user who runs the host, with that user's
+permissions; nothing needs root. The project directory must be writable, because
+Maven writes `target/`. `MAVEN_EXECUTION_REPO_PATH`, when set, must be an existing,
+writable directory. The server creates the persistent index cache
+(`MAVEN_MCP_CACHE_DIR`) and the runtime status directory (`MAVEN_MCP_RUNTIME_DIR`)
+as user-private directories. When it cannot write the cache, it logs `index cache
+is unavailable; building without it` on stderr and keeps working, but every new
+session then builds its first index cold.
+
+**Source artifacts.** `get_class_source`, `search_source` and
+`get_declaration_source` read `-sources.jar` files from the local repository. An
+empty result means that the sources artifact is not there: run
+`./mvnw -B dependency:sources` (with `-Dmaven.repo.local=...` when
+`MAVEN_EXECUTION_REPO_PATH` is set), or call `run_maven` with
+`["dependency:sources"]`. `run_maven` passes only the arguments you give it and
+adds neither `-Dmaven.repo.local` nor `--offline`, so when
+`MAVEN_EXECUTION_REPO_PATH` is set, call it with
+`["dependency:sources", "-Dmaven.repo.local=/absolute/repository"]` naming that
+same directory. A `run_maven` call drops the project index, so the
+next request sees the new files; after downloading them outside the server, call
+`refresh_maven_project`. An unreadable
+sources archive is an MCP error, not an empty result. `incomplete: true` from
+`search_source` means that `MAX_SOURCE_BYTES` or the aggregate scan limit cut
+off part of a source.
+
+**Partial diagnostics.** Maven-backed errors quote Maven's own output after
+redaction. That output can be partial:
+
+- `stdout_truncated` or `stderr_truncated` is `true` when a stream reached
+  `MAX_MAVEN_OUTPUT_BYTES`; raise the limit, or rerun the goal with `run_maven` and
+  fewer options.
+- `without diagnostic output` means that Maven printed nothing usable, as with a
+  timeout or a wrapper that fails before Maven starts. Run the same goal yourself
+  from the project directory.
+- `build.policy_notice` on an offline failure means that the result may reflect
+  the offline policy, not a project error (see
+  [Opt-in Project Execution](#opt-in-project-execution)).
+- The project index is never built from a partial classpath. Truncated Maven
+  classpath output, or a classpath entry that cannot be indexed, fails with
+  `the project index was not built because it would be incomplete`; the message
+  lists the entries and the reason.
+- The server's own diagnostics are on stderr, which the host keeps in its MCP
+  log. Set `RUST_LOG=maven_mcp=debug` in the host's `env` for more detail.
 
 ## Agent Log Analyzer CLI
 
