@@ -65,6 +65,14 @@ fn empty_index() -> (TempDir, Arc<MavenIndex>) {
     (directory, Arc::new(index))
 }
 
+fn finished_build() -> FinishedBuild {
+    FinishedBuild {
+        artifacts: ProjectFingerprint::default(),
+        classpath_entries: 2,
+        duration: Duration::from_millis(1_500),
+    }
+}
+
 fn build(
     cache: &mut ProjectCache,
     root: &Path,
@@ -80,7 +88,7 @@ fn build(
         root,
         generation,
         index,
-        ProjectFingerprint::default(),
+        finished_build(),
         Arc::clone(&snapshot.fingerprint),
         reservation,
     )
@@ -187,7 +195,7 @@ fn invalidation_during_a_build_prevents_publication_and_starts_a_new_generation(
             &root,
             old_generation,
             &index,
-            ProjectFingerprint::default(),
+            finished_build(),
             Arc::clone(&snapshot.fingerprint),
             reservation,
         ),
@@ -366,7 +374,7 @@ fn byte_budget_evicts_idle_indexes_and_rejects_or_degrades_oversized_builds() {
             &first.1,
             generation,
             &big,
-            ProjectFingerprint::default(),
+            finished_build(),
             Arc::clone(&snapshot.fingerprint),
             reservation,
         ),
@@ -576,7 +584,7 @@ fn repeated_failed_and_oversized_builds_do_not_accumulate_bookkeeping() {
                 &root,
                 generation,
                 &oversized,
-                ProjectFingerprint::default(),
+                finished_build(),
                 Arc::clone(&snapshot.fingerprint),
                 reservation,
             ),
@@ -690,4 +698,64 @@ fn fingerprints_are_settled_only_when_every_existing_stamp_is_old_enough() {
     let fingerprint = ProjectFingerprint::capture([file]);
     assert!(fingerprint.was_settled_at(hour_ago + Duration::from_secs(60)));
     assert!(!fingerprint.was_settled_at(hour_ago - Duration::from_secs(60)));
+}
+
+#[test]
+fn runtime_projects_report_index_state_classpath_size_and_build_duration() {
+    let mut cache = ProjectCache::new(limits(4, 16, u64::MAX));
+    let (_directory, root, runner) = project("stateful");
+    let snapshot = install(&mut cache, &root, &runner);
+
+    let not_indexed = cache.runtime_projects();
+    assert_eq!(not_indexed.len(), 1);
+    assert_eq!(not_indexed[0].state, IndexState::NotIndexed);
+    assert_eq!(not_indexed[0].index, IndexStats::default());
+    assert_eq!(not_indexed[0].estimated_bytes, 0);
+    assert_eq!(not_indexed[0].classpath_entries, None);
+    assert_eq!(not_indexed[0].build_duration_ms, None);
+
+    let IndexLookup::Build {
+        cell, generation, ..
+    } = cache.lookup_index(&root, &snapshot.fingerprint)
+    else {
+        panic!("expected a cold lookup");
+    };
+    let building = cache.runtime_projects();
+    assert_eq!(building[0].state, IndexState::Building);
+    assert_eq!(building[0].build_duration_ms, None);
+
+    let (_index_root, index) = empty_index();
+    let reservation = cache.reserve(&root, generation, 0).unwrap();
+    let publication = cache.publish(
+        &root,
+        generation,
+        &index,
+        finished_build(),
+        Arc::clone(&snapshot.fingerprint),
+        reservation,
+    );
+    drop(cell);
+
+    assert_eq!(publication, Publication::Retained);
+    let ready = cache.runtime_projects();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].project_path, root.display().to_string());
+    assert_eq!(ready[0].state, IndexState::Ready);
+    assert_eq!(ready[0].index, index.stats());
+    assert!(ready[0].estimated_bytes > 0);
+    assert_eq!(ready[0].classpath_entries, Some(2));
+    assert_eq!(ready[0].build_duration_ms, Some(1_500));
+}
+
+#[test]
+fn an_abandoned_build_marker_is_not_reported_as_building() {
+    let mut cache = ProjectCache::new(limits(4, 16, u64::MAX));
+    let (_directory, root, runner) = project("abandoned");
+    let snapshot = install(&mut cache, &root, &runner);
+    let lookup = cache.lookup_index(&root, &snapshot.fingerprint);
+    assert!(matches!(lookup, IndexLookup::Build { .. }));
+
+    drop(lookup);
+
+    assert_eq!(cache.runtime_projects()[0].state, IndexState::NotIndexed);
 }

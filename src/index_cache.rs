@@ -200,10 +200,17 @@ impl PersistentIndexCache {
     }
 
     /// Opens the database, creating the private directory, the file and the schema when
-    /// needed. An unreadable or incompatible database is deleted and created again.
+    /// needed. An unreadable or incompatible database is deleted and created again. The shared
+    /// lock is held while opening, so no recovery deletes the file between its creation and
+    /// its use, and a diagnosis always belongs to the epoch read with it.
     fn open(&self) -> Result<Connection> {
-        let epoch = self.recovery_epoch()?;
-        match self.try_open() {
+        let lock = self.lock_file()?;
+        lock.lock_shared()
+            .context("cannot lock the index cache for reading")?;
+        let epoch = read_epoch(&lock)?;
+        let opened = self.try_open();
+        drop(lock);
+        match opened {
             Err(error) if is_damaged(&error) => {
                 tracing::warn!(error = %format!("{error:#}"), "rebuilding a damaged or incompatible index cache");
                 self.recover(epoch)

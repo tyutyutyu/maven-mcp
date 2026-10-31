@@ -1,6 +1,11 @@
 mod support;
 
-use std::process::Stdio;
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -9,6 +14,7 @@ use tokio::{
     process::Command,
 };
 
+use maven_mcp::runtime_stats::HIT_PUBLICATION_DELAY;
 use rmcp::model::CallToolRequestParams;
 use support::TestServer;
 
@@ -87,69 +93,407 @@ async fn stats_cli_reports_empty_runtime_as_successful_json() -> Result<()> {
     Ok(())
 }
 
+/// A host-style STDIO instance that publishes its status into `runtime`.
+struct StdioInstance {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+}
+
+impl StdioInstance {
+    async fn start(runtime: &Path) -> Result<Self> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+            .env("MAVEN_MCP_INDEX_CACHE", "false")
+            .env("MAVEN_MCP_RUNTIME_DIR", runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("missing child stdin")?;
+        let stdout = child.stdout.take().context("missing child stdout")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "stats-test", "version": "1.0" }
+            }
+        });
+        stdin
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .context("initialize response timed out")??
+            .context("server closed before initialize response")?;
+        Ok(Self { child, stdin })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id().expect("a running instance has a PID")
+    }
+
+    /// Closes stdin like a host that went away and waits for the process to exit.
+    async fn stop_with_eof(mut self) -> Result<()> {
+        drop(self.stdin);
+        let status = tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .context("server did not stop after stdin EOF")??;
+        assert!(status.success(), "server exited with {status}");
+        Ok(())
+    }
+}
+
+struct StatsOutput {
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_stats(runtime: &Path, json: bool) -> Result<StatsOutput> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maven-mcp"));
+    command
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
+        .env("MAVEN_MCP_RUNTIME_DIR", runtime)
+        .arg("stats");
+    if json {
+        command.arg("--json");
+    }
+    let output = command.output().await?;
+    let stats = StatsOutput {
+        stdout: String::from_utf8(output.stdout)?,
+        stderr: String::from_utf8(output.stderr)?,
+    };
+    assert!(
+        output.status.success(),
+        "stats CLI failed: {}",
+        stats.stderr
+    );
+    Ok(stats)
+}
+
+async fn stats_json(runtime: &Path) -> Result<Value> {
+    let output = run_stats(runtime, true).await?;
+    assert_eq!(
+        output.stderr, "",
+        "a successful report writes nothing to stderr"
+    );
+    Ok(serde_json::from_str(&output.stdout)?)
+}
+
+fn reported_pids(report: &Value) -> Vec<u64> {
+    report["instances"]
+        .as_array()
+        .expect("instances is an array")
+        .iter()
+        .map(|instance| instance["pid"].as_u64().expect("pid is a number"))
+        .collect()
+}
+
+fn status_file(runtime: &Path, pid: u32) -> PathBuf {
+    runtime.join(format!("{pid}.json"))
+}
+
+fn read_status(runtime: &Path, pid: u32) -> Result<Value> {
+    Ok(serde_json::from_slice(&std::fs::read(status_file(
+        runtime, pid,
+    ))?)?)
+}
+
+fn mode(path: &Path) -> Result<u32> {
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+}
+
+fn reaped_process_id() -> Result<u32> {
+    let mut child = std::process::Command::new("true").spawn()?;
+    let pid = child.id();
+    child.wait()?;
+    Ok(pid)
+}
+
+async fn wait_until_removed(path: &Path) -> Result<()> {
+    for _ in 0..200 {
+        if !path.exists() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("{} was not removed", path.display())
+}
+
 #[tokio::test]
 async fn stats_cli_reports_live_stdio_instance() -> Result<()> {
     let runtime = tempfile::tempdir()?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
-        .env("MAVEN_MCP_INDEX_CACHE", "false")
-        .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().context("missing child stdin")?;
-    let stdout = child.stdout.take().context("missing child stdout")?;
-    let mut lines = BufReader::new(stdout).lines();
-    stdin
-        .write_all(
-            format!(
-                "{}\n",
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "clientInfo": { "name": "stats-test", "version": "1.0" }
-                    }
-                })
-            )
-            .as_bytes(),
-        )
-        .await?;
-    tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-        .await
-        .context("initialize response timed out")??
-        .context("server closed before initialize response")?;
+    let instance = StdioInstance::start(runtime.path()).await?;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
-        .env("MAVEN_MCP_INDEX_CACHE", "false")
-        .arg("stats")
-        .arg("--json")
-        .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
-        .output()
-        .await?;
-    assert!(output.status.success());
-    let report: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["instances"].as_array().unwrap().len(), 1);
-    assert_eq!(report["instances"][0]["pid"], child.id().unwrap());
+    let report = stats_json(runtime.path()).await?;
+
+    assert_eq!(reported_pids(&report), [u64::from(instance.pid())]);
+    let reported = &report["instances"][0];
+    assert_eq!(reported["schema_version"], 1);
+    assert_eq!(reported["binary_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
-        report["instances"][0]["binary_version"],
-        env!("CARGO_PKG_VERSION")
-    );
-    assert_eq!(
-        report["instances"][0]["build_commit"],
+        reported["build_commit"],
         json!(maven_mcp::build_info::build_commit())
     );
     let executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_maven-mcp"))?;
     assert_eq!(
-        report["instances"][0]["executable"],
+        reported["executable"],
         json!(executable.display().to_string())
     );
+    assert!(reported["process_start_ticks"].as_u64().is_some());
+    assert!(
+        reported["memory"]["rss_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        reported["config"]["max_project_index_bytes"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(reported["projects"], json!([]));
+    instance.stop_with_eof().await
+}
 
-    drop(stdin);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await?;
+#[tokio::test]
+async fn stats_cli_reports_every_live_instance_and_cleans_only_stale_state() -> Result<()> {
+    let runtime = tempfile::tempdir()?;
+    let first = StdioInstance::start(runtime.path()).await?;
+    let second = StdioInstance::start(runtime.path()).await?;
+    let (first_pid, second_pid) = (first.pid(), second.pid());
+    // A crashed instance leaves a well-formed status whose process is gone.
+    let stale_pid = reaped_process_id()?;
+    let mut stale = read_status(runtime.path(), first_pid)?;
+    stale["pid"] = json!(stale_pid);
+    let stale_file = status_file(runtime.path(), stale_pid);
+    std::fs::write(&stale_file, serde_json::to_vec(&stale)?)?;
+    let invalid_file = runtime.path().join("invalid.json");
+    std::fs::write(&invalid_file, "{ not a status")?;
+
+    let report = stats_json(runtime.path()).await?;
+
+    let mut expected = vec![u64::from(first_pid), u64::from(second_pid)];
+    expected.sort_unstable();
+    assert_eq!(reported_pids(&report), expected, "sorted by PID");
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["unknown_instances"], 0);
+    assert!(
+        !stale_file.exists(),
+        "the status of a gone process is deleted"
+    );
+    assert!(
+        invalid_file.exists(),
+        "an invalid status is skipped, not deleted"
+    );
+    assert_eq!(mode(runtime.path())?, 0o700);
+    for pid in [first_pid, second_pid] {
+        assert_eq!(mode(&status_file(runtime.path(), pid))?, 0o600);
+    }
+    let human = run_stats(runtime.path(), false).await?;
+    assert_eq!(human.stderr, "");
+    for pid in [first_pid, second_pid] {
+        assert!(
+            human.stdout.contains(&format!(
+                "maven-mcp pid={pid} version={}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{}",
+            human.stdout
+        );
+    }
+
+    first.stop_with_eof().await?;
+    assert!(
+        !status_file(runtime.path(), first_pid).exists(),
+        "EOF removes the instance's own status"
+    );
+    assert_eq!(
+        reported_pids(&stats_json(runtime.path()).await?),
+        [u64::from(second_pid)]
+    );
+
+    second.stop_with_eof().await?;
+    assert_eq!(
+        run_stats(runtime.path(), false).await?.stdout,
+        "No live maven-mcp instances.\n"
+    );
+    assert_eq!(
+        reported_pids(&stats_json(runtime.path()).await?),
+        Vec::<u64>::new()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stats_report_index_figures_and_cache_hits_do_not_write_the_status_per_hit() -> Result<()> {
+    const HITS: u64 = 25;
+    let server = TestServer::start_with_project().await?;
+    let project = server
+        .project_path()
+        .context("missing fixture project")?
+        .display()
+        .to_string();
+    let runtime = tempfile::tempdir()?;
+    let runtime_dir = runtime.path().to_str().context("UTF-8 runtime path")?;
+    let (client, pid) = server
+        .connect_with_limits(&[("MAVEN_MCP_RUNTIME_DIR", runtime_dir)])
+        .await?;
+    let search = || {
+        client.call_tool(
+            CallToolRequestParams::new("search_classes").with_arguments(
+                json!({ "project_path": project, "query": "Foo" })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            ),
+        )
+    };
+
+    search().await?;
+    // A build is a structural change, so it is published before the response.
+    let built = read_status(runtime.path(), pid)?;
+    assert_eq!(built["cache"]["misses"], 1);
+    assert_eq!(built["cache"]["hits"], 0);
+    let indexed = &built["projects"][0];
+    assert_eq!(indexed["state"], "ready", "{built:#}");
+    assert!(
+        indexed["classpath_entries"]
+            .as_u64()
+            .is_some_and(|entries| entries >= 1)
+    );
+    assert!(indexed["build_duration_ms"].as_u64().is_some());
+    assert!(
+        indexed["estimated_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        indexed["index"]["class_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert!(indexed["last_used_unix_ms"].as_u64().is_some());
+
+    let mut publications = std::collections::BTreeSet::new();
+    let started = Instant::now();
+    for _ in 0..HITS {
+        search().await?;
+        publications.insert(read_status(runtime.path(), pid)?["updated_unix_ms"].as_u64());
+    }
+    let elapsed = started.elapsed();
+    let allowed = elapsed.as_millis() / HIT_PUBLICATION_DELAY.as_millis() + 2;
+    assert!(
+        publications.len() as u128 <= allowed,
+        "{} status writes for {HITS} hits in {elapsed:?}",
+        publications.len()
+    );
+
+    // The last hits reach the file within the documented delay, without another request.
+    let deadline = Instant::now() + HIT_PUBLICATION_DELAY * 3;
+    loop {
+        let status = read_status(runtime.path(), pid)?;
+        if status["cache"]["hits"] == HITS {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hits never published: {status:#}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = stats_json(runtime.path()).await?;
+    assert_eq!(report["instances"][0]["projects"][0]["state"], "ready");
+    let human = run_stats(runtime.path(), false).await?.stdout;
+    assert!(human.contains(" state=ready classpath="), "{human}");
+    assert!(human.contains(&format!("hits={HITS} misses=1")), "{human}");
+
+    client.cancel().await?;
+    wait_until_removed(&status_file(runtime.path(), pid)).await
+}
+
+#[tokio::test]
+async fn stats_report_a_running_index_build_as_building() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().context("missing fixture project")?;
+    let blocked = support::install_blocked_classpath(project)?;
+    let runtime = tempfile::tempdir()?;
+    let runtime_dir = runtime.path().to_str().context("UTF-8 runtime path")?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAVEN_MCP_RUNTIME_DIR", runtime_dir),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+    let arguments = json!({ "project_path": project.display().to_string(), "query": "One" });
+    let search = client.call_tool(
+        CallToolRequestParams::new("search_classes")
+            .with_arguments(arguments.as_object().cloned().context("object arguments")?),
+    );
+
+    let observe = async {
+        support::wait_for_blocked_fifo_readers(pid, 1).await?;
+        let status = read_status(runtime.path(), pid)?;
+        blocked.release().await?;
+        anyhow::Ok(status)
+    };
+    let (searched, building) = tokio::join!(search, observe);
+
+    let building = building?;
+    assert_eq!(building["projects"][0]["state"], "building", "{building:#}");
+    assert_eq!(building["projects"][0]["build_duration_ms"], Value::Null);
+    // The released pipe reads as an empty archive, which the build skips.
+    searched?;
+    let after = read_status(runtime.path(), pid)?;
+    assert_eq!(after["projects"][0]["state"], "ready", "{after:#}");
+    assert!(after["projects"][0]["build_duration_ms"].as_u64().is_some());
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_index_build_stops_reporting_building_once_its_work_stops() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let project = server.project_path().context("missing fixture project")?;
+    let blocked = support::install_blocked_classpath(project)?;
+    let runtime = tempfile::tempdir()?;
+    let runtime_dir = runtime.path().to_str().context("UTF-8 runtime path")?;
+    let (client, pid) = server
+        .connect_with_limits(&[
+            ("MAVEN_MCP_RUNTIME_DIR", runtime_dir),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+    let arguments = json!({ "project_path": project.display().to_string(), "query": "One" });
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                CallToolRequestParams::new("search_classes")
+                    .with_arguments(arguments.as_object().cloned().context("object arguments")?),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    let building = read_status(runtime.path(), pid)?;
+    assert_eq!(building["projects"][0]["state"], "building", "{building:#}");
+
+    handle.cancel(Some("regression".to_owned())).await?;
+    blocked.release().await?;
+
+    // No further project request: the abandoned build's end alone republishes the status.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after = loop {
+        let status = read_status(runtime.path(), pid)?;
+        if status["projects"][0]["state"] != "building" || Instant::now() >= deadline {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(after["projects"][0]["state"], "not_indexed", "{after:#}");
+    assert_eq!(after["projects"][0]["build_duration_ms"], Value::Null);
+    client.cancel().await?;
     Ok(())
 }
 
@@ -161,8 +505,10 @@ async fn sigterm_stops_the_stdio_server_cleanly() -> Result<()> {
         unistd::Pid,
     };
 
+    let runtime = tempfile::tempdir()?;
     let mut child = Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
         .env("MAVEN_MCP_INDEX_CACHE", "false")
+        .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -198,11 +544,16 @@ async fn sigterm_stops_the_stdio_server_cleanly() -> Result<()> {
         .await?;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let process_id = child.id().context("missing server process id")?;
+    assert!(status_file(runtime.path(), process_id).exists());
     kill(Pid::from_raw(i32::try_from(process_id)?), Signal::SIGTERM)?;
     let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
         .await
         .context("server did not stop after SIGTERM")??;
     assert!(status.success(), "server exited with {status}");
+    assert!(
+        !status_file(runtime.path(), process_id).exists(),
+        "SIGTERM removes the instance's status although the exit skips destructors"
+    );
     Ok(())
 }
 

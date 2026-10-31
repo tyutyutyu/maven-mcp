@@ -31,3 +31,10 @@ becomes the GitHub Release notes.
 - Documented index lifecycle (startup, first request, reuse, change detection,
   refresh and restart) and the beta maturity, compatibility, deprecation, and
   support policy.
+- `maven-mcp stats` reports every active project with its index `state`
+  (`ready`, `building`, `not_indexed`), `classpath_entries` and
+  `build_duration_ms`, plus the process start time and an `unknown_instances`
+  count (additive `stats --json` fields). Cache hits update the owner-only status
+  file at most once per second. SIGTERM also removes the file. A status file is
+  deleted only when its process is proven gone; an access error or an unknown
+  liveness keeps it.

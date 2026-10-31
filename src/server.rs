@@ -2,8 +2,8 @@ use std::{
     collections::BTreeMap,
     env,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
-    time::SystemTime,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    time::{Instant, SystemTime},
 };
 
 use rmcp::{
@@ -41,8 +41,8 @@ use crate::project::{
     MavenRunner, canonical_project_root,
 };
 use crate::project_cache::{
-    BuildOutcome, BuildOwner, CacheLimits, IndexLookup, ProjectCache, ProjectFingerprint,
-    Publication, ReserveError, RunnerSnapshot,
+    BuildCell, BuildOutcome, BuildOwner, CacheLimits, FinishedBuild, IndexLookup, ProjectCache,
+    ProjectFingerprint, Publication, ReserveError, RunnerSnapshot,
 };
 use crate::runtime_stats::RuntimeStatusPublisher;
 
@@ -500,9 +500,11 @@ impl MavenMcpServer {
         }
     }
 
-    /// Cancels all heavy jobs and rejects new ones; called when the server stops.
+    /// Cancels all heavy jobs, rejects new ones and removes the runtime status; called when
+    /// the server stops.
     pub fn shutdown(&self) {
         self.heavy_work.shutdown();
+        self.runtime_status.close();
     }
 
     /// Runs blocking index, archive or file work outside the async runtime within the bounded
@@ -612,7 +614,7 @@ impl MavenMcpServer {
                         .await?
                     {
                         self.lock_projects()?.record_hit(&root);
-                        self.publish_runtime_status();
+                        self.publish_runtime_status_after_hit();
                         return Ok(Arc::clone(&entry.index));
                     }
                     self.lock_projects()?
@@ -623,10 +625,25 @@ impl MavenMcpServer {
                     owner,
                     generation,
                 } => {
-                    let outcome = cell
-                        .get_or_init(|| self.build_index(&root, &snapshot, generation, owner))
+                    // Reports the project as building while the build runs.
+                    self.publish_runtime_status();
+                    let mut build = BuildStatusGuard {
+                        projects: Arc::downgrade(&self.projects),
+                        status: Arc::downgrade(&self.runtime_status),
+                        cell,
+                        owner,
+                        awaiting: true,
+                    };
+                    // The build future borrows the guard, so a cancelled request drops it, and
+                    // with it every clone the build holds, before the guard.
+                    let outcome = build
+                        .cell
+                        .get_or_init(|| {
+                            self.build_index(&root, &snapshot, generation, Arc::clone(&build.owner))
+                        })
                         .await
                         .clone();
+                    build.awaiting = false;
                     self.publish_runtime_status();
                     match outcome {
                         BuildOutcome::Built(index) => return Ok(index),
@@ -783,6 +800,7 @@ impl MavenMcpServer {
         generation: u64,
         ownership: OwnedMutexGuard<()>,
     ) -> BuildOutcome {
+        let started = Instant::now();
         let context = classpath_context(root, &self.config);
         let (classpath, ownership) = match self
             .resolve_classpath(root, snapshot, &context, ownership)
@@ -915,7 +933,11 @@ impl MavenMcpServer {
                 root,
                 generation,
                 &index,
-                artifacts,
+                FinishedBuild {
+                    artifacts,
+                    classpath_entries: classpath.paths.len(),
+                    duration: started.elapsed(),
+                },
                 Arc::clone(&snapshot.fingerprint),
                 reservation,
             );
@@ -1076,13 +1098,79 @@ impl MavenMcpServer {
     }
 
     fn publish_runtime_status(&self) {
-        let Ok(projects) = self.projects.lock() else {
+        publish_runtime_status(&self.projects, &self.runtime_status);
+    }
+
+    /// A cache hit does not write the status file: hits are coalesced into one write at most
+    /// [`crate::runtime_stats::HIT_PUBLICATION_DELAY`] after the previous write.
+    fn publish_runtime_status_after_hit(&self) {
+        let Some(delay) = self.runtime_status.record_hit() else {
             return;
         };
-        let _ = self
-            .runtime_status
-            .update_cache(projects.runtime_cache(), projects.runtime_projects());
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) if !delay.is_zero() => runtime,
+            _ => return flush_runtime_hits(&self.projects, &self.runtime_status),
+        };
+        // Weak handles: a pending write must not keep a stopped server's state alive.
+        let projects = Arc::downgrade(&self.projects);
+        let status = Arc::downgrade(&self.runtime_status);
+        runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let (Some(projects), Some(status)) = (projects.upgrade(), status.upgrade()) {
+                flush_runtime_hits(&projects, &status);
+            }
+        });
     }
+}
+
+/// A request awaiting a project's index build. When the request is cancelled, nothing after
+/// its await runs, while the build's blocking work keeps running and the project keeps
+/// reporting `building`. The guard then publishes the status again once that work has
+/// released the build owner, so the status shows the real state without a further request.
+struct BuildStatusGuard {
+    projects: Weak<Mutex<ProjectCache>>,
+    status: Weak<RuntimeStatusPublisher>,
+    cell: BuildCell,
+    owner: BuildOwner,
+    /// The request is still waiting for the build; cleared once the outcome is known.
+    awaiting: bool,
+}
+
+impl Drop for BuildStatusGuard {
+    fn drop(&mut self) {
+        if !self.awaiting {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        // Only the owner clone moved into the task may remain from this request; the cell
+        // clone would report the build as live.
+        drop(std::mem::take(&mut self.cell));
+        let owner = std::mem::take(&mut self.owner);
+        let (projects, status) = (self.projects.clone(), self.status.clone());
+        runtime.spawn(async move {
+            drop(owner.lock().await);
+            drop(owner);
+            if let (Some(projects), Some(status)) = (projects.upgrade(), status.upgrade()) {
+                publish_runtime_status(&projects, &status);
+            }
+        });
+    }
+}
+
+fn publish_runtime_status(projects: &Mutex<ProjectCache>, status: &RuntimeStatusPublisher) {
+    let Ok(projects) = projects.lock() else {
+        return;
+    };
+    let _ = status.update_cache(projects.runtime_cache(), projects.runtime_projects());
+}
+
+fn flush_runtime_hits(projects: &Mutex<ProjectCache>, status: &RuntimeStatusPublisher) {
+    let Ok(projects) = projects.lock() else {
+        return;
+    };
+    let _ = status.flush_hits(projects.runtime_cache(), projects.runtime_projects());
 }
 
 /// The records of a build that must read every archive again: nothing is reused, but the

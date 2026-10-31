@@ -535,7 +535,7 @@ struct IndexedProvider {
     entry: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct IndexStats {
     pub jar_count: usize,
     pub source_jar_count: usize,
