@@ -25,13 +25,13 @@ so a future image is covered automatically.
 - Lockfile maintenance runs monthly.
 - Security vulnerability PRs are raised immediately, labelled `security`.
 
-Every update PR must pass the required `CI` check before squash merge. That
+Every update PR must pass the required `verify` check before squash merge. That
 check includes the dependency policy, the native Linux platform matrix, the MSRV
 check, and the locked Node.js tool install.
 
 ## Policy gate
 
-The required `CI` job in `.github/workflows/ci.yml` runs `cargo deny`
+The `Verify` workflow (`.github/workflows/verify.yml`) runs `cargo deny`
 (`deny.toml`) on every pull request and push to `main`, including every lockfile
 change. `.github/workflows/dependency-policy.yml` also scans daily and on manual
 dispatch so newly published RustSec advisories surface without a code change.
@@ -43,8 +43,8 @@ dispatch so newly published RustSec advisories surface without a code change.
 | Sources | Only crates.io; git and unknown registries are denied |
 | Bans | Wildcard version requirements denied; duplicate versions warn |
 
-Policy failures fail the required `CI` check and block merging. They also block
-a release: do not tag a release while `CI` or the daily `Dependency policy` scan
+Policy failures fail the required `verify` check and block merging. They also block
+a release: do not tag a release while `verify` or the daily `Dependency policy` scan
 is red on `main`. Triage scheduled scan failures within 7 days (critical/high
 severity: 48 hours).
 

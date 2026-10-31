@@ -523,7 +523,7 @@ provider descriptors and therefore are not included in this structured view.
 
 The first release supports Linux only, as native binaries (a container image is
 not a substitute platform). Every target below is built and tested natively in
-the required `CI` check:
+the required `verify` check:
 
 | Target | CI runner | Verified in CI |
 | --- | --- | --- |
@@ -572,7 +572,7 @@ Toolchains:
 - Renovate proposes updates to the Rust toolchain pin, the Node.js version, the
   locked npm tools, Cargo crates, CI Cargo tools, and GitHub Actions on its weekly
   schedule (see [Dependency Maintenance](#dependency-maintenance)). Every update
-  must pass `CI`.
+  must pass `verify`.
 
 ## Releases
 
@@ -754,12 +754,12 @@ the protected `release` GitHub environment, which holds the
    `cargo update --workspace --offline` so `Cargo.lock` records it, move the
    `Unreleased` changelog entries into the dated version section, and check the
    result with `task release:check TAG=v<version>`. Merge the pull request after
-   `CI` passes.
+   `verify` passes.
 2. Tag the merge commit on `main` and push the tag:
    `git tag -a v<version> -m "maven-mcp <version>"` and
    `git push origin v<version>`.
 3. The `Release` workflow (`.github/workflows/release.yml`) then runs the
-   complete `CI` on the tag, requires the tag to be on `main`, runs
+   complete `Verify` workflow on the tag, requires the tag to be on `main`, runs
    `scripts/release.sh check --tag` and `cargo publish --dry-run --locked`, and
    creates a draft GitHub pre-release with the changelog notes. On a native
    runner per target, `scripts/release.sh archive` builds the clean tag with the
@@ -1549,7 +1549,7 @@ There are three separate verification levels:
 
 | Level | Command | When | Network, credentials |
 | --- | --- | --- | --- |
-| Deterministic gate | `scripts/test-pyramid.sh` | before every handoff and in the required `CI` check | none; synthetic fixtures and fake Maven wrappers, no Maven, JDK or `~/.m2` |
+| Deterministic gate | `scripts/test-pyramid.sh` | before every handoff and in the required `verify` check | none; synthetic fixtures and fake Maven wrappers, no Maven, JDK or `~/.m2` |
 | Real Maven smoke | `scripts/real-maven-smoke.sh` | on demand | network once to prepare a pinned Maven and plugins; then offline |
 | Multi-project dogfood smoke | `scripts/dogfood-smoke.sh` | on demand, with an installed binary | the user's own trusted Maven projects, JDK and Maven repository |
 | Agent eval | `scripts/run-agent-eval.sh` | only when separately decided | a model provider account; usually paid |
@@ -1682,8 +1682,8 @@ execution is not a sandbox: plugins and tests run with your permissions.
 
 ### Hosted CI
 
-GitHub Actions runs the same verification gate from
-`.github/workflows/ci.yml` for pushes to `main` and pull requests targeting
+GitHub Actions runs the same verification gate in the `Verify` workflow
+(`.github/workflows/verify.yml`) for pushes to `main` and pull requests targeting
 `main`. Every job uses the committed `Cargo.lock` and installs the Rust
 toolchain pinned in `rust-toolchain.toml`, except `MSRV`:
 
@@ -1700,28 +1700,28 @@ toolchain pinned in `rust-toolchain.toml`, except `MSRV`:
 - `Node tools` installs the pinned Node.js, runs `npm ci` for the locked tools,
   and lists the server's tools through the MCP Inspector CLI. No model provider
   is called.
-- `CI` passes only when every job above passed. It is the required status check.
+- `verify` passes only when every job above passed. It is the required status check.
 
 The workflow has read-only repository permissions, does not persist checkout
 credentials, and uses no dependency cache.
 
 A pushed `v<version>` tag starts the separate `Release` workflow
-(`.github/workflows/release.yml`), which runs this complete `CI` workflow
+(`.github/workflows/release.yml`), which runs this complete `Verify` workflow
 first and then builds and publishes the release (see
 [Creating a release](#creating-a-release)). Only its `prepare`, `artifacts`, and
 `publish` jobs get write access to repository contents, and only `publish`
 uses the `release` environment and its crates.io token.
 
 The active default-branch ruleset requires a pull request and a successful,
-up-to-date `CI` check before merging. It requires zero approving reviews for
+up-to-date `verify` check before merging. It requires zero approving reviews for
 the single-maintainer workflow, blocks deletion and force pushes, and requires
 linear history. Use a short-lived branch, open a pull request to `main`, wait
-for `CI`, then squash merge. The repository deletes the branch after merging.
+for `verify`, then squash merge. The repository deletes the branch after merging.
 
 ### Dependency Maintenance
 
 Renovate opens grouped update pull requests, including the pinned Rust
-toolchain, Node.js version, and locked npm tools. The required `CI` check runs
+toolchain, Node.js version, and locked npm tools. The required `verify` check runs
 `cargo deny` for advisories, licenses and sources on every pull request and push
 to `main`; the `Dependency policy` workflow also scans daily. See
 [docs/dependency-maintenance.md](docs/dependency-maintenance.md) for the policy,
@@ -1755,7 +1755,7 @@ report may contain complete model output, configuration and local paths, so
 keep it local: do not commit it, attach it to issues or pull requests, or
 upload it as a CI artifact.
 
-Neither `scripts/test-pyramid.sh` nor the `CI` workflow runs this evaluation;
+Neither `scripts/test-pyramid.sh` nor the `Verify` workflow runs this evaluation;
 only the offline check of its configuration file is part of the gate. It calls
 a real, usually paid model provider, so run it only when that cost is
 intentionally accepted. Without `PROMPTFOO_PROVIDER`, or without Node.js of the

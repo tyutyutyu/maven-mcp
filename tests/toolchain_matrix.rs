@@ -36,8 +36,10 @@ fn is_exact_semver(version: &str) -> bool {
     version_parts(version).is_some_and(|parts| parts.len() == 3)
 }
 
-fn ci_workflow() -> Result<Yaml> {
-    Ok(serde_yaml_ng::from_str(&read(".github/workflows/ci.yml")?)?)
+fn verify_workflow() -> Result<Yaml> {
+    Ok(serde_yaml_ng::from_str(&read(
+        ".github/workflows/verify.yml",
+    )?)?)
 }
 
 fn step_commands(job: &Yaml) -> String {
@@ -78,7 +80,7 @@ fn developer_and_ci_rust_toolchain_is_an_exact_pin_newer_than_the_msrv() -> Resu
 
 #[test]
 fn ci_installs_the_pinned_toolchain_and_checks_the_msrv_separately() -> Result<()> {
-    let workflow = ci_workflow()?;
+    let workflow = verify_workflow()?;
     let jobs = workflow["jobs"].as_mapping().context("jobs")?;
     for (name, job) in jobs {
         let commands = step_commands(job);
@@ -103,7 +105,7 @@ fn ci_installs_the_pinned_toolchain_and_checks_the_msrv_separately() -> Result<(
 
 #[test]
 fn ci_builds_and_tests_every_supported_linux_target_natively() -> Result<()> {
-    let workflow = ci_workflow()?;
+    let workflow = verify_workflow()?;
     let platform = &workflow["jobs"]["platform"];
     let targets = platform["strategy"]["matrix"]["include"]
         .as_sequence()
@@ -140,25 +142,35 @@ fn aarch64_links_with_the_bundled_lld_to_keep_newer_glibc_references_weak() -> R
 }
 
 #[test]
-fn required_ci_check_passes_only_when_every_job_passes() -> Result<()> {
-    let workflow = ci_workflow()?;
+fn required_verify_check_passes_only_when_every_job_passes() -> Result<()> {
+    let workflow = verify_workflow()?;
+    assert_eq!(workflow["name"].as_str(), Some("Verify"));
+    let pull_request = &workflow["on"]["pull_request"];
+    assert!(
+        pull_request.get("paths").is_none() && pull_request.get("paths-ignore").is_none(),
+        "a path filter would leave the required check pending"
+    );
     let jobs = workflow["jobs"].as_mapping().context("jobs")?;
-    let ci = &workflow["jobs"]["ci"];
-    assert_eq!(ci["name"].as_str(), Some("CI"));
-    assert_eq!(ci["if"].as_str(), Some("always()"));
-    let needs = ci["needs"]
+    let verify = &workflow["jobs"]["verify"];
+    assert_eq!(verify["name"].as_str(), Some("verify"));
+    assert!(
+        verify.get("strategy").is_none(),
+        "a matrix job would report `verify (<value>)` instead of the required check"
+    );
+    assert_eq!(verify["if"].as_str(), Some("always()"));
+    let needs = verify["needs"]
         .as_sequence()
-        .context("CI needs")?
+        .context("verify needs")?
         .iter()
         .filter_map(Yaml::as_str)
         .collect::<BTreeSet<_>>();
     let others = jobs
         .keys()
         .filter_map(Yaml::as_str)
-        .filter(|name| *name != "ci")
+        .filter(|name| *name != "verify")
         .collect::<BTreeSet<_>>();
-    assert_eq!(needs, others, "CI must depend on every other job");
-    assert!(step_commands(ci).contains("= success"));
+    assert_eq!(needs, others, "verify must depend on every other job");
+    assert!(step_commands(verify).contains("= success"));
     Ok(())
 }
 
@@ -234,7 +246,7 @@ fn node_tool_scripts_use_the_locked_install_instead_of_npx() -> Result<()> {
 
 #[test]
 fn ci_node_tools_job_enforces_the_exact_package_manager_npm() -> Result<()> {
-    let workflow = ci_workflow()?;
+    let workflow = verify_workflow()?;
     let commands = step_commands(&workflow["jobs"]["node-tools"]);
     assert!(commands.contains("tools/package.json"));
     let install = commands
