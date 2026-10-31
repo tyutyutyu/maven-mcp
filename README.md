@@ -642,9 +642,12 @@ SQLite is compiled in. `scripts/check-linux-binary.sh` fails CI when a release
 binary needs a newer glibc symbol version or links another shared library. The
 test suite itself runs on the Ubuntu 26.04 CI runners only. Maven runs in its own process group, which is killed on timeout,
 cancellation, EOF, SIGINT, and SIGTERM; `maven-mcp stats` decides whether an
-instance is live from `/proc/<pid>` and reads RSS from `/proc/self/status`.
-Without a mounted procfs, `maven-mcp stats` exits with an error instead of
-reporting any instance as live or stale.
+instance is live from `/proc/<pid>` and its start time in `/proc/<pid>/stat`,
+and reads RSS from `/proc/self/status`. It deletes a status file only for a
+process proven gone; an unknown liveness keeps the file (see
+[Runtime statistics](#runtime-statistics)). Without a mounted procfs,
+`maven-mcp stats` exits with an error instead of reporting any instance as live
+or stale.
 
 Not supported: macOS, Windows, the BSDs, and other operating systems. The
 process-group cleanup and procfs checks above are Linux-specific, so building
@@ -912,13 +915,8 @@ maven-mcp stats --json
 time, for example `maven-mcp 0.1.0 (commit <40-hex commit>)`, or
 `(commit unknown)` for a build made without the installation flow. The stats
 command reads user-private runtime status files for live host-managed STDIO
-instances and reports PIDs, the package version, embedded commit and resolved
-executable path of each instance, process RSS where the platform exposes it,
-active project indexes, index sizes, estimated retained bytes, cache
-hit/miss/eviction/invalidation counters, and the persistent index cache counters
-(`persisted_classpath_hits`, `persisted_record_hits`, `persisted_record_misses`;
-additive JSON fields). If no server is running, it exits
-successfully with an empty report.
+instances; see [Runtime statistics](#runtime-statistics) for its fields, freshness
+and liveness rules.
 
 For local source-tree inspection, the bundled helper builds the binary and lets
 MCP Inspector start it over STDIO:
@@ -927,6 +925,127 @@ MCP Inspector start it over STDIO:
 scripts/run-inspector.sh
 scripts/run-inspector.sh --cli --method tools/list
 ```
+
+### Runtime statistics
+
+`maven-mcp stats` prints one human-readable block per live instance of the
+current user, and `maven-mcp stats --json` prints the same data as a versioned
+document. Neither starts an MCP transport. The report goes to stdout. Exit code
+`0` means a report was printed, including the empty report
+(`No live maven-mcp instances.`, or `"instances": []` in JSON). Exit code `1`
+means the report could not be produced, for example without a mounted procfs;
+the reason goes to stderr. Exit code `2` is a command-line usage error. The
+human-readable text is not a stable interface. Parse the JSON instead:
+
+```json
+{
+  "schema_version": 1,
+  "instances": [
+    {
+      "schema_version": 1,
+      "binary_version": "0.1.0",
+      "build_commit": "<40-hex commit or null>",
+      "executable": "/home/me/.local/share/maven-mcp/versions/<id>/maven-mcp",
+      "pid": 4242,
+      "process_start_ticks": 81234,
+      "started_unix_ms": 1767225600000,
+      "updated_unix_ms": 1767225660000,
+      "memory": { "rss_bytes": 52428800, "peak_rss_bytes": 73400320 },
+      "config": {
+        "max_results": 100,
+        "max_source_bytes": 1048576,
+        "max_project_indexes": 4,
+        "max_project_index_bytes": 1073741824
+      },
+      "cache": {
+        "entries": 1, "hits": 12, "misses": 1, "evictions": 0, "invalidations": 0,
+        "retained_bytes": 3145728, "max_bytes": 1073741824, "runners": 2,
+        "persisted_classpath_hits": 0, "persisted_record_hits": 0,
+        "persisted_record_misses": 0
+      },
+      "projects": [
+        {
+          "project_path": "/work/app",
+          "last_used_unix_ms": 1767225655000,
+          "state": "ready",
+          "index": {
+            "jar_count": 41, "source_jar_count": 3, "class_count": 9120,
+            "unique_class_count": 9050, "artifact_count": 41
+          },
+          "estimated_bytes": 3080192,
+          "classpath_entries": 43,
+          "build_duration_ms": 1840
+        },
+        {
+          "project_path": "/work/lib",
+          "last_used_unix_ms": 1767225650000,
+          "state": "not_indexed",
+          "index": {
+            "jar_count": 0, "source_jar_count": 0, "class_count": 0,
+            "unique_class_count": 0, "artifact_count": 0
+          },
+          "estimated_bytes": 0,
+          "classpath_entries": null,
+          "build_duration_ms": null
+        }
+      ]
+    }
+  ],
+  "unknown_instances": 0
+}
+```
+
+- `process_start_ticks` is the kernel start time of the process (field 22 of
+  `/proc/<pid>/stat`). Together with `pid` it identifies the process. Process
+  age is the difference between now and `started_unix_ms`. The human report
+  shows it as `age_s`.
+- `memory` is process-level RSS and peak RSS (`VmRSS`, `VmHWM`), or `null` when
+  the kernel does not expose them. It is not divided among projects.
+- `projects` lists every active canonical project: one with a cached Maven
+  model, a running build, or a retained index. `state` is `ready` when an index
+  is retained, `building` while a build without a retained index runs, and
+  `not_indexed` when only the model is cached because the index was never built,
+  was invalidated or was evicted. When the request of a running build is
+  cancelled, the status is written again as soon as the build's remaining
+  blocking work stops, so it does not stay `building`. `index`, `estimated_bytes`,
+  `classpath_entries` and `build_duration_ms` describe the retained index. They
+  are zero or `null` unless `state` is `ready`.
+- `estimated_bytes` is an estimate of the heap retained by the index and its
+  artifact stamps, not an allocator measurement. `cache.retained_bytes` adds
+  the runners and running builds, which are charged against
+  `MAX_PROJECT_INDEX_BYTES`.
+- `classpath_entries` counts the JARs and class directories the index was built
+  from. `build_duration_ms` is the wall-clock time from the start of classpath
+  resolution (Maven, or a stored classpath) to the publication of the index.
+- `unknown_instances` counts status files whose process could be proven neither
+  live nor gone. They are kept and not listed.
+
+Status files live in `MAVEN_MCP_RUNTIME_DIR`, by default
+`$XDG_RUNTIME_DIR/maven-mcp` or `$HOME/.cache/maven-mcp/runtime`. The directory
+has mode `0700` and each `<pid>.json` file has mode `0600`. Every instance writes
+only its own file and replaces it atomically, so concurrent instances cannot
+corrupt one another's status. Runner discovery, index builds, evictions and
+invalidations are written immediately. Cache hits only change the counters and
+the last-use time, so an instance writes them at most once per second. The file
+therefore lags behind cache hits by at most one second, and a burst of hits
+costs one write instead of one per hit. An instance removes its file on EOF,
+SIGINT and SIGTERM.
+
+Liveness is decided from Linux procfs. `maven-mcp stats` deletes a status file
+only when its process is proven gone: `/proc/<pid>` does not exist, or the PID
+now belongs to a process with a different start time (a reused PID). The file is
+first moved to a private name and read again there, and it is deleted only while
+it still holds the dead instance. A status that a new instance with the reused
+PID published in the meantime is put back without overwriting a newer one. An access
+error, an unexpected `/proc` entry or an unreadable start time leaves liveness
+unknown. Such a file is kept and counted in `unknown_instances`. A status file
+that is not valid JSON, or whose `pid` does not match its file name, is skipped
+and kept. Without a mounted procfs the command fails instead of treating every
+instance as gone. A status file written by an older version has no
+`process_start_ticks`. It is identified by PID only, so it is listed while any
+process holds that PID. Only the Linux targets under
+[Supported Platforms](#supported-platforms) are supported. Other operating
+systems do not build.
 
 ### Versioned local installation
 

@@ -10,7 +10,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rmcp::ErrorData;
@@ -19,9 +19,9 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use walkdir::WalkDir;
 
 use crate::{
-    index::MavenIndex,
+    index::{IndexStats, MavenIndex},
     project::MavenRunner,
-    runtime_stats::{ProjectIndexStatus, RuntimeCacheStatus, unix_ms},
+    runtime_stats::{IndexState, ProjectIndexStatus, RuntimeCacheStatus, unix_ms},
 };
 
 /// Fixed share of the budget charged for one cached runner, in addition to its fingerprint.
@@ -152,6 +152,16 @@ pub struct CachedIndex {
     project: Arc<ProjectFingerprint>,
     artifacts: ProjectFingerprint,
     bytes: u64,
+    classpath_entries: usize,
+    build_duration: Duration,
+}
+
+/// A finished build's artifact stamps and the figures `maven-mcp stats` reports for it.
+#[derive(Debug)]
+pub struct FinishedBuild {
+    pub artifacts: ProjectFingerprint,
+    pub classpath_entries: usize,
+    pub duration: Duration,
 }
 
 impl CachedIndex {
@@ -548,7 +558,7 @@ impl ProjectCache {
         root: &Path,
         generation: u64,
         index: &Arc<MavenIndex>,
-        artifacts: ProjectFingerprint,
+        build: FinishedBuild,
         project: Arc<ProjectFingerprint>,
         reservation: Arc<Reservation>,
     ) -> Publication {
@@ -558,7 +568,7 @@ impl ProjectCache {
             return Publication::Stale;
         }
         // The artifact stamps live as long as the index, and a class directory adds one per file.
-        let bytes = index.estimated_bytes() + artifacts.estimated_bytes();
+        let bytes = index.estimated_bytes() + build.artifacts.estimated_bytes();
         if bytes > self.limits.max_bytes {
             // Evicting every other project would not make room for it.
             if let Some(state) = self.states.get_mut(root) {
@@ -570,8 +580,10 @@ impl ProjectCache {
         let entry = Arc::new(CachedIndex {
             index: Arc::clone(index),
             project,
-            artifacts,
+            artifacts: build.artifacts,
             bytes,
+            classpath_entries: build.classpath_entries,
+            build_duration: build.duration,
         });
         let tick = self.next_tick();
         let state = self
@@ -653,19 +665,12 @@ impl ProjectCache {
         }
     }
 
+    /// Every active project: a retained index, a running build, or only a cached model.
     pub fn runtime_projects(&self) -> Vec<ProjectIndexStatus> {
         let mut projects = self
             .states
             .iter()
-            .filter_map(|(root, state)| {
-                let entry = state.index.as_ref()?;
-                Some(ProjectIndexStatus {
-                    project_path: root.display().to_string(),
-                    last_used_unix_ms: state.last_used_unix_ms,
-                    index: entry.index.stats(),
-                    estimated_bytes: entry.bytes,
-                })
-            })
+            .filter_map(|(root, state)| state.runtime_status(root))
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.project_path.cmp(&right.project_path));
         projects
@@ -807,6 +812,33 @@ impl ProjectCache {
 }
 
 impl ProjectState {
+    fn runtime_status(&self, root: &Path) -> Option<ProjectIndexStatus> {
+        let status = |state| ProjectIndexStatus {
+            project_path: root.display().to_string(),
+            last_used_unix_ms: self.last_used_unix_ms,
+            state,
+            index: IndexStats::default(),
+            estimated_bytes: 0,
+            classpath_entries: None,
+            build_duration_ms: None,
+        };
+        if let Some(entry) = &self.index {
+            return Some(ProjectIndexStatus {
+                index: entry.index.stats(),
+                estimated_bytes: entry.bytes,
+                classpath_entries: Some(entry.classpath_entries),
+                build_duration_ms: Some(
+                    u64::try_from(entry.build_duration.as_millis()).unwrap_or(u64::MAX),
+                ),
+                ..status(IndexState::Ready)
+            });
+        }
+        if self.in_flight.as_ref().is_some_and(InFlight::is_live) {
+            return Some(status(IndexState::Building));
+        }
+        self.runner.as_ref().map(|_| status(IndexState::NotIndexed))
+    }
+
     fn new(generation: u64) -> Self {
         Self {
             generation,
