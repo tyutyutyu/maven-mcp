@@ -120,7 +120,10 @@ impl PersistentIndexCache {
                 tool: self.tool.clone(),
             }),
             Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "index cache is unavailable; building without it");
+                tracing::warn!(
+                    error_kind = %crate::log_safety::error_category(&error),
+                    "index cache is unavailable; building without it"
+                );
                 None
             }
         }
@@ -137,7 +140,10 @@ impl PersistentIndexCache {
         let epoch = self.recovery_epoch()?;
         match self.try_write(update) {
             Err(error) if is_damaged(&error) => {
-                tracing::warn!(error = %format!("{error:#}"), "rebuilding a damaged index cache");
+                tracing::warn!(
+                    error_kind = %crate::log_safety::error_category(&error),
+                    "rebuilding a damaged index cache"
+                );
                 drop(self.recover(epoch)?);
                 self.try_write(update)
             }
@@ -212,7 +218,10 @@ impl PersistentIndexCache {
         drop(lock);
         match opened {
             Err(error) if is_damaged(&error) => {
-                tracing::warn!(error = %format!("{error:#}"), "rebuilding a damaged or incompatible index cache");
+                tracing::warn!(
+                    error_kind = %crate::log_safety::error_category(&error),
+                    "rebuilding a damaged or incompatible index cache"
+                );
                 self.recover(epoch)
             }
             result => result,
@@ -331,8 +340,11 @@ impl CacheReader {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "index cache lookup failed; treating it as a miss");
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    error_kind = %"sqlite",
+                    "index cache lookup failed; treating it as a miss"
+                );
                 None
             })
     }

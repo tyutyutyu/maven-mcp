@@ -41,6 +41,12 @@ agent-specific development rules.
 - `src/project_cache.rs`: per-project runner and index cache: file fingerprints,
   generations, single-flight index builds, and the shared memory budget.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
+- `src/server/tool_call.rs`: the central `tools/call` debug trace (`call_id`,
+  known tool name, outcome, duration).
+- `src/project/run_trace.rs`: debug events of the Maven child lifecycle, keyed by
+  a closed operation category.
+- `src/log_safety.rs`: stable `error_kind` categories so log events never quote
+  error messages or paths.
 - `src/main.rs`: STDIO transport, EOF, SIGINT, and SIGTERM
   lifecycle.
 - `tests/support/mod.rs`: deterministic temporary Maven fixture repository and a

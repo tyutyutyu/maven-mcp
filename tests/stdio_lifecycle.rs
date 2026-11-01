@@ -16,7 +16,10 @@ use tokio::{
 
 use maven_mcp::runtime_stats::HIT_PUBLICATION_DELAY;
 use rmcp::model::CallToolRequestParams;
-use support::TestServer;
+use support::{
+    TestServer,
+    debug_log::{self, StderrLog},
+};
 
 #[tokio::test]
 async fn stdout_contains_only_json_rpc_and_eof_stops_the_server() -> Result<()> {
@@ -459,12 +462,15 @@ async fn a_cancelled_index_build_stops_reporting_building_once_its_work_stops() 
     let blocked = support::install_blocked_classpath(project)?;
     let runtime = tempfile::tempdir()?;
     let runtime_dir = runtime.path().to_str().context("UTF-8 runtime path")?;
-    let (client, pid) = server
-        .connect_with_limits(&[
+    // Debug stderr shows when the server has handled the cancellation.
+    let (client, pid, stderr) = server
+        .connect_with_stderr(&[
             ("MAVEN_MCP_RUNTIME_DIR", runtime_dir),
             ("MAVEN_TIMEOUT_SECONDS", "30"),
+            ("RUST_LOG", "maven_mcp=debug"),
         ])
         .await?;
+    let stderr = StderrLog::capture(stderr);
     let arguments = json!({ "project_path": project.display().to_string(), "query": "One" });
     let handle = client
         .send_cancellable_request(
@@ -480,6 +486,14 @@ async fn a_cancelled_index_build_stops_reporting_building_once_its_work_stops() 
     assert_eq!(building["projects"][0]["state"], "building", "{building:#}");
 
     handle.cancel(Some("regression".to_owned())).await?;
+    // Releasing the build before the server handled the cancellation would let it finish
+    // and publish a ready index.
+    stderr
+        .wait_for(|line| {
+            debug_log::has_message(line, "tool call finished")
+                && debug_log::field(line, "outcome") == Some("cancelled")
+        })
+        .await?;
     blocked.release().await?;
 
     // No further project request: the abandoned build's end alone republishes the status.
@@ -1030,5 +1044,575 @@ async fn debug_logging_and_responses_never_reveal_credentials_or_project_paths()
         assert!(!text.contains("panicked"), "{text}");
     }
     assert!(stderr.contains("MCP server ready for request-scoped Maven projects"));
+    Ok(())
+}
+
+const QUERY_MARKER: &str = "SyntheticQueryMarkerZq";
+const CREDENTIAL_MARKER: &str = "synthetic-credential-marker-7f3";
+const UNKNOWN_TOOL_MARKER: &str = "synthetic_unknown_tool_marker";
+const RELATIVE_PATH_MARKER: &str = "relative-synthetic-path-marker";
+
+/// Wraps the fixture wrapper so a `run_maven` call with a credential-like property also
+/// writes credential-like output that must be redacted and never logged.
+fn install_credential_echoing_wrapper(project: &Path) -> Result<()> {
+    std::fs::rename(project.join("mvnw"), project.join("mvnw-fixture"))?;
+    let wrapper = project.join("mvnw");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" -Dpassword=\"*)\n    printf 'token={CREDENTIAL_MARKER}\\n'\n    printf 'Authorization: Bearer {CREDENTIAL_MARKER}\\n' >&2\n    ;;\nesac\nexec \"$PWD/mvnw-fixture\" \"$@\"\n"
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn tool_call(name: &'static str, arguments: Value) -> CallToolRequestParams {
+    CallToolRequestParams::new(name).with_arguments(
+        arguments
+            .as_object()
+            .cloned()
+            .expect("tool arguments are an object"),
+    )
+}
+
+/// The first inner event of `call_id` with `message`.
+fn inner_event<'a>(lines: &'a [String], call_id: u64, message: &str) -> Option<&'a str> {
+    lines.iter().map(String::as_str).find(|line| {
+        debug_log::has_message(line, message) && debug_log::span_call_id(line) == Some(call_id)
+    })
+}
+
+/// Fails when stderr quotes any of `forbidden`.
+fn assert_never_logged(lines: &[String], forbidden: &[&str]) {
+    let stderr = lines.join("\n");
+    for value in forbidden {
+        assert!(!value.is_empty());
+        assert!(
+            !stderr.contains(value),
+            "stderr quotes {value:?}:\n{stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn debug_log_correlates_tool_calls_cache_and_maven_without_sensitive_data() -> Result<()> {
+    let fixture = TestServer::start_with_project().await?;
+    let project = fixture
+        .project_path()
+        .context("missing fixture project")?
+        .to_owned();
+    let trusted = fixture
+        .trusted_project_directory()
+        .context("missing trusted directory")?
+        .to_owned();
+    install_credential_echoing_wrapper(&project)?;
+    let (client, _, stderr) = fixture
+        .connect_with_stderr(&[("RUST_LOG", "maven_mcp=debug")])
+        .await?;
+    let stderr = StderrLog::capture(stderr);
+    let project_path = project.display().to_string();
+
+    // First and repeated index requests for the same project: miss and build, then hit.
+    client
+        .call_tool(tool_call(
+            "search_classes",
+            json!({ "project_path": project_path, "query": QUERY_MARKER }),
+        ))
+        .await?;
+    client
+        .call_tool(tool_call(
+            "search_classes",
+            json!({ "project_path": project_path, "query": "Foo" }),
+        ))
+        .await?;
+    let (searched, source) = tokio::join!(
+        client.call_tool(tool_call(
+            "search_classes",
+            json!({ "project_path": project_path, "query": "Foo" }),
+        )),
+        client.call_tool(tool_call(
+            "get_class_source",
+            json!({ "project_path": project_path, "class_name": "org.example.Foo" }),
+        )),
+    );
+    searched?;
+    let source = serde_json::to_string(&source?)?;
+    assert!(source.contains("int scoped = 2"), "{source}");
+    let maven = client
+        .call_tool(tool_call(
+            "run_maven",
+            json!({
+                "project_path": project_path,
+                "arguments": [format!("-Dpassword={CREDENTIAL_MARKER}")]
+            }),
+        ))
+        .await?;
+    assert_eq!(
+        maven
+            .structured_content
+            .as_ref()
+            .map(|result| &result["status"]),
+        Some(&json!("success"))
+    );
+    assert!(
+        client
+            .call_tool(tool_call(UNKNOWN_TOOL_MARKER, json!({})))
+            .await
+            .is_err()
+    );
+    assert!(
+        client
+            .call_tool(tool_call(
+                "search_classes",
+                json!({ "project_path": RELATIVE_PATH_MARKER, "query": QUERY_MARKER }),
+            ))
+            .await
+            .is_err()
+    );
+    client.cancel().await?;
+    let lines = stderr.finish().await?;
+    let log = lines.join("\n");
+
+    let calls = debug_log::correlated_calls(&lines)?;
+    let summary = calls
+        .iter()
+        .map(|call| (call.tool.as_str(), call.outcome.as_deref().unwrap_or("")))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 7, "{log}");
+    assert_eq!(summary[0], ("search_classes", "success"), "{log}");
+    assert_eq!(summary[1], ("search_classes", "success"), "{log}");
+    let mut parallel = vec![summary[2], summary[3]];
+    parallel.sort_unstable();
+    assert_eq!(
+        parallel,
+        [
+            ("get_class_source", "success"),
+            ("search_classes", "success")
+        ],
+        "{log}"
+    );
+    assert_eq!(summary[4], ("run_maven", "success"), "{log}");
+    assert_eq!(summary[5], ("<unknown>", "unknown_tool"), "{log}");
+    assert_eq!(summary[6], ("search_classes", "invalid_params"), "{log}");
+
+    let (first, repeated, run_maven) = (calls[0].call_id, calls[1].call_id, calls[4].call_id);
+    assert!(
+        inner_event(&lines, first, "project runner cache miss").is_some(),
+        "{log}"
+    );
+    assert!(
+        inner_event(&lines, first, "project index cache miss").is_some(),
+        "{log}"
+    );
+    assert!(
+        inner_event(&lines, first, "project index build started").is_some(),
+        "{log}"
+    );
+    let built = inner_event(&lines, first, "project index build finished").context("build")?;
+    assert_eq!(debug_log::field(built, "result"), Some("retained"), "{log}");
+    assert!(debug_log::field(built, "class_count").is_some(), "{log}");
+    assert!(
+        debug_log::field(built, "classpath_entries").is_some(),
+        "{log}"
+    );
+    assert!(
+        inner_event(&lines, repeated, "project runner cache hit").is_some(),
+        "{log}"
+    );
+    assert!(
+        inner_event(&lines, repeated, "project index cache hit").is_some(),
+        "{log}"
+    );
+    assert!(
+        inner_event(&lines, repeated, "project index build started").is_none(),
+        "{log}"
+    );
+    assert!(log.contains("runtime status published"), "{log}");
+
+    let classpath = inner_event(&lines, first, "maven run finished").context("classpath run")?;
+    assert_eq!(debug_log::field(classpath, "operation"), Some("classpath"));
+    assert_eq!(debug_log::field(classpath, "status"), Some("success"));
+    assert_eq!(debug_log::field(classpath, "exit_code"), Some("0"));
+    assert_eq!(debug_log::field(classpath, "timeout_ms"), Some("2000"));
+    for name in [
+        "wait_ms",
+        "run_ms",
+        "duration_ms",
+        "timed_out",
+        "redaction_count",
+    ] {
+        assert!(debug_log::field(classpath, name).is_some(), "{name}: {log}");
+    }
+    assert_eq!(
+        debug_log::field(classpath, "stdout_truncated"),
+        Some("false")
+    );
+    assert_eq!(
+        debug_log::field(classpath, "stderr_truncated"),
+        Some("false")
+    );
+    assert!(
+        inner_event(&lines, run_maven, "maven run started").is_some(),
+        "{log}"
+    );
+    let arguments = inner_event(&lines, run_maven, "maven run finished").context("run_maven")?;
+    assert_eq!(debug_log::field(arguments, "operation"), Some("arguments"));
+    assert_eq!(debug_log::field(arguments, "exit_code"), Some("0"));
+    assert!(
+        debug_log::field(arguments, "redaction_count")
+            .and_then(|count| count.parse::<u64>().ok())
+            .is_some_and(|count| count >= 2),
+        "{log}"
+    );
+
+    assert_never_logged(
+        &lines,
+        &[
+            &project_path,
+            &trusted.display().to_string(),
+            QUERY_MARKER,
+            CREDENTIAL_MARKER,
+            UNKNOWN_TOOL_MARKER,
+            RELATIVE_PATH_MARKER,
+            "-Dpassword",
+            "dependency:build-classpath",
+            "Dependencies classpath",
+            "BUILD SUCCESS",
+            "org.example",
+            "org/example",
+            "ScopedOnly",
+            "int scoped",
+            "helper-2.0",
+            "org.libs",
+        ],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn debug_log_records_a_cancelled_tool_call_with_one_cancelled_finish() -> Result<()> {
+    let fixture = TestServer::start_with_project().await?;
+    let project = fixture.project_path().context("missing fixture project")?;
+    let blocked = support::install_blocked_classpath(project)?;
+    let (client, pid, stderr) = fixture
+        .connect_with_stderr(&[
+            ("RUST_LOG", "maven_mcp=debug"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+    let stderr = StderrLog::capture(stderr);
+    let arguments = json!({ "project_path": project.display().to_string(), "query": QUERY_MARKER });
+    let handle = client
+        .send_cancellable_request(
+            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
+                tool_call("search_classes", arguments),
+            )),
+            rmcp::service::PeerRequestOptions::no_options(),
+        )
+        .await?;
+    support::wait_for_blocked_fifo_readers(pid, 1).await?;
+    handle
+        .cancel(Some(format!("{} {CREDENTIAL_MARKER}", project.display())))
+        .await?;
+    stderr
+        .wait_for(|line| {
+            debug_log::has_message(line, "tool call finished")
+                && debug_log::field(line, "outcome") == Some("cancelled")
+        })
+        .await?;
+    blocked.release().await?;
+    client.cancel().await?;
+    let lines = stderr.finish().await?;
+
+    let calls = debug_log::correlated_calls(&lines)?;
+    assert_eq!(calls.len(), 1, "{}", lines.join("\n"));
+    assert_eq!(calls[0].tool, "search_classes");
+    assert_eq!(calls[0].outcome.as_deref(), Some("cancelled"));
+    let classpath = inner_event(&lines, calls[0].call_id, "maven run finished")
+        .context("the cancelled call ran the classpath goal first")?;
+    assert_eq!(debug_log::field(classpath, "operation"), Some("classpath"));
+    assert_never_logged(
+        &lines,
+        &[
+            &project.display().to_string(),
+            QUERY_MARKER,
+            CREDENTIAL_MARKER,
+            "blocked-1.0",
+            "alpha-1.0",
+        ],
+    );
+    Ok(())
+}
+
+/// A raw STDIO session: initialize, then one unknown-tool call, then EOF or SIGTERM. Returns
+/// the exit status, every stdout line and the complete stderr.
+async fn raw_unknown_tool_session(
+    rust_log: Option<&str>,
+    stop_with_sigterm: bool,
+) -> Result<(std::process::ExitStatus, Vec<String>, String)> {
+    let runtime = tempfile::tempdir()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_maven-mcp"));
+    command
+        .env("MAVEN_MCP_INDEX_CACHE", "false")
+        .env("MAVEN_MCP_RUNTIME_DIR", runtime.path())
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(filter) = rust_log {
+        command.env("RUST_LOG", filter);
+    }
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take().context("missing child stdin")?;
+    let mut lines = BufReader::new(child.stdout.take().context("missing child stdout")?).lines();
+    let stderr = child.stderr.take().context("missing child stderr")?;
+    let stderr = tokio::spawn(async move {
+        let mut text = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut BufReader::new(stderr), &mut text)
+            .await
+            .map(|_| text)
+    });
+    for message in [
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "debug-log-test", "version": "1.0" }
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": UNKNOWN_TOOL_MARKER, "arguments": { "query": QUERY_MARKER } }
+        }),
+    ] {
+        stdin.write_all(format!("{message}\n").as_bytes()).await?;
+    }
+    let mut stdout = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await?
+                .context("server closed stdout before the tool response")?;
+            let message: Value = serde_json::from_str(&line)
+                .with_context(|| format!("non-JSON content on server stdout: {line}"))?;
+            stdout.push(line);
+            if message["id"] == 2 {
+                anyhow::ensure!(message.get("error").is_some(), "{message}");
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await
+    .context("unknown tool response timed out")??;
+    if stop_with_sigterm {
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id().context("child pid")?)?),
+            nix::sys::signal::Signal::SIGTERM,
+        )?;
+    } else {
+        drop(stdin);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .context("server did not stop")??;
+    while let Some(line) = lines.next_line().await? {
+        stdout.push(line);
+    }
+    Ok((status, stdout, stderr.await??))
+}
+
+fn assert_json_rpc_only(stdout: &[String]) -> Result<()> {
+    for line in stdout {
+        let message: Value = serde_json::from_str(line)
+            .with_context(|| format!("non-JSON content on server stdout: {line}"))?;
+        assert_eq!(message["jsonrpc"], "2.0", "invalid JSON-RPC output: {line}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn debug_logging_keeps_stdout_json_rpc_only_through_eof_and_sigterm() -> Result<()> {
+    for (stop_with_sigterm, reason) in [(false, "closed"), (true, "signal")] {
+        let (status, stdout, stderr) =
+            raw_unknown_tool_session(Some("maven_mcp=debug"), stop_with_sigterm).await?;
+        assert!(status.success(), "sigterm={stop_with_sigterm}: {status}");
+        assert_json_rpc_only(&stdout)?;
+        let lines = stderr.lines().map(str::to_owned).collect::<Vec<_>>();
+        assert!(stderr.contains("MCP server ready for request-scoped Maven projects"));
+        let summary = lines
+            .iter()
+            .find(|line| debug_log::has_message(line, "configuration summary"))
+            .context("configuration summary")?;
+        assert_eq!(debug_log::field(summary, "trusted_directories"), Some("0"));
+        assert!(stderr.contains("STDIO service initialized"), "{stderr}");
+        assert!(
+            lines.iter().any(|line| {
+                debug_log::has_message(line, "STDIO connection closed")
+                    && debug_log::field(line, "reason") == Some(reason)
+            }),
+            "{stderr}"
+        );
+        let calls = debug_log::correlated_calls(&lines)?;
+        assert_eq!(calls.len(), 1, "{stderr}");
+        assert_eq!(calls[0].tool, "<unknown>");
+        assert_eq!(calls[0].outcome.as_deref(), Some("unknown_tool"));
+        assert_never_logged(&lines, &[UNKNOWN_TOOL_MARKER, QUERY_MARKER]);
+        assert!(
+            !stderr.contains('\u{1b}'),
+            "stderr is not a terminal: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_and_invalid_log_filters_keep_info_without_per_call_events() -> Result<()> {
+    for filter in [None, Some("maven_mcp=info"), Some("maven_mcp=notalevel")] {
+        let (status, stdout, stderr) = raw_unknown_tool_session(filter, false).await?;
+        assert!(status.success(), "{filter:?}: {status}");
+        assert_json_rpc_only(&stdout)?;
+        assert!(
+            stderr.contains("MCP server ready for request-scoped Maven projects"),
+            "{filter:?}: {stderr}"
+        );
+        assert!(stderr.contains("MCP server ready"), "{filter:?}: {stderr}");
+        for debug_only in [
+            "tool call started",
+            "tool call finished",
+            "configuration summary",
+            "STDIO connection closed",
+            " DEBUG ",
+        ] {
+            assert!(!stderr.contains(debug_only), "{filter:?}: {stderr}");
+        }
+        assert!(
+            !stderr.contains(UNKNOWN_TOOL_MARKER),
+            "{filter:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn debug_log_counts_project_index_evictions() -> Result<()> {
+    let fixture = TestServer::start_with_project().await?;
+    let first = fixture
+        .project_path()
+        .context("missing fixture project")?
+        .to_owned();
+    let second = fixture.add_trusted_project("eviction-second")?;
+    // Both classpaths must lie in the configured execution repository.
+    support::install_controlled_wrapper(
+        &second,
+        &[first.join("execution-repository/org/libs/helper/2.0/helper-2.0.jar")],
+    )?;
+    let (client, _, stderr) = fixture
+        .connect_with_stderr(&[
+            ("RUST_LOG", "maven_mcp=debug"),
+            ("MAX_PROJECT_INDEXES", "1"),
+        ])
+        .await?;
+    let stderr = StderrLog::capture(stderr);
+    for project in [&first, &second, &first] {
+        client
+            .call_tool(tool_call(
+                "search_classes",
+                json!({ "project_path": project.display().to_string(), "query": "Foo" }),
+            ))
+            .await?;
+    }
+    client.cancel().await?;
+    let lines = stderr.finish().await?;
+    let log = lines.join("\n");
+
+    let calls = debug_log::correlated_calls(&lines)?;
+    assert_eq!(calls.len(), 3, "{log}");
+    assert!(inner_event(&lines, calls[0].call_id, "project index evicted").is_none());
+    let evictions = [1, 2].map(|call| {
+        inner_event(&lines, calls[call].call_id, "project index evicted")
+            .and_then(|line| debug_log::field(line, "evictions"))
+            .map(str::to_owned)
+    });
+    assert_eq!(
+        evictions,
+        [Some("1".to_owned()), Some("2".to_owned())],
+        "{log}"
+    );
+    // The repeated first project was evicted, so it misses and builds again.
+    assert!(inner_event(&lines, calls[2].call_id, "project index cache miss").is_some());
+    assert!(
+        lines.iter().any(|line| {
+            debug_log::has_message(line, "runtime status published")
+                && debug_log::field(line, "evictions") == Some("2")
+        }),
+        "{log}"
+    );
+    assert_never_logged(
+        &lines,
+        &[
+            &first.display().to_string(),
+            &second.display().to_string(),
+            "eviction-second",
+            "helper-2.0",
+        ],
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn skipped_archive_warnings_carry_a_reason_but_no_archive_or_path() -> Result<()> {
+    let fixture = TestServer::start_with_project().await?;
+    let project = fixture.project_path().context("missing fixture project")?;
+    let blocked = support::install_blocked_classpath(project)?;
+    let (client, pid, stderr) = fixture
+        .connect_with_stderr(&[
+            ("RUST_LOG", "maven_mcp=debug"),
+            ("MAVEN_TIMEOUT_SECONDS", "30"),
+        ])
+        .await?;
+    let stderr = StderrLog::capture(stderr);
+    let search = client.call_tool(tool_call(
+        "search_classes",
+        json!({ "project_path": project.display().to_string(), "query": "One" }),
+    ));
+    let release = async {
+        support::wait_for_blocked_fifo_readers(pid, 1).await?;
+        blocked.release().await
+    };
+    let (searched, released) = tokio::join!(search, release);
+    released?;
+    // The released pipe reads as an empty archive, which the build skips with a warning.
+    searched?;
+    client.cancel().await?;
+    let lines = stderr.finish().await?;
+    let log = lines.join("\n");
+
+    let calls = debug_log::correlated_calls(&lines)?;
+    assert_eq!(calls.len(), 1, "{log}");
+    let warning = lines
+        .iter()
+        .find(|line| line.contains(" WARN ") && debug_log::field(line, "reason").is_some())
+        .context("skipped archive warning")?;
+    assert_eq!(
+        debug_log::span_call_id(warning),
+        Some(calls[0].call_id),
+        "{log}"
+    );
+    assert!(debug_log::field(warning, "error_kind").is_some(), "{log}");
+    assert_never_logged(
+        &lines,
+        &[
+            &project.display().to_string(),
+            "blocked-1.0",
+            "alpha-1.0",
+            "org.t",
+            "org/t",
+            "AlphaOne",
+        ],
+    );
     Ok(())
 }

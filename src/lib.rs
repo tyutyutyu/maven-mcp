@@ -13,6 +13,7 @@ pub mod config;
 pub mod index;
 pub mod index_cache;
 pub mod log_analysis;
+mod log_safety;
 pub mod project;
 pub mod project_cache;
 pub mod redaction;
