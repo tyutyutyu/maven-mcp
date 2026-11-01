@@ -17,6 +17,8 @@ use rmcp::{
 use tempfile::TempDir;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
+pub mod debug_log;
+
 pub struct TestServer {
     repository: TempDir,
     /// Private on-disk index cache shared by every process of this server; persistence is
@@ -119,55 +121,79 @@ impl TestServer {
         &self,
         limits: &[(&str, &str)],
     ) -> Result<(RunningService<RoleClient, ()>, u32)> {
-        let command =
-            tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp")).configure(|command| {
-                command
-                    .env("MAX_RESULTS", "50")
-                    .env("MAX_SOURCE_BYTES", "1024")
-                    .env("RUST_LOG", "maven_mcp=warn")
-                    .env("MAVEN_MCP_CACHE_DIR", self.index_cache.path())
-                    .env("MAVEN_MCP_INDEX_CACHE", "false");
-                if let (Some(trusted_directory), Some(project_path)) =
-                    (&self.trusted_project_directory, &self.project_path)
-                {
-                    command
-                        .env(
-                            "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
-                            trusted_directory.path(),
-                        )
-                        .env(
-                            "MAVEN_EXECUTION_REPO_PATH",
-                            project_path.join("execution-repository"),
-                        )
-                        .env("MAVEN_TIMEOUT_SECONDS", "2")
-                        .env("MAX_MAVEN_OUTPUT_BYTES", "16384");
-                }
-                for (name, value) in limits {
-                    command.env(name, value);
-                }
-                if let Some(jenv_root) = &self.jenv_root {
-                    command
-                        .arg("--jenv")
-                        .env("JENV_ROOT", jenv_root.path())
-                        .env("JENV_VERSION", "must-not-override-project")
-                        .env("JENV_DIR", "/must-not-override-project")
-                        .env_remove("JAVA_HOME")
-                        .env("PATH", "/usr/bin:/bin");
-                }
-                if let Some(java_home) = &self.inherited_java_home {
-                    command.env("JAVA_HOME", java_home.path()).env(
-                        "PATH",
-                        format!("{}/bin:/usr/bin:/bin", java_home.path().display()),
-                    );
-                }
-            });
-        let transport = TokioChildProcess::new(command)?;
+        let transport = TokioChildProcess::new(self.server_command(limits))?;
+        Self::serve(transport).await
+    }
+
+    /// Like [`Self::connect_with_limits`], but the server's stderr diagnostics stay readable;
+    /// the caller must drain them, or a full pipe blocks the server.
+    pub async fn connect_with_stderr(
+        &self,
+        limits: &[(&str, &str)],
+    ) -> Result<(
+        RunningService<RoleClient, ()>,
+        u32,
+        tokio::process::ChildStderr,
+    )> {
+        let (transport, stderr) = TokioChildProcess::builder(self.server_command(limits))
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let stderr = stderr.context("missing STDIO server stderr")?;
+        let (client, process_id) = Self::serve(transport).await?;
+        Ok((client, process_id, stderr))
+    }
+
+    async fn serve(transport: TokioChildProcess) -> Result<(RunningService<RoleClient, ()>, u32)> {
         let process_id = transport.id().context("missing STDIO server process id")?;
         let client = tokio::time::timeout(Duration::from_secs(300), ().serve(transport))
             .await
             .context("STDIO MCP server startup timed out")?
             .context("STDIO MCP client initialization failed")?;
         Ok((client, process_id))
+    }
+
+    fn server_command(&self, limits: &[(&str, &str)]) -> tokio::process::Command {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp")).configure(|command| {
+            command
+                .env("MAX_RESULTS", "50")
+                .env("MAX_SOURCE_BYTES", "1024")
+                .env("RUST_LOG", "maven_mcp=warn")
+                .env("MAVEN_MCP_CACHE_DIR", self.index_cache.path())
+                .env("MAVEN_MCP_INDEX_CACHE", "false");
+            if let (Some(trusted_directory), Some(project_path)) =
+                (&self.trusted_project_directory, &self.project_path)
+            {
+                command
+                    .env(
+                        "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+                        trusted_directory.path(),
+                    )
+                    .env(
+                        "MAVEN_EXECUTION_REPO_PATH",
+                        project_path.join("execution-repository"),
+                    )
+                    .env("MAVEN_TIMEOUT_SECONDS", "2")
+                    .env("MAX_MAVEN_OUTPUT_BYTES", "16384");
+            }
+            for (name, value) in limits {
+                command.env(name, value);
+            }
+            if let Some(jenv_root) = &self.jenv_root {
+                command
+                    .arg("--jenv")
+                    .env("JENV_ROOT", jenv_root.path())
+                    .env("JENV_VERSION", "must-not-override-project")
+                    .env("JENV_DIR", "/must-not-override-project")
+                    .env_remove("JAVA_HOME")
+                    .env("PATH", "/usr/bin:/bin");
+            }
+            if let Some(java_home) = &self.inherited_java_home {
+                command.env("JAVA_HOME", java_home.path()).env(
+                    "PATH",
+                    format!("{}/bin:/usr/bin:/bin", java_home.path().display()),
+                );
+            }
+        })
     }
 
     #[allow(dead_code)]

@@ -232,7 +232,10 @@ pub(super) fn persistable(
             payload,
         }),
         Err(error) => {
-            tracing::warn!(%error, "cannot encode an index record for the cache");
+            tracing::warn!(
+                error_kind = %crate::log_safety::error_category(&error),
+                "cannot encode an index record for the cache"
+            );
             None
         }
     }
@@ -251,7 +254,10 @@ pub(super) fn restore(
     let stored = match decode_payload::<StoredRecord>(payload).and_then(validate) {
         Ok(stored) => stored,
         Err(error) => {
-            tracing::warn!(%error, "ignoring an unreadable cached index record");
+            tracing::warn!(
+                error_kind = %crate::log_safety::error_category(&error),
+                "ignoring an unreadable cached index record"
+            );
             return Ok(None);
         }
     };

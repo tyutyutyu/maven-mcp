@@ -169,7 +169,10 @@ impl HeavyWork {
             }
         };
         let job = token.clone();
+        // The request's span (its tool call) also covers the events of its blocking work.
+        let span = tracing::Span::current();
         let handle = tokio::task::spawn_blocking(move || {
+            let _entered = span.entered();
             let _slots = (admitted, running);
             scope(&job, || (!job.is_cancelled()).then(work))
         });

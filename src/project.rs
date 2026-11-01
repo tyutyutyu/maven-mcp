@@ -28,6 +28,10 @@ use walkdir::WalkDir;
 use crate::config::{JavaEnvironment, MavenExecutionConfig, ProjectExecutionConfig};
 use crate::redaction::{redact_properties, redact_sensitive_values};
 
+mod run_trace;
+
+use run_trace::{MavenOperation, MavenRunTrace, RunFailure};
+
 const JENV_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Created and dropped while the global Maven permit is held.
@@ -700,7 +704,7 @@ impl MavenRunner {
             Ok(arguments) => arguments,
             Err(error) => return self.runner_error(started, error.to_string()),
         };
-        self.execute(arguments).await
+        self.execute(MavenOperation::Lifecycle, arguments).await
     }
 
     pub async fn run_arguments(&self, arguments: &[String]) -> Result<MavenRunResult> {
@@ -708,7 +712,10 @@ impl MavenRunner {
             bail!("Maven arguments must not contain NUL bytes");
         }
         Ok(self
-            .execute(arguments.iter().map(OsString::from).collect())
+            .execute(
+                MavenOperation::Arguments,
+                arguments.iter().map(OsString::from).collect(),
+            )
             .await)
     }
 
@@ -728,8 +735,8 @@ impl MavenRunner {
                 };
             }
         };
-        let _permit = match self.permit.acquire().await {
-            Ok(permit) => permit,
+        let (_permit, wait) = match self.acquire_permit(MavenOperation::FocusedTest).await {
+            Ok(acquired) => acquired,
             Err(error) => {
                 return FocusedTestResult {
                     report_status: TestReportStatus::Missing,
@@ -744,7 +751,7 @@ impl MavenRunner {
         };
         let before = self.report_snapshot();
         let run = self
-            .execute_permitted(arguments, Instant::now())
+            .execute_permitted(MavenOperation::FocusedTest, arguments, Instant::now(), wait)
             .await
             .result;
         let build = MavenBuildResult::from_run(run);
@@ -870,8 +877,8 @@ impl MavenRunner {
             }
         };
         let output = output_directory.join("effective-pom.xml");
-        let _permit = match self.permit.acquire().await {
-            Ok(permit) => permit,
+        let (_permit, wait) = match self.acquire_permit(MavenOperation::EffectivePom).await {
+            Ok(acquired) => acquired,
             Err(error) => {
                 return EffectivePomResult {
                     status: DiagnosticStatus::Invalid,
@@ -912,9 +919,14 @@ impl MavenRunner {
         arguments.push(OsString::from("help:effective-pom"));
         arguments.push(OsString::from(format!("-Doutput={}", output.0.display())));
         let build = MavenBuildResult::from_run(
-            self.execute_permitted(arguments, Instant::now())
-                .await
-                .result,
+            self.execute_permitted(
+                MavenOperation::EffectivePom,
+                arguments,
+                Instant::now(),
+                wait,
+            )
+            .await
+            .result,
         );
         if !output.0.exists() {
             return EffectivePomResult {
@@ -976,7 +988,9 @@ impl MavenRunner {
         if let Some(filter) = coordinate_filter {
             arguments.push(OsString::from(format!("-Dincludes={filter}")));
         }
-        let executed = self.execute_with_raw_stdout(arguments).await;
+        let executed = self
+            .execute_with_raw_stdout(MavenOperation::DependencyTree, arguments)
+            .await;
         let run = executed.result;
         let incomplete = run.stdout_truncated;
         let dependencies = parse_dependency_tree(&executed.raw_stdout);
@@ -1018,7 +1032,9 @@ impl MavenRunner {
             arguments.push(OsString::from(format!("-Dscope={}", scope.argument())));
         }
 
-        let executed = self.execute_with_raw_stdout(arguments).await;
+        let executed = self
+            .execute_with_raw_stdout(MavenOperation::DependencyResolution, arguments)
+            .await;
         let run = executed.result;
         let output_truncated = run.stdout_truncated;
         let build = MavenBuildResult::from_run(run);
@@ -1097,7 +1113,9 @@ impl MavenRunner {
             ClasspathKind::Build => "-Dmdep.includeScope=compile",
             ClasspathKind::Test => "-Dmdep.includeScope=test",
         }));
-        let executed = self.execute_with_raw_stdout(arguments).await;
+        let executed = self
+            .execute_with_raw_stdout(MavenOperation::Classpath, arguments)
+            .await;
         let run = executed.result;
         let (artifacts, normalization_incomplete) = parse_classpath(&run.stdout);
         let (paths, path_incomplete) = parse_classpath_paths(&executed.raw_stdout);
@@ -1192,14 +1210,20 @@ impl MavenRunner {
         modules
     }
 
-    async fn execute(&self, arguments: Vec<OsString>) -> MavenRunResult {
-        self.execute_with_raw_stdout(arguments).await.result
+    async fn execute(&self, operation: MavenOperation, arguments: Vec<OsString>) -> MavenRunResult {
+        self.execute_with_raw_stdout(operation, arguments)
+            .await
+            .result
     }
 
-    async fn execute_with_raw_stdout(&self, arguments: Vec<OsString>) -> ExecutedMaven {
+    async fn execute_with_raw_stdout(
+        &self,
+        operation: MavenOperation,
+        arguments: Vec<OsString>,
+    ) -> ExecutedMaven {
         let started = Instant::now();
-        let _permit = match self.permit.acquire().await {
-            Ok(permit) => permit,
+        let (_permit, wait) = match self.acquire_permit(operation).await {
+            Ok(acquired) => acquired,
             Err(error) => {
                 return ExecutedMaven {
                     result: self.runner_error(started, error.to_string()),
@@ -1207,20 +1231,60 @@ impl MavenRunner {
                 };
             }
         };
-        self.execute_permitted(arguments, started).await
+        self.execute_permitted(operation, arguments, started, wait)
+            .await
     }
 
-    /// Runs Maven while the caller already holds the global permit.
-    async fn execute_permitted(&self, arguments: Vec<OsString>, started: Instant) -> ExecutedMaven {
-        let executable = match self.validated_executable() {
-            Ok(executable) => executable,
-            Err(error) => {
-                return ExecutedMaven {
-                    result: self.runner_error(started, error.to_string()),
-                    raw_stdout: String::new(),
-                };
+    /// Waits for the global Maven permit and reports how long the wait took.
+    async fn acquire_permit(
+        &self,
+        operation: MavenOperation,
+    ) -> Result<(tokio::sync::SemaphorePermit<'_>, Duration), tokio::sync::AcquireError> {
+        let waiting = Instant::now();
+        let acquired = self.permit.acquire().await;
+        let wait = waiting.elapsed();
+        if acquired.is_err() {
+            run_trace::log_permit_failure(operation, wait);
+        }
+        acquired.map(|permit| (permit, wait))
+    }
+
+    /// Runs Maven while the caller already holds the global permit, which it waited `wait`
+    /// for; `started` is when the whole request started, the base of `duration_ms`.
+    async fn execute_permitted(
+        &self,
+        operation: MavenOperation,
+        arguments: Vec<OsString>,
+        started: Instant,
+        wait: Duration,
+    ) -> ExecutedMaven {
+        let trace = MavenRunTrace::start(operation, wait, self.timeout);
+        match self.run_child(arguments, started).await {
+            Ok(executed) => {
+                trace.finish(&executed.result, None);
+                executed
             }
-        };
+            Err((failure, message)) => {
+                let result = self.runner_error(started, message);
+                trace.finish(&result, Some(failure));
+                ExecutedMaven {
+                    result,
+                    raw_stdout: String::new(),
+                }
+            }
+        }
+    }
+
+    /// Starts the Maven child and collects its bounded output; a failure carries its stable
+    /// category and the message of the structured `runner_error` result.
+    async fn run_child(
+        &self,
+        arguments: Vec<OsString>,
+        started: Instant,
+    ) -> Result<ExecutedMaven, (RunFailure, String)> {
+        let executable = self
+            .validated_executable()
+            .map_err(|error| (RunFailure::Executable, error.to_string()))?;
 
         let mut command = Command::new(executable);
         command
@@ -1233,22 +1297,13 @@ impl MavenRunner {
         for name in crate::config::SERVER_ONLY_ENVIRONMENT {
             command.env_remove(name);
         }
-        if let Err(error) = self.configure_java_environment(&mut command).await {
-            return ExecutedMaven {
-                result: self.runner_error(started, error.to_string()),
-                raw_stdout: String::new(),
-            };
-        }
+        self.configure_java_environment(&mut command)
+            .await
+            .map_err(|error| (RunFailure::JavaSelection, error.to_string()))?;
         command.as_std_mut().process_group(0);
-        let mut child = match spawn_maven(&mut command).await {
-            Ok(child) => child,
-            Err(error) => {
-                return ExecutedMaven {
-                    result: self.runner_error(started, format!("cannot start Maven: {error}")),
-                    raw_stdout: String::new(),
-                };
-            }
-        };
+        let mut child = spawn_maven(&mut command)
+            .await
+            .map_err(|error| (RunFailure::Spawn, format!("cannot start Maven: {error}")))?;
         let process_id = child.id();
         let mut process_group = ProcessGroupGuard::new(process_id);
         let stdout = child.stdout.take();
@@ -1299,32 +1354,21 @@ impl MavenRunner {
             Some(Ok(status)) if status.success() => (MavenRunStatus::Success, status.code()),
             Some(Ok(status)) => (MavenRunStatus::BuildFailure, status.code()),
             Some(Err(error)) => {
-                return ExecutedMaven {
-                    result: self.runner_error(started, format!("cannot wait for Maven: {error}")),
-                    raw_stdout: String::new(),
-                };
+                return Err((RunFailure::Wait, format!("cannot wait for Maven: {error}")));
             }
-            None => {
-                return ExecutedMaven {
-                    result: self.runner_error(started, "missing Maven exit status".to_owned()),
-                    raw_stdout: String::new(),
-                };
-            }
+            None => return Err((RunFailure::Wait, "missing Maven exit status".to_owned())),
         };
         drop(readers);
         process_group.disarm();
         let mut pipe_outputs = Vec::new();
         for joined in [stdout, stderr] {
-            match joined {
-                Ok(output) => pipe_outputs.push(output),
-                Err(error) => {
-                    return ExecutedMaven {
-                        result: self
-                            .runner_error(started, format!("cannot read Maven output: {error}")),
-                        raw_stdout: String::new(),
-                    };
-                }
-            }
+            let output = joined.map_err(|error| {
+                (
+                    RunFailure::OutputRead,
+                    format!("cannot read Maven output: {error}"),
+                )
+            })?;
+            pipe_outputs.push(output);
         }
         let stderr = pipe_outputs.pop().unwrap_or_default();
         let stdout = pipe_outputs.pop().unwrap_or_default();
@@ -1336,7 +1380,7 @@ impl MavenRunner {
         let stderr = stderr.into_bytes(failed);
         let (stdout_text, stdout_redactions) = self.redact(&stdout);
         let (stderr_text, stderr_redactions) = self.redact(&stderr);
-        ExecutedMaven {
+        Ok(ExecutedMaven {
             result: MavenRunResult {
                 status,
                 exit_code,
@@ -1349,7 +1393,7 @@ impl MavenRunner {
                 redaction_count: stdout_redactions + stderr_redactions,
             },
             raw_stdout,
-        }
+        })
     }
 
     fn arguments(&self, invocation: &MavenInvocation) -> Result<Vec<OsString>> {

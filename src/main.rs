@@ -1,4 +1,7 @@
-use std::{io, time::Duration};
+use std::{
+    io::{self, IsTerminal},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -63,11 +66,12 @@ async fn run() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "maven_mcp=info".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(io::stderr)
+                .with_ansi(stderr_supports_color())
                 .with_filter(filter_fn(is_minimized_event)),
         )
         .init();
@@ -84,6 +88,7 @@ async fn run() -> Result<()> {
         max_source_bytes = config.max_source_bytes,
         "MCP server ready for request-scoped Maven projects"
     );
+    log_configuration_summary(&config);
 
     let server = MavenMcpServer::new(config);
     let lifecycle = server.clone();
@@ -97,15 +102,18 @@ async fn run() -> Result<()> {
         }
     };
     tracing::info!(transport = "stdio", "MCP server ready");
+    tracing::debug!(transport = %"stdio", "STDIO service initialized");
     let cancellation = service.cancellation_token();
     let waiting = service.waiting();
     tokio::pin!(waiting);
     tokio::select! {
         result = &mut waiting => {
             lifecycle.shutdown();
-            result.context("STDIO MCP server task failed")?;
+            let reason = result.context("STDIO MCP server task failed")?;
+            tracing::debug!(transport = %"stdio", reason = %quit_reason_label(&reason), "STDIO connection closed");
         }
         _ = &mut shutdown => {
+            tracing::debug!(transport = %"stdio", reason = %"signal", "STDIO connection closed");
             lifecycle.shutdown();
             cancellation.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut waiting).await;
@@ -113,6 +121,50 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The documented filter when `RUST_LOG` is unset or invalid.
+const DEFAULT_LOG_FILTER: &str = "maven_mcp=info";
+
+/// Colors only for an interactive terminal: an MCP host usually captures stderr into a log
+/// file, where escape sequences would split the `key=value` fields. `NO_COLOR` still wins.
+fn stderr_supports_color() -> bool {
+    io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
+/// Only counts, limits and switches: configured directories, the Maven executable and the
+/// jenv root are local paths and are never logged.
+fn log_configuration_summary(config: &Config) {
+    tracing::debug!(
+        max_results = config.max_results,
+        max_source_bytes = config.max_source_bytes,
+        max_project_indexes = config.max_project_indexes,
+        max_project_index_bytes = config.max_project_index_bytes,
+        max_heavy_jobs = config.max_heavy_jobs,
+        max_queued_heavy_jobs = config.max_queued_heavy_jobs,
+        trusted_directories = config.execution.trusted_project_directories.len(),
+        maven_executable_configured = config.execution.maven_executable.is_some(),
+        execution_repository_configured = config.execution.execution_repository.is_some(),
+        maven_timeout_ms = u64::try_from(config.execution.timeout.as_millis()).unwrap_or(u64::MAX),
+        max_maven_output_bytes = config.execution.max_output_bytes,
+        network_enabled = config.execution.network_enabled,
+        jenv = matches!(
+            config.execution.java_environment,
+            maven_mcp::config::JavaEnvironment::Jenv { .. }
+        ),
+        index_cache = config.index_cache.is_some(),
+        "configuration summary"
+    );
+}
+
+/// A stable category of how the STDIO session ended; never the error text.
+fn quit_reason_label(reason: &rmcp::service::QuitReason) -> &'static str {
+    match reason {
+        rmcp::service::QuitReason::Cancelled => "cancelled",
+        rmcp::service::QuitReason::Closed => "closed",
+        rmcp::service::QuitReason::JoinError(_) => "join_error",
+        _ => "other",
+    }
 }
 
 /// `RUST_LOG` selects the verbosity, but MCP transport (`rmcp`) events are never written at

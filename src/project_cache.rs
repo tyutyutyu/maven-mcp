@@ -270,10 +270,13 @@ struct InFlight {
 
 impl InFlight {
     /// Whether a request still holds the build cell or the build's blocking work still holds
-    /// its owner. A request that was cancelled drops its clones, so a marker only the cache
-    /// references has no build running and nobody waiting.
+    /// its owner lock. A request that was cancelled drops its cell clone, so a marker whose
+    /// cell only the cache references and whose lock is free has no build running and nobody
+    /// waiting. The lock, not the owner's reference count, is checked: a released guard
+    /// drops its owner reference only after waking the next holder, which may already
+    /// republish the status.
     fn is_live(&self) -> bool {
-        Arc::strong_count(&self.cell) > 1 || Arc::strong_count(&self.owner) > 1
+        Arc::strong_count(&self.cell) > 1 || self.owner.try_lock().is_err()
     }
 }
 
@@ -744,6 +747,12 @@ impl ProjectCache {
         };
         self.release_index(&victim);
         self.evictions += 1;
+        tracing::debug!(
+            evictions = self.evictions,
+            retained_bytes = self.retained_bytes(),
+            max_bytes = self.limits.max_bytes,
+            "project index evicted"
+        );
         true
     }
 
@@ -769,6 +778,11 @@ impl ProjectCache {
         {
             self.released_runners.push(runner.release());
         }
+        tracing::debug!(
+            retained_bytes = self.retained_bytes(),
+            max_bytes = self.limits.max_bytes,
+            "project runner evicted"
+        );
         true
     }
 

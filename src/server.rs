@@ -12,6 +12,7 @@ use rmcp::{
         router::tool::ToolRouter,
         wrapper::{Json, Parameters},
     },
+    model::ErrorCode,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -33,6 +34,7 @@ use crate::index_cache::{
     CacheUpdate, ClasspathManifest, PersistentIndexCache, ResolutionSources, classpath_context,
     decode_payload, encode_payload, resolution_inputs,
 };
+use crate::log_safety::{elapsed_ms, error_category};
 use crate::project::{
     ClasspathKind, CoverageGapResult, CoverageSummaryResult, DependencyResolutionResult,
     DependencyResolutionStatus, DependencyScope, DependencyTreeResult, EffectivePomResult,
@@ -44,7 +46,12 @@ use crate::project_cache::{
     BuildCell, BuildOutcome, BuildOwner, CacheLimits, FinishedBuild, IndexLookup, ProjectCache,
     ProjectFingerprint, Publication, ReserveError, RunnerSnapshot,
 };
-use crate::runtime_stats::RuntimeStatusPublisher;
+use crate::runtime_stats::{RuntimeCacheStatus, RuntimeStatusPublisher};
+
+mod tool_call;
+
+use tool_call::{CallOutcome, ToolCallTrace};
+use tracing::Instrument;
 
 /// Number of times one request retries after the project changed while its index was built.
 const MAX_INDEX_BUILD_ATTEMPTS: usize = 4;
@@ -528,8 +535,14 @@ impl MavenMcpServer {
     }
 
     fn validate_project_path(&self, project_path: &str) -> Result<PathBuf, ErrorData> {
-        canonical_project_root(&PathBuf::from(project_path))
-            .map_err(|error| ErrorData::invalid_params(error.to_string(), None))
+        canonical_project_root(&PathBuf::from(project_path)).map_err(|error| {
+            tracing::debug!(
+                reason = %"invalid_project_path",
+                error_kind = %error_category(&error),
+                "project path rejected"
+            );
+            ErrorData::invalid_params(error.to_string(), None)
+        })
     }
 
     fn lock_projects(&self) -> Result<MutexGuard<'_, ProjectCache>, ErrorData> {
@@ -548,6 +561,11 @@ impl MavenMcpServer {
             .iter()
             .any(|directory| root.starts_with(directory))
         {
+            tracing::debug!(
+                reason = %"outside_trusted_directories",
+                trusted_directories = self.config.execution.trusted_project_directories.len(),
+                "project path rejected"
+            );
             return Err(ErrorData::invalid_params(
                 "project_path is not inside a directory configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES",
                 None,
@@ -566,12 +584,16 @@ impl MavenMcpServer {
     fn project_runner(&self, project_path: &str) -> Result<(PathBuf, RunnerSnapshot), ErrorData> {
         let root = self.trusted_project_root(project_path)?;
         let cached = self.lock_projects()?.runner(&root);
-        if let Some(snapshot) = cached.as_ref()
-            && !snapshot.revalidate
-            && snapshot.fingerprint.is_current()
-        {
-            return Ok((root, snapshot.clone()));
-        }
+        let miss_reason = match cached.as_ref() {
+            None => "absent",
+            Some(snapshot) if snapshot.revalidate => "maven_ran",
+            Some(snapshot) if !snapshot.fingerprint.is_current() => "project_changed",
+            Some(snapshot) => {
+                tracing::debug!("project runner cache hit");
+                return Ok((root, snapshot.clone()));
+            }
+        };
+        tracing::debug!(reason = %miss_reason, "project runner cache miss");
         let discovered = match &cached {
             Some(snapshot) => snapshot
                 .runner
@@ -585,11 +607,19 @@ impl MavenMcpServer {
         let runner = match discovered {
             Ok(runner) => Arc::new(runner),
             Err(error) => {
+                tracing::debug!(
+                    error_kind = %error_category(&error),
+                    "project runner discovery failed"
+                );
                 self.lock_projects()?.discard_project(&root);
                 self.publish_runtime_status();
                 return Err(ErrorData::invalid_params(error.to_string(), None));
             }
         };
+        tracing::debug!(
+            modules = runner.project().modules.len(),
+            "project runner discovered"
+        );
         let fingerprint = ProjectFingerprint::capture(runner.fingerprint_paths());
         let snapshot = self
             .lock_projects()?
@@ -613,10 +643,16 @@ impl MavenMcpServer {
                         .blocking(move || checked.artifacts_are_current())
                         .await?
                     {
+                        tracing::debug!(generation, "project index cache hit");
                         self.lock_projects()?.record_hit(&root);
                         self.publish_runtime_status_after_hit();
                         return Ok(Arc::clone(&entry.index));
                     }
+                    tracing::debug!(
+                        generation,
+                        reason = %"artifacts_changed",
+                        "project index invalidated"
+                    );
                     self.lock_projects()?
                         .invalidate_generation(&root, generation);
                 }
@@ -625,6 +661,7 @@ impl MavenMcpServer {
                     owner,
                     generation,
                 } => {
+                    tracing::debug!(generation, "project index cache miss");
                     // Reports the project as building while the build runs.
                     self.publish_runtime_status();
                     let mut build = BuildStatusGuard {
@@ -648,7 +685,9 @@ impl MavenMcpServer {
                     match outcome {
                         BuildOutcome::Built(index) => return Ok(index),
                         BuildOutcome::Failed(error) => return Err(error),
-                        BuildOutcome::Stale => {}
+                        BuildOutcome::Stale => {
+                            tracing::debug!(generation, "project index build stale; retrying");
+                        }
                     }
                 }
             }
@@ -670,9 +709,28 @@ impl MavenMcpServer {
     ) -> BuildOutcome {
         // Blocking work of a cancelled build of this generation may still run: wait for it.
         let ownership = owner.lock_owned().await;
+        tracing::debug!(generation, "project index build started");
+        let started = Instant::now();
         let outcome = self
             .try_build_index(root, snapshot, generation, ownership)
             .await;
+        // A published build logs its own figures in `try_build_index`.
+        let unbuilt = match &outcome {
+            BuildOutcome::Built(_) => None,
+            BuildOutcome::Stale => Some("stale"),
+            BuildOutcome::Failed(error) if error.code == ErrorCode::INVALID_PARAMS => {
+                Some("invalid_params")
+            }
+            BuildOutcome::Failed(_) => Some("internal_error"),
+        };
+        if let Some(result) = unbuilt {
+            tracing::debug!(
+                generation,
+                result = %result,
+                duration_ms = elapsed_ms(started),
+                "project index build finished"
+            );
+        }
         if matches!(outcome, BuildOutcome::Failed(_))
             && let Ok(mut projects) = self.lock_projects()
         {
@@ -943,6 +1001,17 @@ impl MavenMcpServer {
             );
             if publication != Publication::Stale {
                 projects.finish_full_rebuild(root, generation);
+                // A stale publication is logged by `build_index`, like every unbuilt outcome.
+                log_build_finished(&BuildSummary {
+                    generation,
+                    stats: index.stats(),
+                    classpath_entries: classpath.paths.len(),
+                    persisted_classpath: classpath.persisted,
+                    records_reused: scoped.records.reused.len(),
+                    records_built: scoped.records.built,
+                    publication,
+                    duration_ms: elapsed_ms(started),
+                });
             }
             publication
         };
@@ -1003,9 +1072,12 @@ impl MavenMcpServer {
         match written {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::warn!(error = %format!("{error:#}"), "cannot write the index cache");
+                tracing::warn!(
+                    error_kind = %error_category(&error),
+                    "cannot write the index cache"
+                );
             }
-            Err(error) => tracing::warn!(%error.message, "cannot write the index cache"),
+            Err(_) => tracing::warn!(error_kind = %"heavy_work", "cannot write the index cache"),
         }
         let current = self
             .lock_projects()
@@ -1027,9 +1099,15 @@ impl MavenMcpServer {
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::warn!(error = %format!("{error:#}"), "cannot forget a cached classpath");
+                tracing::warn!(
+                    error_kind = %error_category(&error),
+                    "cannot forget a cached classpath"
+                );
             }
-            Err(error) => tracing::warn!(%error.message, "cannot forget a cached classpath"),
+            Err(_) => tracing::warn!(
+                error_kind = %"heavy_work",
+                "cannot forget a cached classpath"
+            ),
         }
     }
 
@@ -1038,6 +1116,7 @@ impl MavenMcpServer {
     async fn invalidate_project(&self, project_path: &str) -> Result<(), ErrorData> {
         let root = self.validate_project_path(project_path)?;
         self.lock_projects()?.invalidate_after_maven(&root);
+        tracing::debug!(reason = %"maven_ran", "project cache invalidated");
         self.publish_runtime_status();
         self.forget_persisted_classpath(classpath_context(&root, &self.config))
             .await;
@@ -1055,6 +1134,7 @@ impl MavenMcpServer {
             projects.invalidate_after_maven(&root);
             projects.require_full_rebuild(&root);
         }
+        tracing::debug!(reason = %"refresh", "project cache invalidated");
         self.publish_runtime_status();
         self.forget_persisted_classpath(classpath_context(&root, &self.config))
             .await;
@@ -1163,14 +1243,80 @@ fn publish_runtime_status(projects: &Mutex<ProjectCache>, status: &RuntimeStatus
     let Ok(projects) = projects.lock() else {
         return;
     };
-    let _ = status.update_cache(projects.runtime_cache(), projects.runtime_projects());
+    let cache = projects.runtime_cache();
+    let published = status.update_cache(cache.clone(), projects.runtime_projects());
+    log_runtime_publication("update", &cache, &published);
 }
 
 fn flush_runtime_hits(projects: &Mutex<ProjectCache>, status: &RuntimeStatusPublisher) {
     let Ok(projects) = projects.lock() else {
         return;
     };
-    let _ = status.flush_hits(projects.runtime_cache(), projects.runtime_projects());
+    let cache = projects.runtime_cache();
+    let published = status.flush_hits(cache.clone(), projects.runtime_projects());
+    log_runtime_publication("hit_flush", &cache, &published);
+}
+
+/// A failed status write only affects `maven-mcp stats`, so it is a debug event; the counters
+/// are the published figures, never a project path.
+fn log_runtime_publication(
+    kind: &'static str,
+    cache: &RuntimeCacheStatus,
+    published: &anyhow::Result<()>,
+) {
+    match published {
+        Ok(()) => tracing::debug!(
+            kind = %kind,
+            entries = cache.entries,
+            runners = cache.runners,
+            hits = cache.hits,
+            misses = cache.misses,
+            evictions = cache.evictions,
+            invalidations = cache.invalidations,
+            retained_bytes = cache.retained_bytes,
+            "runtime status published"
+        ),
+        Err(error) => tracing::debug!(
+            kind = %kind,
+            error_kind = %error_category(error),
+            "runtime status not published"
+        ),
+    }
+}
+
+/// The safe figures of one published index build: counts and sizes only.
+struct BuildSummary {
+    generation: u64,
+    stats: IndexStats,
+    classpath_entries: usize,
+    persisted_classpath: bool,
+    records_reused: usize,
+    records_built: usize,
+    publication: Publication,
+    duration_ms: u64,
+}
+
+fn log_build_finished(summary: &BuildSummary) {
+    let result = match summary.publication {
+        Publication::Retained => "retained",
+        Publication::Uncached => "uncached",
+        Publication::Stale => "stale",
+    };
+    tracing::debug!(
+        generation = summary.generation,
+        result = %result,
+        jar_count = summary.stats.jar_count,
+        source_jar_count = summary.stats.source_jar_count,
+        class_count = summary.stats.class_count,
+        unique_class_count = summary.stats.unique_class_count,
+        artifact_count = summary.stats.artifact_count,
+        classpath_entries = summary.classpath_entries,
+        persisted_classpath = summary.persisted_classpath,
+        records_reused = summary.records_reused,
+        records_built = summary.records_built,
+        duration_ms = summary.duration_ms,
+        "project index build finished"
+    );
 }
 
 /// The records of a build that must read every archive again: nothing is reused, but the
@@ -1907,14 +2053,31 @@ impl ServerHandler for MavenMcpServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // Only a name the router knows is logged; any other client string becomes `<unknown>`.
+        let tool = self
+            .tool_router
+            .get(&request.name)
+            .map(|tool| tool.name.clone());
+        let trace = ToolCallTrace::start(tool);
+        let known_tool = trace.is_known_tool();
         let cancellation = context.ct.clone();
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                Err(ErrorData::internal_error("tool request cancelled", None))
+        let (result, outcome) = async {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => (
+                    Err(ErrorData::internal_error("tool request cancelled", None)),
+                    CallOutcome::Cancelled,
+                ),
+                result = self.tool_router.call(call) => {
+                    let outcome = CallOutcome::of(&result, known_tool);
+                    (result, outcome)
+                }
             }
-            result = self.tool_router.call(call) => result,
         }
+        .instrument(trace.span())
+        .await;
+        trace.finish(outcome);
+        result
     }
 }

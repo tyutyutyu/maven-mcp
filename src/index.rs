@@ -697,7 +697,11 @@ impl MavenIndex {
                 Ok(()) => {}
                 Err(error) if error.is::<ArchiveLimit>() => return Err(error),
                 Err(error) => {
-                    tracing::warn!(%error, "skipping malformed jar");
+                    tracing::warn!(
+                        reason = %"malformed_archive",
+                        error_kind = %crate::log_safety::error_category(&error),
+                        "skipping malformed jar"
+                    );
                     continue;
                 }
             }
@@ -1201,8 +1205,8 @@ impl MavenIndex {
                 Ok(archive) => archive,
                 Err(error) => {
                     tracing::warn!(
-                        coordinate = %jar.coordinate(),
-                        %error,
+                        reason = %"unreadable_archive",
+                        error_kind = %crate::log_safety::error_category(&error),
                         "skipping unreadable class archive"
                     );
                     continue;
@@ -1220,9 +1224,8 @@ impl MavenIndex {
                     Ok(description) => description,
                     Err(error) => {
                         tracing::warn!(
-                            coordinate = %jar.coordinate(),
-                            class_name,
-                            %error,
+                            reason = %"unreadable_class",
+                            error_kind = %crate::log_safety::error_category(&error),
                             "skipping unreadable class metadata"
                         );
                         continue;
@@ -2192,7 +2195,11 @@ fn load_jar_record(
     } = match read_jar_index(path) {
         Ok(content) => content,
         Err(error) => {
-            tracing::warn!(file = %file_label(path), %error, "skipping unreadable jar");
+            tracing::warn!(
+                reason = %"unreadable_archive",
+                error_kind = %crate::log_safety::error_category(&error),
+                "skipping unreadable jar"
+            );
             return None;
         }
     };
@@ -2216,7 +2223,8 @@ fn load_jar_record(
     })
 }
 
-/// Logs and public errors name an archive by its file name only, never by its absolute host path.
+/// Public errors name an archive by its file name only, never by its absolute host path; logs
+/// do not name it at all.
 fn file_label(path: &Path) -> std::borrow::Cow<'_, str> {
     path.file_name()
         .map_or(std::borrow::Cow::Borrowed("<unnamed>"), |name| {
@@ -2231,7 +2239,10 @@ fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
             Ok(entry) => entry,
             Err(error) => {
                 tracing::warn!(
-                    error = %error.io_error().map_or_else(|| "symbolic link loop".to_owned(), ToString::to_string),
+                    reason = %"unreadable_entry",
+                    error_kind = %error.io_error().map_or("symbolic_link_loop", |error| {
+                        crate::log_safety::io_error_category(error.kind())
+                    }),
                     "unable to inspect repository entry"
                 );
                 continue;
@@ -2250,7 +2261,7 @@ fn collect_repository_jars(root: &Path) -> Vec<PathBuf> {
 
 fn repository_identity(root: &Path, path: &Path) -> Option<JarIdentity> {
     let Some((key, classifier)) = parse_coordinate(root, path) else {
-        tracing::debug!(file = %file_label(path), "skipping jar outside Maven layout");
+        tracing::debug!(reason = %"outside_maven_layout", "skipping jar");
         return None;
     };
     Some(JarIdentity {

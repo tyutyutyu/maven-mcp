@@ -38,3 +38,12 @@ becomes the GitHub Release notes.
   file at most once per second. SIGTERM also removes the file. A status file is
   deleted only when its process is proven gone; an access error or an unknown
   liveness keeps it.
+- `RUST_LOG=maven_mcp=debug` logs one correlated start and finish event per
+  `tools/call` (internal `call_id`, known tool name, `outcome`, `duration_ms`),
+  project runner and index cache hits, misses, builds and evictions, runtime
+  status publication, and the Maven child lifecycle (operation category, permit
+  wait, run time, status, exit code, timeout, truncation and redaction count).
+  The default `maven_mcp=info` events are unchanged. Warnings and debug events
+  never quote paths, archive or class names, coordinates or error messages; they
+  carry stable `reason` and `error_kind` categories. stderr is colored only when
+  it is a terminal.

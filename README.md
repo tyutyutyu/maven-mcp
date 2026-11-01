@@ -1314,12 +1314,103 @@ recognize a secret without a recognizable key, header or token format, a secret
 split across lines, or custom header names. Values next to a sensitive word may
 be redacted even when they are not secrets.
 
-Diagnostics go only to stderr. Logs and MCP errors name archives by file name
-instead of their absolute host path. `RUST_LOG` can raise the verbosity of
-`maven_mcp`, but MCP transport (`rmcp`) events are always suppressed at every
-level, because they can quote complete requests, notifications, cancellation
-reasons and responses. A panic logs only
-its source file and line, never its payload.
+Diagnostics go only to stderr. MCP errors name archives by file name instead of
+their absolute host path; log events do not name them at all. `RUST_LOG` can
+raise the verbosity of `maven_mcp`, but MCP transport (`rmcp`) events are always
+suppressed at every level, because they can quote complete requests,
+notifications, cancellation reasons and responses. A panic logs only
+its source file and line, never its payload. See [Debug logging](#debug-logging)
+for the events and their privacy limits.
+
+### Debug logging
+
+The default filter is `maven_mcp=info`: startup (`MCP server ready for
+request-scoped Maven projects`, `MCP server ready`), `shutdown requested` on
+SIGINT or SIGTERM, and warnings. An unset or invalid `RUST_LOG` falls back to
+this default. stderr is never protocol output; stdout carries only JSON-RPC at
+every level. Colors are used only when stderr is a terminal and `NO_COLOR` is
+unset, so a host log file contains plain `key=value` fields.
+
+To trace one session, set the filter in the host's `env` (or reproduce outside
+the host with the same environment):
+
+```bash
+RUST_LOG=maven_mcp=debug \
+MAVEN_TRUSTED_PROJECT_DIRECTORIES=/home/<user>/work/trusted-projects \
+  /home/<user>/.local/share/maven-mcp/releases/current/maven-mcp 2>maven-mcp-debug.log
+```
+
+At debug level every `tools/call` request gets one `tool call started` and one
+`tool call finished` event:
+
+| Field | Meaning |
+| --- | --- |
+| `call_id` | Per-process, strictly increasing number assigned by the server; it is not the client's JSON-RPC id. |
+| `tool` | The tool name as the router knows it, or `<unknown>` for any other name. |
+| `outcome` | Finish only: `success`, `tool_error`, `invalid_params`, `unknown_tool`, `internal_error`, `error` (another MCP error code), `cancelled` (the client cancelled the request) or `dropped` (the call stopped without a result, for example at shutdown). |
+| `duration_ms` | Finish only: whole milliseconds from start to finish. |
+
+Every internal event of a call carries the span prefix
+`tool_call{call_id=<n> tool=<name>}`, also for work on the blocking index
+threads, so `grep 'call_id=7'` selects one call. The internal events are:
+
+- Project access: `project path rejected` (`reason=invalid_project_path` or
+  `outside_trusted_directories`), `project runner cache hit`, `project runner
+  cache miss` (`reason=absent`, `maven_ran` or `project_changed`), `project
+  runner discovered` (`modules`), `project runner discovery failed`.
+- Project index: `project index cache hit`, `project index cache miss`,
+  `project index invalidated`, `project index build started`, `project index
+  build finished` (`result=retained`, `uncached`, `stale`, `invalid_params` or
+  `internal_error`; on success also `jar_count`, `source_jar_count`,
+  `class_count`, `unique_class_count`, `artifact_count`, `classpath_entries`,
+  `persisted_classpath`, `records_reused`, `records_built`), `project index
+  build stale; retrying`, `project cache invalidated` (`reason=maven_ran` or
+  `refresh`), `project index evicted` (with the running `evictions` count,
+  `retained_bytes` and `max_bytes`), and `project runner evicted` (with
+  `retained_bytes` and `max_bytes`; runner evictions do not increment
+  `evictions`).
+- Runtime status: `runtime status published` with the published `entries`,
+  `runners`, `hits`, `misses`, `evictions`, `invalidations` and
+  `retained_bytes`, or `runtime status not published` with an `error_kind`.
+- Maven children: `maven run started` (`operation`, `wait_ms` for the global
+  Maven permit, `timeout_ms`) and `maven run finished` (`status=success`,
+  `build_failure`, `timeout`, `runner_error` or `abandoned` for a cancelled
+  request, `exit_code` when Maven exited, `timed_out`, `wait_ms`, `run_ms`,
+  `duration_ms`, `stdout_truncated`, `stderr_truncated`, `redaction_count`, and
+  `error_kind=permit`, `executable`, `java_selection`, `spawn`, `wait` or
+  `output_read` for a runner error). `wait_ms` is the permit wait, `run_ms` the
+  child run after it, and `duration_ms` their sum, the total from the start of
+  the permit wait, for every operation. `operation` is `classpath`, `lifecycle`,
+  `focused_test`, `effective_pom`, `dependency_tree`, `dependency_resolution` or
+  `arguments`; `run_maven` is always `arguments`, because its argument vector is
+  arbitrary.
+- Lifecycle: `configuration summary` (limits, counts and switches only),
+  `STDIO service initialized`, and `STDIO connection closed` (`reason=closed`,
+  `cancelled`, `signal` or `join_error`).
+
+Troubleshooting with the debug log:
+
+1. Find the slow or failing call by its `tool call finished` event and note its
+   `call_id`, `outcome` and `duration_ms`.
+2. Select its internal events with `grep 'call_id=<n>'`. A `project index cache
+   miss` followed by `project index build started` is a cold build; a repeated
+   request for the same project shows `project index cache hit` instead.
+3. In `maven run finished`, a large `wait_ms` means the call waited for another
+   Maven run (one runs at a time per server); a large `run_ms` is Maven itself;
+   `timed_out=true` reached `MAVEN_TIMEOUT_SECONDS`; truncation flags mean
+   `MAX_MAVEN_OUTPUT_BYTES` was reached. The tool response carries the redacted
+   output itself.
+4. Frequent `project index evicted` events mean that `MAX_PROJECT_INDEXES` or
+   `MAX_PROJECT_INDEX_BYTES` is too small for the projects in use.
+5. Warnings such as `skipping malformed jar` name a stable `reason` and
+   `error_kind`; use `diagnose_artifact` to find the affected artifact.
+
+Privacy limits: no level logs request arguments, response bodies, search
+expressions, source code, Maven arguments, Maven stdout or stderr, project or
+repository paths, configured directories, Maven coordinates, archive or class
+names, or error messages. Errors appear only as a closed `error_kind` category.
+A debug log is still local diagnostic data; keep it out of version control and
+issue reports unless you have reviewed it.
 
 Local logs, MCP Inspector sessions, `target/promptfoo/`,
 `target/mcp-test-report/`, `target/coverage/`, `target/real-maven-smoke/`,
@@ -1384,7 +1475,7 @@ Surefire failures follow the existing report-error contract.
 | `MAVEN_MCP_BUILD_COMMIT` | none | Build time only, not read at runtime. Full 40-character lowercase commit embedded into `--version`, `serverInfo.version` and stats; set by `install:candidate`. Any other value fails the build. |
 | `MAVEN_MCP_INSTALL_ROOT` | `${XDG_DATA_HOME:-$HOME/.local/share}/maven-mcp` | Used only by `scripts/local-install.sh` and `scripts/dogfood-smoke.sh`: absolute versioned installation root outside the source worktree. |
 | `JENV_ROOT` | `$HOME/.jenv` | jenv installation root used only when the server starts with `--jenv`; must be an absolute path when explicitly set. |
-| `RUST_LOG` | `maven_mcp=info` | Logging level/filter for stderr diagnostics. MCP transport (`rmcp`) events are always suppressed; see [Redaction and data minimization](#redaction-and-data-minimization). |
+| `RUST_LOG` | `maven_mcp=info` | Logging level/filter for stderr diagnostics; an invalid filter falls back to the default. `maven_mcp=debug` adds correlated per-call events; see [Debug logging](#debug-logging). MCP transport (`rmcp`) events are always suppressed; see [Redaction and data minimization](#redaction-and-data-minimization). |
 
 `get_class_source` returns a result only when the corresponding sources artifact
 is present in the local repository. For Maven projects, these artifacts can be
@@ -1530,7 +1621,8 @@ redaction. That output can be partial:
   `the project index was not built because it would be incomplete`; the message
   lists the entries and the reason.
 - The server's own diagnostics are on stderr, which the host keeps in its MCP
-  log. Set `RUST_LOG=maven_mcp=debug` in the host's `env` for more detail.
+  log. Set `RUST_LOG=maven_mcp=debug` in the host's `env` for correlated
+  per-call events; see [Debug logging](#debug-logging).
 
 ## Agent Log Analyzer CLI
 
