@@ -8,11 +8,8 @@ use std::{
 
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::{
-        router::tool::ToolRouter,
-        wrapper::{Json, Parameters},
-    },
-    model::ErrorCode,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResponse, ErrorCode},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -48,8 +45,16 @@ use crate::project_cache::{
 };
 use crate::runtime_stats::{RuntimeCacheStatus, RuntimeStatusPublisher};
 
+mod response_limit;
+mod result_store;
 mod tool_call;
 
+use response_limit::{
+    Json, READ_PAGE_TOOL, ToolResultPage, decode_cursor, deferrable_output_schema, deferred_marker,
+    fit_page, fits_response, invalid_cursor, result_too_large, set_result_serialization_limit,
+    structured_result, unavailable_result,
+};
+use result_store::ResultStore;
 use tool_call::{CallOutcome, ToolCallTrace};
 use tracing::Instrument;
 
@@ -98,6 +103,18 @@ pub struct RefreshResult {
 #[serde(rename_all = "snake_case")]
 pub enum RefreshStatus {
     Refreshed,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResultPageRequest {
+    #[schemars(
+        description = "Absolute path to the trusted Maven project root of the call that returned the deferred_result"
+    )]
+    project_path: String,
+    #[schemars(description = "The result_id of a deferred_result marker")]
+    result_id: String,
+    #[schemars(description = "Omit for the first page; then the next_cursor of the previous page")]
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -451,6 +468,8 @@ pub struct MavenMcpServer {
     /// The on-disk index cache shared with other processes, unless disabled.
     index_cache: Option<Arc<PersistentIndexCache>>,
     runtime_status: Arc<RuntimeStatusPublisher>,
+    /// Oversized tool results awaiting `read_tool_result_page`; process memory only.
+    results: Arc<Mutex<ResultStore>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -463,6 +482,27 @@ struct ResolvedClasspath {
     /// when an input is unidentifiable or changed after Maven started, so the classpath must
     /// not be persisted.
     inputs: Option<ProjectFingerprint>,
+}
+
+/// The serialization budget of one tool result: a result that fits one response is never
+/// rejected, and a larger one must fit the result store.
+fn result_serialization_limit(config: &Config) -> usize {
+    config
+        .max_mcp_result_cache_bytes
+        .max(config.max_mcp_response_bytes)
+}
+
+/// Every tool except the pager may return a deferred result marker instead of its result.
+fn deferrable_tool_router(mut router: ToolRouter<MavenMcpServer>) -> ToolRouter<MavenMcpServer> {
+    for route in router.map.values_mut() {
+        if route.attr.name == READ_PAGE_TOOL {
+            continue;
+        }
+        if let Some(schema) = &route.attr.output_schema {
+            route.attr.output_schema = Some(Arc::new(deferrable_output_schema(schema)));
+        }
+    }
+    router
 }
 
 fn heavy_work_error(error: HeavyWorkError) -> ErrorData {
@@ -496,6 +536,8 @@ impl MavenMcpServer {
                 cache.max_bytes,
             ))
         });
+        set_result_serialization_limit(result_serialization_limit(&config));
+        let results = ResultStore::new(config.max_mcp_result_cache_bytes);
         Self {
             config,
             execution_permit: Arc::new(Semaphore::new(1)),
@@ -503,8 +545,76 @@ impl MavenMcpServer {
             projects: Arc::new(Mutex::new(projects)),
             index_cache,
             runtime_status: Arc::new(runtime_status),
-            tool_router: Self::tool_router(),
+            results: Arc::new(Mutex::new(results)),
+            tool_router: deferrable_tool_router(Self::tool_router()),
         }
+    }
+
+    /// Fails when `MAX_MCP_RESPONSE_BYTES` cannot hold a deferred result marker or a result
+    /// page with one character; called at startup before the server accepts requests.
+    pub fn validate_response_limits(config: &Config) -> anyhow::Result<()> {
+        let longest_tool_name = Self::tool_router()
+            .list_all()
+            .iter()
+            .map(|tool| tool.name.len())
+            .max()
+            .unwrap_or(0);
+        response_limit::validate_response_limit(
+            config.max_mcp_response_bytes,
+            result_serialization_limit(config),
+            longest_tool_name,
+        )
+    }
+
+    fn lock_results(&self) -> Result<MutexGuard<'_, ResultStore>, ErrorData> {
+        self.results
+            .lock()
+            .map_err(|_| ErrorData::internal_error("result store is poisoned", None))
+    }
+
+    /// Returns a result whose complete serialization fits `MAX_MCP_RESPONSE_BYTES`
+    /// unchanged. A larger result is stored for the call's canonical project and replaced by
+    /// a deferred result marker; a result that cannot be stored is a resource-limit error.
+    fn bound_response(
+        &self,
+        tool: &str,
+        project_path: Option<&str>,
+        response: CallToolResponse,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let CallToolResponse::Complete(result) = response else {
+            return Ok(response);
+        };
+        let limit = self.config.max_mcp_response_bytes;
+        // Pages are fitted to the limit when they are built.
+        if tool == READ_PAGE_TOOL || fits_response(&result, limit)? {
+            return Ok(result.into());
+        }
+        let Some(structured) = result.structured_content else {
+            return Err(ErrorData::internal_error(
+                format!("the tool result exceeds MAX_MCP_RESPONSE_BYTES ({limit} bytes)"),
+                None,
+            ));
+        };
+        // The same compact text rmcp places in `content`, so pages rebuild it byte for byte.
+        let json = structured.to_string();
+        drop(structured);
+        let root = self.trusted_project_root(project_path.unwrap_or_default())?;
+        let total_bytes = json.len();
+        let (result_id, stored_results, retained_bytes) = {
+            let mut results = self.lock_results()?;
+            let result_id = results
+                .insert(&root, json, Instant::now())
+                .map_err(|too_large| result_too_large(too_large.limit))?;
+            (result_id, results.len(), results.retained_bytes())
+        };
+        tracing::debug!(
+            total_bytes,
+            stored_results,
+            retained_bytes,
+            "tool result deferred"
+        );
+        let marker = deferred_marker(tool, result_id, total_bytes);
+        Ok(structured_result(&marker, usize::MAX)?.into())
     }
 
     /// Cancels all heavy jobs, rejects new ones and removes the runtime status; called when
@@ -2026,6 +2136,39 @@ impl MavenMcpServer {
             .await?,
         ))
     }
+
+    #[tool(
+        description = "Read the next page of a tool result that was returned as a deferred_result marker because it exceeded MAX_MCP_RESPONSE_BYTES. Pass the project_path of the original call and the marker's result_id; omit cursor for the first page, then pass each returned next_cursor until complete is true. Concatenating the fragment values in order yields the original structured JSON exactly. Results live only in this server process and expire 300 seconds after they were stored."
+    )]
+    async fn read_tool_result_page(
+        &self,
+        Parameters(request): Parameters<ResultPageRequest>,
+    ) -> Result<Json<ToolResultPage>, ErrorData> {
+        let root = self.trusted_project_root(&request.project_path)?;
+        let json = self
+            .lock_results()?
+            .get(&request.result_id, &root, Instant::now())
+            .ok_or_else(unavailable_result)?;
+        let offset = match request.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                decode_cursor(&request.result_id, cursor, &json).ok_or_else(invalid_cursor)?
+            }
+        };
+        fit_page(
+            &json,
+            offset,
+            &request.result_id,
+            self.config.max_mcp_response_bytes,
+        )
+        .map(Json)
+        .map_err(|_| {
+            ErrorData::internal_error(
+                "MAX_MCP_RESPONSE_BYTES is too small for a result page",
+                None,
+            )
+        })
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository.";
@@ -2060,6 +2203,13 @@ impl ServerHandler for MavenMcpServer {
             .map(|tool| tool.name.clone());
         let trace = ToolCallTrace::start(tool);
         let known_tool = trace.is_known_tool();
+        let tool_name = request.name.clone();
+        let project_path = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("project_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let cancellation = context.ct.clone();
         let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let (result, outcome) = async {
@@ -2070,6 +2220,9 @@ impl ServerHandler for MavenMcpServer {
                     CallOutcome::Cancelled,
                 ),
                 result = self.tool_router.call(call) => {
+                    let result = result.and_then(|response| {
+                        self.bound_response(&tool_name, project_path.as_deref(), response)
+                    });
                     let outcome = CallOutcome::of(&result, known_tool);
                     (result, outcome)
                 }

@@ -43,6 +43,11 @@ agent-specific development rules.
 - `src/server.rs`: MCP request/output types, tool definitions, and handlers.
 - `src/server/tool_call.rs`: the central `tools/call` debug trace (`call_id`,
   known tool name, outcome, duration).
+- `src/server/response_limit.rs`: the bounded structured `Json` output wrapper,
+  the complete-result size check, the `deferred_result` marker, result pages and
+  the deferrable output schemas.
+- `src/server/result_store.rs`: the bounded, project-scoped, process-local store
+  of oversized tool results (16 results, byte budget, 300 s TTL, oldest first).
 - `src/project/run_trace.rs`: debug events of the Maven child lifecycle, keyed by
   a closed operation category.
 - `src/log_safety.rs`: stable `error_kind` categories so log events never quote
@@ -109,6 +114,14 @@ agent-specific development rules.
   as a missing result.
 - `MAX_SOURCE_BYTES` limits source size, and responses must preserve whether
   content was truncated.
+- Tool handlers return `server::Json<T>` (not rmcp's wrapper), so serialization is
+  bounded by `MAX_MCP_RESULT_CACHE_BYTES` before any buffer is built. A complete
+  `tools/call` result above `MAX_MCP_RESPONSE_BYTES` is stored in memory for the
+  call's canonical project root and replaced by a `deferred_result` marker; results
+  within the limit stay byte-identical. `read_tool_result_page` pages must fit the
+  limit, cut only at UTF-8 boundaries, and rebuild the stored JSON exactly. Unknown,
+  expired, evicted and other-project result IDs share one invalid-params error.
+  Stored results never reach logs, disk or the runtime status file.
 
 ## Configuration and Local Execution
 
@@ -121,6 +134,10 @@ Java-selection flag are:
   retained at four times this count.
 - `MAX_PROJECT_INDEX_BYTES`, default: `1073741824`; must be a positive integer.
   Budget for estimated retained memory of runners, indexes, and running builds.
+- `MAX_MCP_RESPONSE_BYTES`, default: `12288`; must be a positive integer large
+  enough for a `deferred_result` marker and a one-character page (startup check).
+- `MAX_MCP_RESULT_CACHE_BYTES`, default: `67108864`; must be a positive integer.
+  Retained-byte budget of stored oversized results and the largest serialized result.
 - `MAVEN_TRUSTED_PROJECT_DIRECTORIES`, optional platform path-list of existing
   absolute directory trees. Maven-backed project operations are disabled when
   unset; a canonical `project_path` must be equal to or below one configured

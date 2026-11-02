@@ -125,6 +125,22 @@ impl TestServer {
         Self::serve(transport).await
     }
 
+    /// Connects a client whose server replaces every tool result larger than
+    /// `response_bytes` with a pageable `deferred_result` marker; `limits` set further
+    /// variables, and a later entry wins over an earlier one.
+    pub async fn connect_with_response_limit(
+        &self,
+        response_bytes: usize,
+        limits: &[(&str, &str)],
+    ) -> Result<RunningService<RoleClient, ()>> {
+        let response_bytes = response_bytes.to_string();
+        let mut variables = vec![("MAX_MCP_RESPONSE_BYTES", response_bytes.as_str())];
+        variables.extend_from_slice(limits);
+        self.connect_with_limits(&variables)
+            .await
+            .map(|(client, _)| client)
+    }
+
     /// Like [`Self::connect_with_limits`], but the server's stderr diagnostics stay readable;
     /// the caller must drain them, or a full pipe blocks the server.
     pub async fn connect_with_stderr(

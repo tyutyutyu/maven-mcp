@@ -81,6 +81,7 @@ async fn run() -> Result<()> {
     tokio::pin!(shutdown);
 
     let config = Config::from_env_with_jenv(cli.jenv)?;
+    MavenMcpServer::validate_response_limits(&config)?;
     tracing::info!(
         version = build_info::PACKAGE_VERSION,
         commit = build_info::build_commit().unwrap_or("unknown"),
@@ -142,6 +143,8 @@ fn log_configuration_summary(config: &Config) {
         max_project_index_bytes = config.max_project_index_bytes,
         max_heavy_jobs = config.max_heavy_jobs,
         max_queued_heavy_jobs = config.max_queued_heavy_jobs,
+        max_mcp_response_bytes = config.max_mcp_response_bytes,
+        max_mcp_result_cache_bytes = config.max_mcp_result_cache_bytes,
         trusted_directories = config.execution.trusted_project_directories.len(),
         maven_executable_configured = config.execution.maven_executable.is_some(),
         execution_repository_configured = config.execution.execution_repository.is_some(),

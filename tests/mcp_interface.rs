@@ -458,6 +458,7 @@ async fn tool_catalog_lists_exactly_the_public_tools() -> Result<()> {
         "list_artifact_versions",
         "list_jar_classes",
         "list_maven_test_classes",
+        "read_tool_result_page",
         "refresh_maven_project",
         "run_maven",
         "run_maven_lifecycle",
@@ -1157,7 +1158,8 @@ async fn arbitrary_maven_rejects_invalid_requests_and_untrusted_projects() -> Re
 async fn arbitrary_maven_reports_failure_timeout_and_bounded_redacted_output() -> Result<()> {
     let server = TestServer::start_with_project().await?;
     let project = server.project_path().unwrap();
-    let client = server.connect().await?;
+    // The bounded 16 KiB outputs are checked whole, not through result pages.
+    let (client, _) = server.connect_with_limits(&[UNPAGED]).await?;
     for (script, status, exit_code, truncated) in [
         (
             "#!/bin/sh\nprintf 'root=%s password=synthetic-value\\n' \"$PWD\" >&2\nexit 23\n",
@@ -3619,7 +3621,10 @@ async fn measure_member_search_over_a_jar_with_many_classes() -> Result<()> {
     support::set_controlled_classpath(&project, &[repository_jar(&project, "alpha"), bulk])?;
     let runtime = tempfile::tempdir()?;
     let (client, pid) = server
-        .connect_with_limits(&[("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap())])
+        .connect_with_limits(&[
+            ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
+            UNPAGED,
+        ])
         .await?;
     let project_path = project.display().to_string();
     let members = |query: &str, jar: Option<&str>| {
@@ -3852,6 +3857,7 @@ async fn measure_type_hierarchy_search_over_a_wide_and_deep_graph() -> Result<()
         .connect_with_limits(&[
             ("MAVEN_MCP_RUNTIME_DIR", runtime.path().to_str().unwrap()),
             ("MAX_RESULTS", "100000"),
+            UNPAGED,
         ])
         .await?;
     let project_path = project.display().to_string();
@@ -4975,5 +4981,557 @@ async fn measure_persistent_cache_startup_cold_warm_and_incremental_costs() -> R
         rss(&warm_status, "peak_rss_bytes"),
         rss(&incremental_status, "peak_rss_bytes"),
     );
+    Ok(())
+}
+
+// Oversized results and read_tool_result_page.
+
+/// The response limit of the paging tests; it holds the largest marker and a one-character page.
+const PAGED_RESPONSE_BYTES: usize = 2_048;
+/// A response limit no fixture result reaches.
+const UNPAGED_RESPONSE_BYTES: usize = 16_777_216;
+/// For tests that measure or check large results whole instead of through result pages.
+const UNPAGED: (&str, &str) = ("MAX_MCP_RESPONSE_BYTES", "16777216");
+const WIDE_CLASS_COUNT: usize = 40;
+
+/// The complete serialized `tools/call` result, as the size limit measures it.
+fn result_bytes(result: &rmcp::model::CallToolResult) -> usize {
+    serde_json::to_vec(result).unwrap().len()
+}
+
+/// The compact JSON text rmcp places in `content`, which equals the structured content.
+fn content_text(result: &rmcp::model::CallToolResult) -> String {
+    let text = result.content[0]
+        .as_text()
+        .expect("structured results repeat their JSON as text")
+        .text
+        .clone();
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        *result.structured_content.as_ref().unwrap()
+    );
+    text
+}
+
+async fn call_result(
+    client: &Client,
+    tool: &str,
+    value: Value,
+) -> Result<rmcp::model::CallToolResult> {
+    let result = client
+        .call_tool(CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments(value)))
+        .await?;
+    assert_eq!(result.is_error, Some(false));
+    Ok(result)
+}
+
+/// Trusted projects whose classpath JAR holds [`WIDE_CLASS_COUNT`] classes, so a class search
+/// for `WideResultClass` exceeds [`PAGED_RESPONSE_BYTES`].
+async fn wide_projects(count: usize) -> Result<(TestServer, Vec<PathBuf>)> {
+    let server = TestServer::start_with_project().await?;
+    let projects = extra_projects(&server, count)?;
+    let classes = (0..WIDE_CLASS_COUNT)
+        .map(|number| format!("org/t/wide/WideResultClass{number:03}"))
+        .collect::<Vec<_>>();
+    support::write_class_jar(&repository_jar(&projects[0], "alpha"), &classes)?;
+    Ok((server, projects))
+}
+
+fn wide_search(project: &Path) -> Value {
+    json!({ "project_path": project.display().to_string(), "query": "WideResultClass" })
+}
+
+/// The `deferred_result` of a marker response, after checking the marker's size and shape.
+fn deferred(result: &rmcp::model::CallToolResult, tool: &str) -> Value {
+    assert!(
+        result_bytes(result) <= PAGED_RESPONSE_BYTES,
+        "marker of {} bytes",
+        result_bytes(result)
+    );
+    let structured = result.structured_content.clone().unwrap();
+    assert_eq!(structured.as_object().unwrap().len(), 1, "{structured}");
+    let marker = structured["deferred_result"].clone();
+    assert_eq!(marker["tool"], tool);
+    assert_eq!(marker["read_with"], "read_tool_result_page");
+    assert_eq!(marker["expires_in_seconds"], 300);
+    assert!(
+        marker["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("read_tool_result_page")
+    );
+    marker
+}
+
+fn page_request(project: &Path, result_id: &str, cursor: Option<&str>) -> Value {
+    let mut request = json!({
+        "project_path": project.display().to_string(),
+        "result_id": result_id,
+    });
+    if let Some(cursor) = cursor {
+        request["cursor"] = json!(cursor);
+    }
+    request
+}
+
+/// Reads every page of a deferred result, checking each page's complete response size, and
+/// returns the concatenated JSON text and the page count.
+async fn read_pages(
+    client: &Client,
+    project: &Path,
+    marker: &Value,
+    limit: usize,
+) -> Result<(String, usize)> {
+    let result_id = marker["result_id"].as_str().unwrap();
+    let total_bytes = marker["total_bytes"].as_u64().unwrap() as usize;
+    let (mut text, mut pages, mut cursor) = (String::new(), 0, None::<String>);
+    loop {
+        let result = call_result(
+            client,
+            "read_tool_result_page",
+            page_request(project, result_id, cursor.as_deref()),
+        )
+        .await?;
+        let size = result_bytes(&result);
+        assert!(size <= limit, "page {pages} response has {size} bytes");
+        let page = structured(result);
+        assert_eq!(page["offset"].as_u64().unwrap() as usize, text.len());
+        assert_eq!(page["total_bytes"].as_u64().unwrap() as usize, total_bytes);
+        let fragment = page["fragment"].as_str().unwrap();
+        assert!(!fragment.is_empty());
+        text.push_str(fragment);
+        pages += 1;
+        if page["complete"] == true {
+            assert!(page["next_cursor"].is_null());
+            return Ok((text, pages));
+        }
+        cursor = Some(page["next_cursor"].as_str().unwrap().to_owned());
+    }
+}
+
+#[tokio::test]
+async fn read_tool_result_page_publishes_a_project_scoped_object_schema() -> Result<()> {
+    let tools = listed_tools().await?;
+    let pager = tools
+        .iter()
+        .find(|tool| tool.name == "read_tool_result_page")
+        .expect("the pager is listed");
+    assert_eq!(pager.input_schema["type"], "object");
+    assert_eq!(
+        pager.input_schema["required"],
+        json!(["project_path", "result_id"])
+    );
+    assert!(pager.input_schema["properties"].get("cursor").is_some());
+    let output = output_schema(&tools, "read_tool_result_page");
+    assert_eq!(output["type"], "object");
+    assert_schema_properties(
+        output,
+        "read_tool_result_page",
+        &[
+            "offset",
+            "fragment",
+            "next_cursor",
+            "complete",
+            "total_bytes",
+        ],
+    );
+    assert!(output["properties"].get("deferred_result").is_none());
+
+    for tool in tools
+        .iter()
+        .filter(|tool| tool.name != "read_tool_result_page")
+    {
+        let schema = output_schema(&tools, &tool.name);
+        assert_eq!(schema["type"], "object", "{}", tool.name);
+        let marker = &schema["properties"]["deferred_result"];
+        assert_eq!(marker["type"], "object", "{} may defer", tool.name);
+        assert!(schema.get("required").is_none(), "{}", tool.name);
+        if let Some(branches) = schema.get("anyOf") {
+            assert_eq!(branches[1], json!({"required": ["deferred_result"]}));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn results_within_the_response_limit_are_returned_unchanged() -> Result<()> {
+    let (server, projects) = wide_projects(1).await?;
+    let project = projects[0].display().to_string();
+    let paged = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let unpaged = server
+        .connect_with_response_limit(UNPAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let default = server.connect_with_limits(LONG_MAVEN).await?.0;
+
+    for (tool, request) in [
+        (
+            "search_classes",
+            json!({"project_path": project, "query": "WideResultClass", "limit": 2}),
+        ),
+        ("index_stats", json!({"project_path": project})),
+        ("inspect_maven_project", json!({"project_path": project})),
+    ] {
+        let small = call_result(&paged, tool, request.clone()).await?;
+        assert!(result_bytes(&small) <= PAGED_RESPONSE_BYTES, "{tool}");
+        assert_eq!(
+            small,
+            call_result(&unpaged, tool, request.clone()).await?,
+            "{tool}"
+        );
+        assert_eq!(small, call_result(&default, tool, request).await?, "{tool}");
+        assert!(
+            small
+                .structured_content
+                .unwrap()
+                .get("deferred_result")
+                .is_none()
+        );
+    }
+    for client in [paged, unpaged, default] {
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_results_become_markers_whose_pages_rebuild_the_exact_json() -> Result<()> {
+    let (server, projects) = wide_projects(1).await?;
+    let project = &projects[0];
+    let unpaged = server
+        .connect_with_response_limit(UNPAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let reference = call_result(&unpaged, "search_classes", wide_search(project)).await?;
+    let original = content_text(&reference);
+    assert_eq!(
+        reference.structured_content.as_ref().unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        WIDE_CLASS_COUNT
+    );
+    let paged = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+
+    let result = call_result(&paged, "search_classes", wide_search(project)).await?;
+    let marker = deferred(&result, "search_classes");
+    let (rebuilt, pages) = read_pages(&paged, project, &marker, PAGED_RESPONSE_BYTES).await?;
+
+    assert_eq!(
+        rebuilt, original,
+        "the pages rebuild the JSON byte for byte"
+    );
+    assert_eq!(
+        marker["total_bytes"].as_u64().unwrap() as usize,
+        original.len()
+    );
+    assert!(pages > 1);
+    println!(
+        "oversized search_classes: original tool result {} bytes, structured JSON {} bytes, marker {} bytes, {pages} pages within {PAGED_RESPONSE_BYTES} bytes",
+        result_bytes(&reference),
+        original.len(),
+        result_bytes(&result)
+    );
+    // A completed result stays readable until it expires or is evicted.
+    let again = read_pages(&paged, project, &marker, PAGED_RESPONSE_BYTES).await?;
+    assert_eq!(again.0, original);
+    for client in [paged, unpaged] {
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn paged_sources_never_split_multibyte_characters() -> Result<()> {
+    let server = TestServer::start_with_project().await?;
+    let line = "    // árvíztűrő tükörfúrógép 😀 漢字 \"quoted\" back\\slash\n";
+    let source = format!(
+        "package org.example;\npublic class Foo {{\n{}}}\n",
+        line.repeat(80)
+    );
+    server.replace_helper_sources(&[("org/example/Foo.java", source.as_bytes())])?;
+    let project = server.project_path().unwrap().to_owned();
+    let request =
+        json!({"project_path": project.display().to_string(), "class_name": "org.example.Foo"});
+    let sources = [("MAX_SOURCE_BYTES", "65536")];
+    let unpaged = server
+        .connect_with_response_limit(UNPAGED_RESPONSE_BYTES, &sources)
+        .await?;
+    let reference = call_result(&unpaged, "get_class_source", request.clone()).await?;
+    let original = content_text(&reference);
+    assert_eq!(
+        reference.structured_content.as_ref().unwrap()["results"][0]["source"],
+        source.as_str()
+    );
+    let paged = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, &sources)
+        .await?;
+
+    let marker = deferred(
+        &call_result(&paged, "get_class_source", request).await?,
+        "get_class_source",
+    );
+    let (rebuilt, pages) = read_pages(&paged, &project, &marker, PAGED_RESPONSE_BYTES).await?;
+
+    // Each fragment is a JSON string, so a split character could not even be transported.
+    assert_eq!(rebuilt, original);
+    assert!(pages > 5, "{pages} pages");
+    for client in [paged, unpaged] {
+        client.cancel().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_cursors_are_invalid_params_errors() -> Result<()> {
+    let (server, projects) = wide_projects(1).await?;
+    let project = &projects[0];
+    let client = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let first = deferred(
+        &call_result(&client, "search_classes", wide_search(project)).await?,
+        "search_classes",
+    );
+    let second = deferred(
+        &call_result(&client, "search_classes", wide_search(project)).await?,
+        "search_classes",
+    );
+    let first_id = first["result_id"].as_str().unwrap();
+    let first_page = call(
+        &client,
+        "read_tool_result_page",
+        page_request(project, first_id, None),
+    )
+    .await?;
+    let issued = first_page["next_cursor"].as_str().unwrap();
+    let second_id = second["result_id"].as_str().unwrap();
+
+    for cursor in ["", "garbage", "0", &format!("{first_id}.1x"), issued] {
+        let error = call_error(
+            &client,
+            "read_tool_result_page",
+            page_request(project, second_id, Some(cursor)),
+        )
+        .await;
+        assert!(error.contains("-32602"), "{cursor:?}: {error}");
+        assert!(error.contains("cursor"), "{cursor:?}: {error}");
+    }
+    let total = first["total_bytes"].as_u64().unwrap();
+    let error = call_error(
+        &client,
+        "read_tool_result_page",
+        page_request(project, first_id, Some(&format!("{first_id}.{total}"))),
+    )
+    .await;
+    assert!(
+        error.contains("-32602") && error.contains("cursor"),
+        "{error}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_evicted_and_other_project_results_share_one_error() -> Result<()> {
+    let (server, projects) = wide_projects(2).await?;
+    let (first, second) = (&projects[0], &projects[1]);
+    let client = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let read_first_page = |project: &Path, result_id: &str| {
+        call_error(
+            &client,
+            "read_tool_result_page",
+            page_request(project, result_id, None),
+        )
+    };
+
+    let oldest = deferred(
+        &call_result(&client, "search_classes", wide_search(first)).await?,
+        "search_classes",
+    );
+    let oldest_id = oldest["result_id"].as_str().unwrap().to_owned();
+    let other_project = read_first_page(second, &oldest_id).await;
+    let unknown = read_first_page(first, "r0000000000000000ffff").await;
+    assert!(unknown.contains("-32602"), "{unknown}");
+    assert_eq!(
+        other_project, unknown,
+        "another project's result is unknown"
+    );
+    assert!(!other_project.contains(&first.display().to_string()));
+
+    // Sixteen results of the second project evict the oldest result of the first.
+    let mut newest = String::new();
+    for _ in 0..16 {
+        let marker = deferred(
+            &call_result(&client, "search_classes", wide_search(second)).await?,
+            "search_classes",
+        );
+        newest = marker["result_id"].as_str().unwrap().to_owned();
+    }
+    assert_eq!(read_first_page(first, &oldest_id).await, unknown);
+    call(
+        &client,
+        "read_tool_result_page",
+        page_request(second, &newest, None),
+    )
+    .await?;
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_result_byte_budget_evicts_oldest_and_rejects_a_result_that_cannot_fit() -> Result<()> {
+    let (server, projects) = wide_projects(1).await?;
+    let project = &projects[0];
+    let measuring = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let marker = deferred(
+        &call_result(&measuring, "search_classes", wide_search(project)).await?,
+        "search_classes",
+    );
+    measuring.cancel().await?;
+    let json_bytes = marker["total_bytes"].as_u64().unwrap() as usize;
+    let id_bytes = marker["result_id"].as_str().unwrap().len();
+    // Retained bytes of one stored result: the JSON text, its identifier and the project root.
+    let retained = json_bytes + id_bytes + project.canonicalize()?.as_os_str().len();
+    let with_budget = |budget: usize| {
+        let budget = budget.to_string();
+        let server = &server;
+        async move {
+            server
+                .connect_with_response_limit(
+                    PAGED_RESPONSE_BYTES,
+                    &[
+                        ("MAVEN_TIMEOUT_SECONDS", "30"),
+                        ("MAX_MCP_RESULT_CACHE_BYTES", budget.as_str()),
+                    ],
+                )
+                .await
+        }
+    };
+
+    // Exactly one result fits, so the second evicts the first.
+    let client = with_budget(retained).await?;
+    let first = deferred(
+        &call_result(&client, "search_classes", wide_search(project)).await?,
+        "search_classes",
+    );
+    let second = deferred(
+        &call_result(&client, "search_classes", wide_search(project)).await?,
+        "search_classes",
+    );
+    let evicted = call_error(
+        &client,
+        "read_tool_result_page",
+        page_request(project, first["result_id"].as_str().unwrap(), None),
+    )
+    .await;
+    assert!(evicted.contains("unknown, expired, evicted"), "{evicted}");
+    let (rebuilt, _) = read_pages(&client, project, &second, PAGED_RESPONSE_BYTES).await?;
+    assert_eq!(rebuilt.len(), json_bytes);
+    client.cancel().await?;
+
+    // One byte less and the single result cannot be stored: an explicit error, no marker.
+    let client = with_budget(retained - 1).await?;
+    let error = call_error(&client, "search_classes", wide_search(project)).await;
+    assert!(error.contains("MAX_MCP_RESULT_CACHE_BYTES"), "{error}");
+    assert!(!error.contains("deferred_result"), "{error}");
+    assert!(error.len() < 400, "the resource-limit error stays small");
+    // A small result of the same request still fits without the store.
+    let mut small = wide_search(project);
+    small["limit"] = json!(1);
+    call(&client, "search_classes", small).await?;
+    client.cancel().await?;
+
+    // A budget below the serialized result stops serialization before anything is stored.
+    let client = with_budget(json_bytes / 2).await?;
+    let error = call_error(&client, "search_classes", wide_search(project)).await;
+    assert!(error.contains("MAX_MCP_RESULT_CACHE_BYTES"), "{error}");
+    client.cancel().await?;
+    println!(
+        "result store accounting: {json_bytes} JSON bytes + {id_bytes} identifier bytes + project root = {retained} retained bytes"
+    );
+    Ok(())
+}
+
+#[test]
+fn response_limit_configuration_rejects_zero_invalid_and_too_small_values() {
+    for (name, value, message) in [
+        ("MAX_MCP_RESPONSE_BYTES", "0", "greater than zero"),
+        ("MAX_MCP_RESPONSE_BYTES", "12k", "positive integer"),
+        ("MAX_MCP_RESPONSE_BYTES", "1024", "too small"),
+        ("MAX_MCP_RESULT_CACHE_BYTES", "0", "greater than zero"),
+        ("MAX_MCP_RESULT_CACHE_BYTES", "-1", "positive integer"),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_maven-mcp"))
+            .env(name, value)
+            .env("MAVEN_MCP_INDEX_CACHE", "false")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}={value}");
+        assert!(output.stdout.is_empty(), "{name}={value}");
+        assert!(
+            stderr.contains(name) && stderr.contains(message),
+            "{name}={value}: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_documented_paging_example_matches_the_real_marker_and_pages() -> Result<()> {
+    let blocks = readme_json_blocks("### Oversized results and paging")?;
+    let [documented_marker, request, documented_page] = blocks.as_slice() else {
+        panic!("the paging section must document a marker, a request and a page: {blocks:?}");
+    };
+    assert_eq!(request["params"]["name"], "read_tool_result_page");
+    let documented_arguments = &request["params"]["arguments"];
+    assert_eq!(
+        object_keys(documented_arguments),
+        BTreeSet::from(["project_path", "result_id"])
+    );
+    assert_eq!(
+        documented_arguments["result_id"],
+        documented_marker["deferred_result"]["result_id"]
+    );
+
+    let (server, projects) = wide_projects(1).await?;
+    let project = &projects[0];
+    let client = server
+        .connect_with_response_limit(PAGED_RESPONSE_BYTES, LONG_MAVEN)
+        .await?;
+    let marker = structured(call_result(&client, "search_classes", wide_search(project)).await?);
+    assert_eq!(object_keys(&marker), object_keys(documented_marker));
+    let (actual, documented) = (
+        &marker["deferred_result"],
+        &documented_marker["deferred_result"],
+    );
+    assert_eq!(object_keys(actual), object_keys(documented));
+    for field in ["tool", "read_with", "expires_in_seconds", "instruction"] {
+        assert_eq!(actual[field], documented[field], "{field}");
+    }
+    let page = call(
+        &client,
+        "read_tool_result_page",
+        page_request(project, actual["result_id"].as_str().unwrap(), None),
+    )
+    .await?;
+    assert_eq!(object_keys(&page), object_keys(documented_page));
+    let documented_cursor = documented_page["next_cursor"].as_str().unwrap();
+    assert!(
+        documented_cursor.starts_with(&format!("{}.", documented["result_id"].as_str().unwrap()))
+    );
+    assert!(
+        page["next_cursor"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{}.", actual["result_id"].as_str().unwrap()))
+    );
+    client.cancel().await?;
     Ok(())
 }
