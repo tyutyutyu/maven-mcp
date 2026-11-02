@@ -11,7 +11,7 @@ cd "${PROJECT_ROOT}"
 for prerequisite in "cargo llvm-cov --version" "python3 --version"; do
   if ! ${prerequisite} >/dev/null 2>&1; then
     echo "Missing coverage prerequisite: '${prerequisite}' failed." >&2
-    echo "Install: rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --version 0.8.5 --locked" >&2
+    echo "Install: rustup component add llvm-tools-preview && cargo install cargo-llvm-cov --version 0.9.0 --locked" >&2
     exit 1
   fi
 done

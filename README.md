@@ -2048,7 +2048,7 @@ skip; the script stops with a message if they are missing):
 
 ```bash
 rustup component add llvm-tools-preview
-cargo install cargo-llvm-cov --version 0.8.5 --locked
+cargo install cargo-llvm-cov --version 0.9.0 --locked
 ```
 
 `python3` is also required. The reports are written to:
