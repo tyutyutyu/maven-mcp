@@ -47,3 +47,13 @@ becomes the GitHub Release notes.
   never quote paths, archive or class names, coordinates or error messages; they
   carry stable `reason` and `error_kind` categories. stderr is colored only when
   it is a terminal.
+- Oversized tool results are pageable: a `tools/call` result whose complete
+  serialization exceeds `MAX_MCP_RESPONSE_BYTES` (default `12288`) is kept in
+  process memory and returned as an object-rooted `deferred_result` marker, and
+  the new `read_tool_result_page` tool returns its JSON in cursor-linked pages
+  that each fit the limit and rebuild the original byte for byte. Stored results
+  are bound to the canonical project, limited to 16 results and
+  `MAX_MCP_RESULT_CACHE_BYTES` (default 64 MiB), and expire after 300 seconds; a
+  result above that budget is an explicit MCP error. Results within the limit
+  are unchanged. Every tool's `outputSchema` now allows the optional
+  `deferred_result` marker as an `anyOf` alternative to its required fields.

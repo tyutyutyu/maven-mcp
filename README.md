@@ -178,6 +178,9 @@ The server exposes the following MCP tools:
   declarations.
 - `list_artifact_versions` – lists locally available versions of an artifact,
   with an optional `groupId` filter.
+- `read_tool_result_page` – returns the next bounded page of a tool result that
+  was too large for one MCP response and came back as a `deferred_result`
+  marker (see [Oversized results and paging](#oversized-results-and-paging)).
 
 ### Multi-release JARs
 
@@ -617,6 +620,97 @@ read error fails the request instead of being reported as a missing match.
 `uses`/`provides`, `META-INF/spring.factories`, and
 `META-INF/spring/*.imports`. Spring `.handlers` and `.schemas` files are not
 provider descriptors and therefore are not included in this structured view.
+
+### Oversized results and paging
+
+Some MCP hosts move a large tool result into host-side storage that the model
+cannot always read back (VS Code GitHub Copilot uses
+`vscode-chat-response-resource://` storage). The server therefore limits the
+complete serialized `tools/call` result, including both the `structuredContent`
+and the JSON text that repeats it in `content`, to `MAX_MCP_RESPONSE_BYTES`
+(default `12288`).
+
+- A result within the limit is returned exactly as before: same shape, same
+  field order, no extra field.
+- A larger result is kept in the server's memory and replaced by an
+  object-rooted `deferred_result` marker that fits the limit. Every tool's
+  `outputSchema` (except `read_tool_result_page`) allows this alternative: an
+  optional `deferred_result` property, with the original required fields and
+  the marker as the two `anyOf` branches.
+- A result that cannot be stored, because its JSON alone exceeds
+  `MAX_MCP_RESULT_CACHE_BYTES` (default 64 MiB), fails with a short MCP error
+  naming that variable. Serialization stops at that budget before any buffer is
+  built, and no marker points to a lost or truncated result. Narrow such a
+  request, for example with a smaller `limit` or a selected `jar`.
+
+A marker in place of a `search_classes` result looks like this:
+
+```json
+{
+  "deferred_result": {
+    "result_id": "r6f0c2a9d41b7e5830",
+    "tool": "search_classes",
+    "total_bytes": 48211,
+    "read_with": "read_tool_result_page",
+    "expires_in_seconds": 300,
+    "instruction": "This tool result is larger than one MCP response may be (MAX_MCP_RESPONSE_BYTES), so it was stored in this server process instead of being returned. Call read_tool_result_page with the same project_path and this result_id and no cursor, then call it again with each returned next_cursor until complete is true. Concatenating every fragment in order yields the original structured JSON of this tool exactly. The result_id is valid only in this server process and expires 300 seconds after this response; older results may be evicted earlier."
+  }
+}
+```
+
+Read it with `read_tool_result_page`, passing the same `project_path` and the
+`result_id`, without a `cursor` for the first page:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "method": "tools/call",
+  "params": {
+    "name": "read_tool_result_page",
+    "arguments": {
+      "project_path": "/home/me/projects/my-service",
+      "result_id": "r6f0c2a9d41b7e5830"
+    }
+  }
+}
+```
+
+Each page holds the next `fragment` of the stored JSON text. Repeat the call
+with `"cursor"` set to the returned `next_cursor` until `complete` is `true`
+(`next_cursor` is then `null`):
+
+```json
+{
+  "offset": 0,
+  "fragment": "{\"results\":[{\"class_name\":\"org.example.Foo\",",
+  "next_cursor": "r6f0c2a9d41b7e5830.3911",
+  "complete": false,
+  "total_bytes": 48211
+}
+```
+
+Concatenating the fragments in order rebuilds, byte for byte, the JSON text the
+tool would have returned in its `structuredContent`; a fragment on its own is
+not valid JSON. Pages cut only at UTF-8 character boundaries, and the complete
+response of every page, after JSON escaping, fits `MAX_MCP_RESPONSE_BYTES`.
+
+The stored results are process-local and bounded:
+
+- at most 16 results and `MAX_MCP_RESULT_CACHE_BYTES` retained bytes (the JSON
+  text, the identifier and the bound project root) across every project; the
+  oldest result is evicted first when a new one does not fit;
+- each result expires 300 seconds after it was stored and is lost when the
+  server restarts; nothing is written to disk, logged, or shown by
+  `maven-mcp stats`;
+- a result is bound to the canonical project root of the original call. An
+  unknown, expired, evicted, or other-project `result_id` fails with the same
+  invalid-params error, which reveals nothing about the result; repeat the
+  original call. A cursor that the server did not issue for that `result_id`
+  is an invalid-params error too.
+
+The server refuses to start when `MAX_MCP_RESPONSE_BYTES` is too small to hold
+the largest marker or a page with one character (about 1.6 KB with the default result budget).
 
 ## Supported Platforms
 
@@ -1462,6 +1556,8 @@ Surefire failures follow the existing report-error contract.
 | `MAX_PROJECT_INDEX_BYTES` | `1073741824` | Budget for the estimated retained memory of cached runners, indexes and running index builds together. Exceeding it evicts least recently used idle entries; a build that cannot fit fails with an error naming this variable. |
 | `MAX_HEAVY_JOBS` | `2` | Maximum number of blocking index, archive and file jobs that run at the same time. |
 | `MAX_QUEUED_HEAVY_JOBS` | `16` | Maximum number of further heavy jobs waiting for a running slot. When running and queued slots are all taken, new jobs fail immediately with an "overloaded" MCP error. |
+| `MAX_MCP_RESPONSE_BYTES` | `12288` | Positive byte limit of one complete serialized `tools/call` result. A larger result is returned as a `deferred_result` marker and read with `read_tool_result_page`; see [Oversized results and paging](#oversized-results-and-paging). Startup fails when the value cannot hold a marker or a one-character page. |
+| `MAX_MCP_RESULT_CACHE_BYTES` | `67108864` | Positive byte budget of the in-memory store of oversized results (at most 16, each expiring after 300 seconds), and the largest serialized result. A result above it fails with an MCP error naming this variable. |
 | `MAVEN_TRUSTED_PROJECT_DIRECTORIES` | none | Required for Maven-backed project operations. Platform path-list of existing absolute directory trees; a canonical `project_path` must be equal to or nested below one entry. |
 | `MAVEN_EXECUTABLE` | none | Absolute Maven binary path; required only when no valid executable Maven Wrapper is available. |
 | `MAVEN_EXECUTION_REPO_PATH` | none | Optional existing writable Maven local repository for structured Maven execution and exact artifact inspection. Exact artifact inspection otherwise reads `$HOME/.m2/repository`. `run_maven` requires an explicit `-Dmaven.repo.local` argument to select this repository. |

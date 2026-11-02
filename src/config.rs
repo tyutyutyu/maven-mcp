@@ -22,6 +22,10 @@ pub const DEFAULT_MAX_JAR_ENTRIES: usize = 200_000;
 pub const DEFAULT_MAX_INDEX_ENTRIES: usize = 20_000_000;
 pub const DEFAULT_MAX_INDEX_NAME_BYTES: usize = 2_147_483_648;
 pub const DEFAULT_MAX_INDEX_CACHE_BYTES: usize = 1_073_741_824;
+/// Conservative default below the size at which MCP hosts such as VS Code Copilot move a tool
+/// result into host-side storage the model may not be able to read back.
+pub const DEFAULT_MAX_MCP_RESPONSE_BYTES: usize = 12_288;
+pub const DEFAULT_MAX_MCP_RESULT_CACHE_BYTES: usize = 67_108_864;
 pub const MAX_ENTRY_NAME_BYTES: usize = 4096;
 
 static MAX_XML_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_XML_BYTES);
@@ -197,6 +201,11 @@ pub struct Config {
     pub max_heavy_jobs: usize,
     /// Heavy jobs that may wait for a running slot; further jobs are rejected.
     pub max_queued_heavy_jobs: usize,
+    /// Largest complete serialized `tools/call` result; larger results become pageable.
+    pub max_mcp_response_bytes: usize,
+    /// Aggregate retained bytes of every stored oversized result, and the serialization
+    /// budget of one result.
+    pub max_mcp_result_cache_bytes: usize,
     pub execution: MavenExecutionConfig,
     /// The on-disk index cache, or `None` when it is disabled or has no location.
     pub index_cache: Option<IndexCacheConfig>,
@@ -241,6 +250,14 @@ impl Config {
                 "MAX_QUEUED_HEAVY_JOBS",
                 DEFAULT_MAX_QUEUED_HEAVY_JOBS,
             )?,
+            max_mcp_response_bytes: positive_env(
+                "MAX_MCP_RESPONSE_BYTES",
+                DEFAULT_MAX_MCP_RESPONSE_BYTES,
+            )?,
+            max_mcp_result_cache_bytes: positive_env(
+                "MAX_MCP_RESULT_CACHE_BYTES",
+                DEFAULT_MAX_MCP_RESULT_CACHE_BYTES,
+            )?,
             execution: maven_execution_from_env(use_jenv)?,
             index_cache: index_cache_from_env()?,
         })
@@ -250,7 +267,7 @@ impl Config {
 /// Variables that configure only this server's own limits, logging, cache and stats. They
 /// are removed from every Maven child, so they cannot change a Maven result and are left out
 /// of the persisted classpath identity, which digests the rest of the environment.
-pub const SERVER_ONLY_ENVIRONMENT: [&str; 17] = [
+pub const SERVER_ONLY_ENVIRONMENT: [&str; 19] = [
     "MAX_RESULTS",
     "MAX_SOURCE_BYTES",
     "MAX_PROJECT_INDEXES",
@@ -263,6 +280,8 @@ pub const SERVER_ONLY_ENVIRONMENT: [&str; 17] = [
     "MAX_INDEX_NAME_BYTES",
     "MAX_INDEX_CACHE_BYTES",
     "MAX_MAVEN_OUTPUT_BYTES",
+    "MAX_MCP_RESPONSE_BYTES",
+    "MAX_MCP_RESULT_CACHE_BYTES",
     "MAVEN_TIMEOUT_SECONDS",
     "MAVEN_MCP_INDEX_CACHE",
     "MAVEN_MCP_CACHE_DIR",
@@ -384,7 +403,12 @@ fn boolean_env_or(name: &str, default: bool) -> Result<bool> {
 }
 
 fn positive_env(name: &str, default: usize) -> Result<usize> {
-    let Some(value) = env::var_os(name) else {
+    parse_positive(name, env::var_os(name).as_deref(), default)
+}
+
+/// `default` when the variable is unset, otherwise its value, which must be a positive integer.
+fn parse_positive(name: &str, value: Option<&std::ffi::OsStr>, default: usize) -> Result<usize> {
+    let Some(value) = value else {
         return Ok(default);
     };
     let parsed = value
