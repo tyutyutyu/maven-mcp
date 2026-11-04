@@ -477,6 +477,167 @@ async fn tool_catalog_lists_exactly_the_public_tools() -> Result<()> {
     Ok(())
 }
 
+/// Synonyms that the README terminology replaced; client-facing text must not use them.
+const RETIRED_TERMS: [&str; 6] = [
+    "startup index",
+    "opt-in project",
+    "configured project",
+    "host-trusted",
+    "trusted tree",
+    "read-only local Maven repository",
+];
+
+/// The tool description followed by every input property description of one tool.
+fn client_facing_texts(tool: &rmcp::model::Tool) -> Vec<String> {
+    let properties = tool
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.values())
+        .filter_map(|property| property.get("description").and_then(Value::as_str))
+        .map(str::to_owned);
+    tool.description
+        .iter()
+        .map(|description| description.to_string())
+        .chain(properties)
+        .collect()
+}
+
+fn tool_description<'a>(tools: &'a [rmcp::model::Tool], name: &str) -> &'a str {
+    tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .and_then(|tool| tool.description.as_deref())
+        .unwrap_or_else(|| panic!("{name} must have a description"))
+}
+
+#[tokio::test]
+async fn server_instructions_use_the_shared_terminology() -> Result<()> {
+    let server = TestServer::start().await?;
+    let client = server.connect().await?;
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("initialize must return server instructions");
+    client.cancel().await?;
+    for term in [
+        "Native STDIO",
+        "project_path",
+        "canonical project root",
+        "trusted directory tree",
+        "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+        "lazy project index",
+        "partial result",
+        "deferred_result",
+        "read_tool_result_page",
+    ] {
+        assert!(
+            instructions.contains(term),
+            "server instructions miss {term:?}"
+        );
+    }
+    for retired in RETIRED_TERMS {
+        assert!(
+            !instructions.contains(retired),
+            "server instructions use the retired term {retired:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_descriptions_use_the_shared_terminology_in_english() -> Result<()> {
+    let tools = listed_tools().await?;
+    for tool in &tools {
+        for text in client_facing_texts(tool) {
+            assert!(text.is_ascii(), "{}: non-English text {text:?}", tool.name);
+            for retired in RETIRED_TERMS {
+                assert!(
+                    !text.contains(retired),
+                    "{} uses the retired term {retired:?}: {text:?}",
+                    tool.name
+                );
+            }
+        }
+        let project_path = tool.input_schema["properties"]["project_path"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            project_path.contains("canonical"),
+            "{}: project_path description does not name the canonical project root",
+            tool.name
+        );
+        if tool.name != "read_tool_result_page" {
+            assert!(
+                project_path.contains("trusted directory tree"),
+                "{}: project_path description does not name the trusted directory tree",
+                tool.name
+            );
+        }
+    }
+    assert!(tool_description(&tools, "index_stats").contains("lazy project index"));
+    for partial in ["search_source", "search_jar_content"] {
+        assert!(
+            tool_description(&tools, partial).contains("partial result"),
+            "{partial} does not describe its partial result"
+        );
+    }
+    for trusted in ["run_maven", "run_maven_lifecycle"] {
+        assert!(
+            tool_description(&tools, trusted).contains("trusted"),
+            "{trusted} does not name the trust requirement"
+        );
+    }
+    Ok(())
+}
+
+/// Tool names of the README tool list: list items under `## Features` whose text
+/// before the ` – ` separator consists only of backticked names.
+fn readme_documented_tools() -> Result<BTreeSet<String>> {
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))?;
+    let features = readme
+        .split("\n## Features\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .ok_or_else(|| anyhow::anyhow!("README.md misses ## Features"))?;
+    let mut items: Vec<String> = Vec::new();
+    for line in features.lines() {
+        if let Some(item) = line.strip_prefix("- ") {
+            items.push(item.to_owned());
+        } else if let (Some(item), true) = (items.last_mut(), line.starts_with("  ")) {
+            item.push(' ');
+            item.push_str(line.trim());
+        }
+    }
+    let mut names = BTreeSet::new();
+    for item in items {
+        let Some((head, _)) = item.split_once(" \u{2013} ") else {
+            continue;
+        };
+        let tokens = head.split(", ").collect::<Vec<_>>();
+        let backticked = tokens
+            .iter()
+            .filter_map(|token| token.strip_prefix('`')?.strip_suffix('`'))
+            .collect::<Vec<_>>();
+        if backticked.len() == tokens.len() {
+            names.extend(backticked.into_iter().map(str::to_owned));
+        }
+    }
+    Ok(names)
+}
+
+#[tokio::test]
+async fn readme_tool_list_matches_the_tool_catalog() -> Result<()> {
+    let tools = listed_tools().await?;
+    let listed = tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(readme_documented_tools()?, listed);
+    Ok(())
+}
+
 #[tokio::test]
 async fn every_tool_output_schema_has_an_object_root() -> Result<()> {
     let tools = listed_tools().await?;

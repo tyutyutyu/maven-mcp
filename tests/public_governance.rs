@@ -203,3 +203,316 @@ fn governance_documents_reference_no_private_workspace_data() -> Result<()> {
     }
     Ok(())
 }
+
+/// Public Markdown documents whose language, terminology and links are checked.
+const PUBLIC_MARKDOWN: [&str; 9] = [
+    "README.md",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "SUPPORT.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "docs/dependency-maintenance.md",
+    PULL_REQUEST_TEMPLATE,
+];
+/// The shared terms that `README.md` defines and the maintenance rule names.
+const SHARED_TERMS: [&str; 7] = [
+    "native STDIO",
+    "`project_path`",
+    "canonical project root",
+    "trusted directory tree",
+    "lazy project index",
+    "partial result",
+    "deferred result",
+];
+/// Synonyms replaced by the shared terms. `AGENTS.md` names them in its rule, so it is
+/// the only document allowed to contain them.
+const RETIRED_TERMS: [&str; 5] = [
+    "trusted tree",
+    "startup index",
+    "host-trusted",
+    "the opt-in project",
+    "the configured project",
+];
+/// The `README.md` paragraph that lists what the release privacy check rejects; naming
+/// private paths there documents the check and is not a reference to them.
+const RELEASE_PRIVACY_PARAGRAPH: &str = "`scripts/release.sh check` also checks";
+
+/// Lines outside fenced code blocks.
+fn prose_lines(text: &str) -> Vec<&str> {
+    let mut fenced = false;
+    text.lines()
+        .filter(|line| {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                return false;
+            }
+            !fenced
+        })
+        .collect()
+}
+
+/// GitHub heading anchors of a Markdown document, with `-1`, `-2` suffixes for repeats.
+fn heading_anchors(text: &str) -> Vec<String> {
+    let mut anchors: Vec<String> = Vec::new();
+    for line in prose_lines(text) {
+        let Some(title) = line
+            .strip_prefix('#')
+            .map(|rest| rest.trim_start_matches('#'))
+            .and_then(|rest| rest.strip_prefix(' '))
+        else {
+            continue;
+        };
+        let slug = title
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+            .map(|c| if c == ' ' { '-' } else { c })
+            .collect::<String>();
+        let repeats = anchors
+            .iter()
+            .filter(|anchor| {
+                anchor.as_str() == slug
+                    || anchor
+                        .strip_prefix(&slug)
+                        .and_then(|suffix| suffix.strip_prefix('-'))
+                        .is_some_and(|n| n.parse::<usize>().is_ok())
+            })
+            .count();
+        anchors.push(if repeats == 0 {
+            slug
+        } else {
+            format!("{slug}-{repeats}")
+        });
+    }
+    anchors
+}
+
+/// Targets of inline Markdown links outside fenced code blocks.
+fn link_targets(text: &str) -> Result<Vec<String>> {
+    let link = regex::Regex::new(r"\]\(([^)\s]+)\)")?;
+    Ok(prose_lines(text)
+        .into_iter()
+        .flat_map(|line| link.captures_iter(line).map(|c| c[1].to_owned()))
+        .collect::<Vec<_>>())
+}
+
+fn without_paragraph(text: &str, start: &str) -> String {
+    match text.find(start) {
+        Some(begin) => {
+            let end = text[begin..]
+                .find("\n\n")
+                .map_or(text.len(), |offset| begin + offset);
+            format!("{}{}", &text[..begin], &text[end..])
+        }
+        None => text.to_owned(),
+    }
+}
+
+#[test]
+fn readme_defines_the_shared_terminology_and_documentation_language() -> Result<()> {
+    let readme = read("README.md")?;
+    let terminology = readme
+        .split("\n## Terminology\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .context("README.md misses ## Terminology")?;
+    for term in SHARED_TERMS {
+        assert!(
+            terminology.contains(&format!("\n| {term} |")),
+            "the README terminology does not define {term:?}"
+        );
+    }
+    assert_contains_all(
+        "README.md",
+        terminology,
+        &[
+            "### Documentation language",
+            "English is the primary and only maintained language",
+            "Translations are not maintained in this repository.",
+            "](AGENTS.md#documentation-language-and-terminology)",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn readme_reaches_the_architecture_and_security_model_in_english() -> Result<()> {
+    let readme = read("README.md")?;
+    let documentation = readme
+        .split("\n## Documentation\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .context("README.md misses ## Documentation")?;
+    for target in [
+        "(#getting-started)",
+        "(#architecture-and-security-model)",
+        "(#terminology)",
+        "(#opt-in-project-execution)",
+        "(#redaction-and-data-minimization)",
+        "(#local-development)",
+        "(#releases)",
+        "(AGENTS.md)",
+        "(SECURITY.md)",
+    ] {
+        assert!(
+            documentation.contains(target),
+            "the README documentation map does not link {target}"
+        );
+    }
+    let architecture = readme
+        .split("\n## Architecture and security model\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .context("README.md misses ## Architecture and security model")?;
+    assert_contains_all(
+        "README.md",
+        architecture,
+        &[
+            "**Native STDIO.**",
+            "stdout carries only protocol messages",
+            "**Request-scoped projects.**",
+            "canonical project root",
+            "**Trust boundary.**",
+            "MAVEN_TRUSTED_PROJECT_DIRECTORIES",
+            "trusted directory trees",
+            "**Lazy project index.**",
+            "**Maven execution.**",
+            "is not a sandbox",
+            "partial result",
+            "**Data minimization.**",
+            "[SECURITY.md](SECURITY.md)",
+        ],
+    );
+    let local_development = readme
+        .split("\n## Local Development\n")
+        .nth(1)
+        .context("README.md misses ## Local Development")?;
+    assert_contains_all(
+        "README.md",
+        local_development,
+        &[
+            "cargo test --locked",
+            "cargo test --test mcp_interface --locked",
+            "scripts/test-pyramid.sh",
+            "There are four separate verification levels:",
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn agents_md_records_the_documentation_language_and_terminology_rule() -> Result<()> {
+    let agents = read("AGENTS.md")?;
+    let rule = agents
+        .split("\n## Documentation Language and Terminology\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .context("AGENTS.md misses ## Documentation Language and Terminology")?;
+    assert_contains_all(
+        "AGENTS.md",
+        rule,
+        &[
+            "English is the primary and authoritative language",
+            "Translations are optional",
+            "marked as non-authoritative, links to its English source",
+            "updated or removed in the same pull request",
+            "\"Terminology\" in `README.md`",
+            "never linked or required as references",
+        ],
+    );
+    for term in SHARED_TERMS {
+        assert!(
+            normalized(rule).contains(term),
+            "the AGENTS.md rule does not name {term:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn public_documents_use_english_shared_terminology() -> Result<()> {
+    for document in PUBLIC_MARKDOWN {
+        let text = read(document)?;
+        let prose = prose_lines(&text).join("\n");
+        assert!(
+            !prose.contains(['ő', 'ű', 'Ő', 'Ű']),
+            "{document} contains Hungarian prose"
+        );
+        if document == "AGENTS.md" {
+            continue;
+        }
+        let normalized_text = normalized(&text);
+        for retired in RETIRED_TERMS {
+            assert!(
+                !normalized_text.contains(retired),
+                "{document} uses the retired term {retired:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn public_markdown_links_resolve_to_files_and_headings() -> Result<()> {
+    for document in PUBLIC_MARKDOWN {
+        let text = read(document)?;
+        let directory = Path::new(document).parent().unwrap_or(Path::new(""));
+        for target in link_targets(&text)? {
+            if target.starts_with("https://") || target.starts_with("mailto:") {
+                continue;
+            }
+            let (file, anchor) = target.split_once('#').unwrap_or((&target, ""));
+            let linked = if file.is_empty() {
+                document.to_owned()
+            } else {
+                directory.join(file).to_string_lossy().into_owned()
+            };
+            assert!(
+                Path::new(REPO).join(&linked).exists(),
+                "{document} links the missing file {target:?}"
+            );
+            if !anchor.is_empty() {
+                assert!(
+                    heading_anchors(&read(&linked)?)
+                        .iter()
+                        .any(|heading| heading == anchor),
+                    "{document} links the missing heading {target:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn public_documents_require_no_private_workspace_references() -> Result<()> {
+    for document in PUBLIC_MARKDOWN {
+        let text = read(document)?;
+        for target in link_targets(&text)? {
+            for private in PRIVATE_REFERENCES {
+                assert!(
+                    !target.contains(private),
+                    "{document} links private workspace data {target:?}"
+                );
+            }
+        }
+        let checked = if document == "README.md" {
+            without_paragraph(&text, RELEASE_PRIVACY_PARAGRAPH)
+        } else {
+            text
+        };
+        for private in PRIVATE_REFERENCES
+            .iter()
+            .filter(|private| **private != "/home/")
+        {
+            assert!(
+                !checked.contains(private),
+                "{document} references private workspace data {private:?}"
+            );
+        }
+    }
+    Ok(())
+}

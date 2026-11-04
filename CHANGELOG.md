@@ -13,8 +13,8 @@ becomes the GitHub Release notes.
 
 - Native STDIO MCP server for request-scoped Maven project inspection. Every
   repository- or project-dependent tool takes an explicit absolute
-  `project_path`; Maven-backed operations require a trusted project directory
-  from `MAVEN_TRUSTED_PROJECT_DIRECTORIES`.
+  `project_path`; Maven-backed operations require its canonical project root to
+  be inside a trusted directory tree from `MAVEN_TRUSTED_PROJECT_DIRECTORIES`.
 - Class, JAR, JAR entry, JAR content, source, declaration source, class member,
   type hierarchy, class reference, service provider, artifact version, artifact
   POM, artifact diagnosis, and exact local API comparison tools.
@@ -67,3 +67,13 @@ becomes the GitHub Release notes.
   extended pull request template ask for version, platform, and minimal
   reproduction data while rejecting credentials, Maven settings, raw logs, and
   full local paths. `README.md` links every governance document.
+- One English terminology across the public documentation and the client-facing
+  MCP text: `README.md` gains a documentation map, an architecture and security
+  model, and a terminology table (native STDIO, `project_path`, canonical
+  project root, trusted directory tree, lazy project index, partial result,
+  deferred result), and `AGENTS.md` records the documentation language and
+  terminology rule. The server instructions, the `project_path` descriptions,
+  and the `index_stats`, `inspect_maven_project`, `run_maven`,
+  `run_maven_lifecycle`, `list_maven_test_classes`,
+  `get_last_maven_test_failures`, `refresh_maven_project`, `search_source`, and
+  `search_jar_content` descriptions use these terms.

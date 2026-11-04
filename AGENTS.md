@@ -207,12 +207,39 @@ cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
+## Documentation Language and Terminology
+
+- English is the primary and authoritative language of every public document:
+  `README.md`, this file, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`,
+  `SECURITY.md`, `CHANGELOG.md`, `docs/`, the `.github/` issue and pull request
+  templates, MCP tool and schema descriptions, server instructions, error
+  messages, and code comments. Write every change to them in English.
+- Translations are optional and not maintained in the repository today. A
+  translation may be added only as a separate file that is marked as
+  non-authoritative, links to its English source, and is updated or removed in
+  the same pull request that changes the source. No public document may depend
+  on a translation.
+- Use the terms defined under "Terminology" in `README.md` with exactly that
+  meaning: native STDIO, `project_path`, canonical project root, trusted
+  directory tree, lazy project index, partial result, and deferred result. Do
+  not introduce synonyms such as "trusted tree", "opt-in project", "configured
+  project", or "startup index". A new shared term is added to that table in the
+  same change that first uses it.
+- Keep the tool descriptions in `src/server.rs`, the tool list in `README.md`,
+  and the guides consistent; `tests/mcp_interface.rs` and
+  `tests/public_governance.rs` check the shared terms and every relative
+  Markdown link.
+- Public documents must be complete on their own. Planning notes, private test
+  notes, decision records, and workspace data stay outside the repository, are
+  never committed or packaged, and are never linked or required as references.
+
 ## Checklist for MCP Tool Changes
 
 When adding a tool or changing a public tool contract, update all of the
 following together:
 
-1. The request/output type and tool description in `src/server.rs`.
+1. The request/output type and tool description in `src/server.rs`, using the
+   README terminology.
 2. The indexing or search logic and its unit tests.
 3. The expected tool-name list, `outputSchema`, and lifecycle checks in
    `tests/mcp_interface.rs`.
@@ -280,7 +307,7 @@ scripts/run-inspector.sh --cli --method tools/list
 ## Native Runtime Security
 
 - STDIO is the only supported transport; do not add a listening socket or
-  daemon lifecycle without a separately approved ADR.
+  daemon lifecycle without a separately approved architecture decision.
 - stdout is protocol-only. Logging and diagnostics must remain on stderr.
 - Project execution is selected per request through explicit `project_path`, but
   authorization is granted only by `MAVEN_TRUSTED_PROJECT_DIRECTORIES`. Never
