@@ -57,3 +57,13 @@ becomes the GitHub Release notes.
   result above that budget is an explicit MCP error. Results within the limit
   are unchanged. Every tool's `outputSchema` now allows the optional
   `deferred_result` marker as an `anyOf` alternative to its required fields.
+- Public contribution, conduct, support, and security governance:
+  `CONTRIBUTING.md` (contribution process, required checks, private-data rules,
+  and MIT inbound=outbound terms without a CLA or DCO), `CODE_OF_CONDUCT.md`,
+  `SUPPORT.md`, and `SECURITY.md` (GitHub Private Vulnerability Reporting, the
+  latest beta on the supported Linux targets, and best-effort response goals
+  without an SLA). GitHub bug report and feature request issue forms, an issue
+  chooser configuration with the private security reporting link, and an
+  extended pull request template ask for version, platform, and minimal
+  reproduction data while rejecting credentials, Maven settings, raw logs, and
+  full local paths. `README.md` links every governance document.
