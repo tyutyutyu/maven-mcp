@@ -606,7 +606,11 @@ async fn sigterm_does_not_leave_an_active_maven_process_group() -> Result<()> {
     let pid_path = project.join("maven-child.pid");
     let maven_process_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Ok(value) = std::fs::read_to_string(&pid_path) {
+            // The shell creates the file before printf writes the PID, so an
+            // empty read only means the write has not happened yet.
+            if let Ok(value) = std::fs::read_to_string(&pid_path)
+                && !value.trim().is_empty()
+            {
                 break value.trim().parse::<i32>();
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

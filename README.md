@@ -866,7 +866,9 @@ SHA-256 (see [Creating a release](#creating-a-release)).
 - **Support period.** During the beta, only the latest release is supported.
   Fixes, including security fixes, ship only as a new release of the newest
   `0.y` series. They are never backported to older series. Report a problem only
-  after you reproduce it on the latest release. Older archives stay downloadable.
+  after you reproduce it on the latest release; see [SUPPORT.md](SUPPORT.md),
+  and report vulnerabilities privately as described in
+  [SECURITY.md](SECURITY.md). Older archives stay downloadable.
   A broken crates.io version may be yanked. There is no long-term support line.
   The support period for stable versions will be published with `1.0.0`.
 
@@ -2344,6 +2346,23 @@ Contributions are accepted under the same MIT License: by submitting a pull
 request you confirm that you have the right to contribute the code and license
 it under those terms. No CLA or DCO sign-off is required, and signed commits or
 tags are not required.
+
+The maintainer is István Földházi. Project participation is governed by these
+documents:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to propose a change, the required
+  checks, and the contribution terms;
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): expected behavior and how to report
+  a conduct problem;
+- [SUPPORT.md](SUPPORT.md): where to ask for help and what a report needs;
+- [SECURITY.md](SECURITY.md): private vulnerability reporting through GitHub
+  Private Vulnerability Reporting, supported versions, and response
+  expectations.
+
+Issues and pull requests use the forms and template under `.github/`. Never
+post credentials, Maven settings files, private source code, complete raw logs,
+or complete local paths in them; report suspected vulnerabilities only
+privately.
 
 ## License
 

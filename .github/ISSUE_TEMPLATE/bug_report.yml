@@ -1,0 +1,90 @@
+name: Bug report
+description: Something in maven-mcp does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Issues are public: **do not** post credentials,
+        Maven `settings.xml` or `settings-security.xml` contents, private source code,
+        complete raw logs or complete local paths. Replace private values with placeholders
+        such as `<PROJECT_ROOT>`, `<MAVEN_REPOSITORY>` or `<HOME>`.
+
+        Suspected security vulnerabilities must be reported privately; see
+        [SECURITY.md](https://github.com/tyutyutyu/maven-mcp/blob/main/SECURITY.md).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I reproduced the problem on the latest release and searched the existing issues.
+          required: true
+        - label: This report contains no credentials, Maven settings files, private source code, complete raw logs or complete local paths.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: maven-mcp version
+      description: Output of `maven-mcp --version`.
+      placeholder: maven-mcp 0.1.0 (commit 0123456789ab)
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation channel
+      options:
+        - GitHub Release archive
+        - crates.io (cargo install)
+        - Source build
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Platform target
+      options:
+        - x86_64-unknown-linux-gnu
+        - aarch64-unknown-linux-gnu
+        - Other (unsupported)
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, MCP host and its version, Maven version (`mvn -v` first line) and Java version.
+      placeholder: Ubuntu 24.04, Codex CLI 1.2.3, Apache Maven 3.9.9, Java 21
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        The tool or command, its arguments (with placeholder paths) and the steps to reproduce.
+        Prefer a small synthetic Maven project with public dependencies; include its `pom.xml`
+        when it matters. List the relevant `MAVEN_*` environment variables without secret values.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: The response or error. Quote only the relevant, redacted lines, not complete logs.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that helps, such as whether the problem started after an upgrade.

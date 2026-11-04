@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a new tool, option or behavior for maven-mcp.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are public: do not include credentials, private source code, internal artifact
+        coordinates or complete local paths. Larger changes, such as a new tool or a changed
+        public response shape, are agreed here before a pull request; see
+        [CONTRIBUTING.md](https://github.com/tyutyutyu/maven-mcp/blob/main/CONTRIBUTING.md).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and the README.
+          required: true
+        - label: This request contains no credentials, private source code or complete local paths.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you or your agent trying to do, and why is it hard with the current tools?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: The tool, input or output change you have in mind, with an example request and response if possible.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and security impact
+      description: Would this change an existing public response shape, a default, or the trusted-directory and project isolation rules?
