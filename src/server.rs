@@ -76,7 +76,9 @@ impl<T> From<Vec<T>> for Results<T> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectPathRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
 }
 
@@ -108,7 +110,7 @@ pub enum RefreshStatus {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResultPageRequest {
     #[schemars(
-        description = "Absolute path to the trusted Maven project root of the call that returned the deferred_result"
+        description = "project_path of the call that returned the deferred_result; it must resolve to the same canonical project root"
     )]
     project_path: String,
     #[schemars(description = "The result_id of a deferred_result marker")]
@@ -119,7 +121,9 @@ pub struct ResultPageRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Case-insensitive substring to search for")]
     query: String,
@@ -129,7 +133,9 @@ pub struct SearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntrySearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Case-insensitive substring matched against JAR entry paths")]
     query: String,
@@ -143,7 +149,9 @@ pub struct EntrySearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassListRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Exact coordinate, repository-relative path, or JAR filename")]
     jar: String,
@@ -155,7 +163,9 @@ pub struct ClassListRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
@@ -169,7 +179,9 @@ pub struct SourceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JarEntryRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Exact coordinate, repository-relative path, or JAR filename")]
     jar: String,
@@ -179,7 +191,9 @@ pub struct JarEntryRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PomDescriptorRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Exact Maven coordinate in groupId:artifactId:version form")]
     coordinate: String,
@@ -187,7 +201,9 @@ pub struct PomDescriptorRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArtifactHealthRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Exact Maven coordinate in groupId:artifactId:version form")]
     coordinate: String,
@@ -195,7 +211,9 @@ pub struct ArtifactHealthRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassMemberSearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(
         description = "Case-insensitive substring matched against member or annotation names"
@@ -211,7 +229,9 @@ pub struct ClassMemberSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ArtifactApiDiffRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Exact Maven groupId")]
     group_id: String,
@@ -225,7 +245,9 @@ pub struct ArtifactApiDiffRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct JarContentSearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Case-insensitive substring matched inside supported text resources")]
     query: String,
@@ -239,7 +261,9 @@ pub struct JarContentSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TypeHierarchyRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified interface or base class name")]
     type_name: String,
@@ -256,7 +280,9 @@ pub struct TypeHierarchyRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SourceSearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Substring or regular expression matched in Java/Kotlin sources")]
     query: String,
@@ -276,7 +302,9 @@ pub struct SourceSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeclarationSourceRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
@@ -296,7 +324,9 @@ pub struct DeclarationSourceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassReferenceRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified class name used as source or target owner")]
     class_name: String,
@@ -318,7 +348,9 @@ pub struct ClassReferenceRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProviderSearchRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Optional case-insensitive service or extension-point filter")]
     service: Option<String>,
@@ -336,7 +368,9 @@ pub struct ProviderSearchRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MavenArgumentsRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(
         description = "Exact ordered Maven argument list, including any lifecycle phases, plugin goals and options. Each item is one argument; no shell parsing or automatic flags. Use --offline explicitly if needed."
@@ -346,7 +380,9 @@ pub struct MavenArgumentsRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MavenLifecycleRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Allowed lifecycle phase: compile, test_compile, or verify")]
     phase: LifecyclePhase,
@@ -359,7 +395,9 @@ pub struct MavenLifecycleRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FocusedTestRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified test class name")]
     test_class: String,
@@ -374,7 +412,9 @@ pub struct FocusedTestRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectModuleRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
@@ -382,7 +422,9 @@ pub struct ProjectModuleRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DependencyTreeRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
@@ -396,7 +438,9 @@ pub struct DependencyTreeRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DependencyResolutionRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
@@ -410,7 +454,9 @@ pub struct DependencyResolutionRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MavenClasspathRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Optional exact selector from inspect_maven_project.modules")]
     module: Option<String>,
@@ -420,7 +466,9 @@ pub struct MavenClasspathRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CoverageGapRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Maximum result count; capped by MAX_RESULTS")]
     limit: Option<usize>,
@@ -435,7 +483,9 @@ pub enum ClassVisibility {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ClassDescriptionRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Fully-qualified class name; inner classes may use $")]
     class_name: String,
@@ -451,7 +501,9 @@ pub struct ClassDescriptionRequest {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct VersionsRequest {
-    #[schemars(description = "Absolute path to the trusted Maven project root containing pom.xml")]
+    #[schemars(
+        description = "Absolute Maven project root containing pom.xml; its canonical path must be inside a trusted directory tree"
+    )]
     project_path: String,
     #[schemars(description = "Maven artifactId")]
     artifact_id: String,
@@ -1560,7 +1612,9 @@ fn unindexed_classpath_message(unindexed: &[UnindexedClasspathEntry]) -> String 
 
 #[tool_router(router = tool_router)]
 impl MavenMcpServer {
-    #[tool(description = "Return startup index statistics")]
+    #[tool(
+        description = "Return statistics of the lazy project index, which the first index-dependent request of the canonical project root builds"
+    )]
     async fn index_stats(
         &self,
         Parameters(request): Parameters<ProjectPathRequest>,
@@ -1778,7 +1832,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Search supported UTF-8 text resources inside indexed JARs with entry, total-byte, context, and result limits"
+        description = "Search supported UTF-8 text resources inside indexed JARs with entry, total-byte, context, and result limits; incomplete marks a partial result"
     )]
     async fn search_jar_content(
         &self,
@@ -1814,7 +1868,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Search Java and Kotlin sources in local sources artifacts with bounded line context"
+        description = "Search Java and Kotlin sources in local sources artifacts with bounded line context; incomplete marks a partial result, so an empty partial result does not prove absence"
     )]
     async fn search_source(
         &self,
@@ -1918,7 +1972,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Return the validated root POM, packaging, Maven Wrapper, and reactor module model for the opt-in project"
+        description = "Return the validated root POM, packaging, Maven Wrapper, and reactor module model of the canonical project root without starting Maven"
     )]
     fn inspect_maven_project(
         &self,
@@ -1930,7 +1984,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Explicitly refresh one trusted project: drop its cached model and index, abandon any running build, re-read the POMs, wrapper and Maven configuration, and rebuild the index. Starts Maven for the classpath goal through the shared execution permit and the same offline/network policy as a cold request; the refresh itself never deletes or rewrites the local Maven repository, and other projects' caches are untouched. Returns status refreshed only after the rebuild succeeded. A project_path that fails validation is an error that changes nothing; a failure after the invalidation is an error and the project stays invalidated, so the next request retries."
+        description = "Explicitly refresh one trusted project: drop its cached model and index, abandon any running build, re-read the POMs, wrapper and Maven configuration, and rebuild the index. Starts Maven for the classpath goal through the shared execution permit and the same offline/network policy as the first index-dependent request; the refresh itself never deletes or rewrites the local Maven repository, and other projects' caches are untouched. Returns status refreshed only after the rebuild succeeded. A project_path that fails validation is an error that changes nothing; a failure after the invalidation is an error and the project stays invalidated, so the next request retries."
     )]
     async fn refresh_maven_project(
         &self,
@@ -1947,7 +2001,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Run any Maven goals and arguments in a host-trusted project without shell interpretation or injected flags. Maven options control network, settings, profiles, repository and alternate POM paths; execution is not a sandbox. Returns bounded, redacted stdout/stderr and execution status."
+        description = "Run any Maven goals and arguments in a project inside a trusted directory tree without shell interpretation or injected flags. Maven options control network, settings, profiles, repository and alternate POM paths; execution is not a sandbox. Returns bounded, redacted stdout/stderr and execution status."
     )]
     async fn run_maven(
         &self,
@@ -1964,7 +2018,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "Run an allowlisted Maven compile, test-compile, or verify phase in the configured project with optional validated reactor selection; use run_maven for arbitrary goals and arguments"
+        description = "Run an allowlisted Maven compile, test-compile, or verify phase in the requested trusted project with optional validated reactor selection; use run_maven for arbitrary goals and arguments"
     )]
     async fn run_maven_lifecycle(
         &self,
@@ -1984,7 +2038,7 @@ impl MavenMcpServer {
     }
 
     #[tool(
-        description = "List Java and Kotlin test classes under the validated Maven reactor root"
+        description = "List Java and Kotlin test classes under the canonical project root and its reactor modules"
     )]
     async fn list_maven_test_classes(
         &self,
@@ -2018,7 +2072,9 @@ impl MavenMcpServer {
         ))
     }
 
-    #[tool(description = "Return failures from the last focused Maven test run in this process")]
+    #[tool(
+        description = "Return failures from the last focused Maven test run of the canonical project root in this server process"
+    )]
     async fn get_last_maven_test_failures(
         &self,
         Parameters(request): Parameters<ProjectPathRequest>,
@@ -2171,7 +2227,7 @@ impl MavenMcpServer {
     }
 }
 
-const SERVER_INSTRUCTIONS: &str = "Search and inspect classes, JAR resources, POM metadata, local artifact health, sources, and versioned APIs from a read-only local Maven repository.";
+const SERVER_INSTRUCTIONS: &str = "Native STDIO MCP server for request-scoped Maven projects. Every tool requires project_path, the absolute Maven project root containing pom.xml; the server resolves it to its canonical project root and accepts it only inside a trusted directory tree configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES. Index-dependent tools search classes, JAR resources, sources, and classfile metadata in a lazy project index built from the project's Maven classpath on its first index-dependent request; other tools read POM metadata, local artifact health, and versioned APIs from the local Maven repository or run Maven for the trusted project. incomplete or truncated set to true marks a partial result; read a deferred_result marker with read_tool_result_page.";
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MavenMcpServer {

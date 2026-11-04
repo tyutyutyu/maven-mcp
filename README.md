@@ -5,6 +5,35 @@ An MCP host such as Codex or GitHub Copilot starts the binary as a child process
 and communicates with it exclusively over STDIO. Startup does not scan
 `~/.m2/repository` and does not require a preselected project.
 
+## Documentation
+
+This README is the primary user documentation. Every public document of the
+project is written in English, which is the authoritative language; see
+[Documentation language](#documentation-language).
+
+- [Getting started](#getting-started): install a release and connect an MCP host.
+- [Architecture and security model](#architecture-and-security-model): how the
+  server runs, what it trusts, and what it does not protect against.
+- [Terminology](#terminology): the shared terms of this README, the MCP tool
+  descriptions, and the guides.
+- [Features](#features), [Index lifecycle](#index-lifecycle) and
+  [Oversized results and paging](#oversized-results-and-paging): the tools and
+  their results.
+- [Opt-in Project Execution](#opt-in-project-execution) and
+  [Redaction and data minimization](#redaction-and-data-minimization): the trust
+  boundary and data handling.
+- [Environment Variables](#environment-variables) and
+  [Troubleshooting](#troubleshooting): configuration and diagnosis.
+- [Releases](#releases): versioning, compatibility, support, upgrades, and the
+  release process.
+- [Local Development](#local-development): test commands and verification levels.
+- Project governance: [CONTRIBUTING.md](CONTRIBUTING.md),
+  [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [SUPPORT.md](SUPPORT.md),
+  [SECURITY.md](SECURITY.md), and [CHANGELOG.md](CHANGELOG.md).
+- Contributor reference: [AGENTS.md](AGENTS.md) (architecture contracts and
+  development rules for human contributors and coding agents) and
+  [docs/dependency-maintenance.md](docs/dependency-maintenance.md).
+
 ## Getting started
 
 These steps take you from a published release archive to an MCP host that starts
@@ -57,15 +86,15 @@ continue at step 3 with `<root>/stable/maven-mcp` as the binary path.
    keeps its own directory, so [upgrades and rollbacks](#upgrade-and-rollback) only
    move the `current` symlink.
 
-3. **Choose the trusted tree and prepare the project.** Pick an existing absolute
-   directory that contains the Maven projects the agent may use, for example
-   `/home/<user>/work/trusted-projects`. It becomes
+3. **Choose the trusted directory tree and prepare the project.** Pick an existing
+   absolute directory that contains the Maven projects the agent may use, for
+   example `/home/<user>/work/trusted-projects`. It becomes
    `MAVEN_TRUSTED_PROJECT_DIRECTORIES` in the host configuration. Without it, every
    project tool is refused (see [Opt-in Project Execution](#opt-in-project-execution)).
    Every tool call names its project by `project_path`: the absolute directory of
-   the root `pom.xml`, inside that tree. The structured Maven tools run Maven
-   offline by default, so fill the local Maven repository once while you are
-   online, from the project directory:
+   the root `pom.xml`, inside that trusted directory tree. The structured Maven
+   tools run Maven offline by default, so fill the local Maven repository once
+   while you are online, from the project directory:
 
    ```bash
    cd /home/<user>/work/trusted-projects/my-service
@@ -82,8 +111,9 @@ continue at step 3 with `<root>/stable/maven-mcp` as the binary path.
    [Codex](#codex-project-configuration) or
    [GitHub Copilot CLI](#github-copilot-cli-configuration) to the repository you
    open the agent in. Set `command` to the absolute binary path from step 2 and
-   `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to the tree from step 3. The examples pass
-   `--jenv`; keep it only if you select Java versions with jenv (see
+   `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to the trusted directory tree from step 3.
+   The examples pass `--jenv`; keep it only if you select Java versions with jenv
+   (see
    [Request-scoped jenv Java selection](#request-scoped-jenv-java-selection)).
    Without it, Maven uses the Java environment that the host passes to the
    server; the host sections say which variables that includes.
@@ -103,6 +133,74 @@ continue at step 3 with `<root>/stable/maven-mcp` as the binary path.
    on the size of the classpath. Later calls reuse the index, and a new host
    session reuses the [persistent index cache](#persistent-index-cache). If a step
    fails, see [Troubleshooting](#troubleshooting).
+
+## Architecture and security model
+
+- **Native STDIO.** The MCP host starts `maven-mcp` as a child process, speaks
+  MCP JSON-RPC with it over stdin and stdout, and stops it when the session
+  ends. stdout carries only protocol messages; diagnostics go to stderr. There
+  is no port, daemon, container image, or manual server lifecycle. EOF, SIGINT,
+  and SIGTERM stop the server together with every running Maven process group.
+- **Request-scoped projects.** Startup reads only the environment: it scans no
+  Maven repository and selects no project. Every tool call names its project
+  through `project_path`, which the server resolves to the canonical project
+  root. Several projects can be used in one process; caches, Maven runners, the
+  last focused-test results, and stored oversized results are keyed by the
+  canonical project root, so one project's data never answers another
+  project's request.
+- **Trust boundary.** Only the host grants trust, through
+  `MAVEN_TRUSTED_PROJECT_DIRECTORIES`. A canonical project root must be inside
+  one of these trusted directory trees; both sides are canonicalized first, so
+  a symlink cannot escape a tree. Neither the requested path nor the client's
+  working directory grants trust. Without the variable, every project tool is
+  refused (see [Opt-in Project Execution](#opt-in-project-execution)).
+- **Lazy project index.** The first index-dependent request of a project builds
+  its index from that project's Maven classpath only; artifacts elsewhere in the
+  local Maven repository are never searched. Later requests reuse the index
+  while its stamps are unchanged (see [Index lifecycle](#index-lifecycle)). The
+  [persistent index cache](#persistent-index-cache) is derived, deletable data,
+  and the server never writes the local Maven repository itself.
+- **Maven execution.** At most one Maven process runs at a time across the
+  server. The structured tools run Maven offline by default, and every run has a
+  timeout, output limits, redaction, and process-group cleanup. Maven execution
+  is not a sandbox: plugins and tests run with the local user's permissions,
+  and `run_maven` options can reach files and networks outside the trusted
+  project (see [Arbitrary Maven goals and arguments](#arbitrary-maven-goals-and-arguments)).
+- **Bounded, honest results.** Size and count limits bound every response. A
+  partial result says so through its `incomplete` or `truncated` field instead
+  of looking complete, and a result too large for one MCP response is paged
+  (see [Oversized results and paging](#oversized-results-and-paging)).
+- **Data minimization.** Maven output and diagnostics are redacted, and logs
+  never quote requests, source code, paths, or error messages (see
+  [Redaction and data minimization](#redaction-and-data-minimization) and
+  [Debug logging](#debug-logging)).
+
+Report suspected vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md); it also lists what is in and out of scope.
+
+## Terminology
+
+The README, the MCP tool descriptions, and the guides use these terms with one
+meaning each:
+
+| Term | Meaning |
+| --- | --- |
+| native STDIO | The only transport: the MCP host starts the native `maven-mcp` binary as a child process and exchanges MCP JSON-RPC over its stdin and stdout. |
+| `project_path` | The request argument that names a project: the absolute directory of the root `pom.xml` (the reactor root of a multi-module build). |
+| canonical project root | `project_path` after symlinks and relative components are resolved. Caches, runners, test results, and stored results are keyed by it. |
+| trusted directory tree | One directory configured in `MAVEN_TRUSTED_PROJECT_DIRECTORIES` together with everything below it. A canonical project root must be equal to or below one of them. |
+| lazy project index | The per-project index of classpath JARs, sources, and classfile facts. It is built by the first index-dependent request (the first query) of a canonical project root, never at startup; a request that has to build it is a cold request. |
+| partial result | A successful result that limits stopped from being complete, marked by `incomplete: true` or `truncated: true`. An empty partial result does not prove that something is absent. |
+| deferred result | A complete result too large for one MCP response, replaced by a `deferred_result` marker and read with `read_tool_result_page`. It is not a partial result. |
+
+### Documentation language
+
+English is the primary and only maintained language of the public
+documentation: this README, the governance and contributor guides, the
+changelog, the issue and pull request templates, and the MCP tool descriptions.
+Translations are not maintained in this repository. The rules for keeping the
+language and terminology consistent are in
+[AGENTS.md](AGENTS.md#documentation-language-and-terminology).
 
 ## Features
 
@@ -294,9 +392,9 @@ resolved and must stay inside the canonical repository, so an artifact, POM, or
 parent-directory symlink pointing outside it (even a dangling one) is rejected
 without reading or returning external content; absent artifacts still report
 `found: false`. Other repository-search tools ask Maven for
-the effective test classpath, build a lazy index only from those local JARs and
+the effective test classpath, build the lazy project index only from those local JARs and
 their sibling `-sources.jar` files, and cache that index by canonical
-`project_path`. For a multi-module reactor, classpath sections from every module
+project root. For a multi-module reactor, classpath sections from every module
 are aggregated; empty parent or aggregator POM sections do not hide dependencies
 reported by later modules. Reactor outputs on that classpath are indexed with the
 repository artifacts: packaged JARs (conventionally named or with a custom
@@ -1278,8 +1376,8 @@ the command in either host. See the
 
 ## Opt-in Project Execution
 
-Project execution requires both a host-configured trusted directory and a request
-`project_path` below that directory. Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to a
+Project execution requires both a host-configured trusted directory tree and a
+request `project_path` whose canonical project root is inside that tree. Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` to a
 platform path-list of existing absolute directories; the server canonicalizes the
 directories at startup. A configured directory can contain Maven projects at any
 depth, and may itself be a Maven project root. Without this variable, all
@@ -1645,11 +1743,11 @@ and reported as `Maven failed with outcome Timeout`. Later calls and new session
 are fast, because they reuse the in-memory index and the
 [persistent index cache](#persistent-index-cache).
 
-**Trusted tree and project root.** Every message names the rule that failed:
+**Trusted directory tree and project root.** Every message names the rule that failed:
 
 | Message | Fix |
 | --- | --- |
-| `project_path is not inside a directory configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES` | Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` in the host configuration (it is not read from your shell or from the host's working directory) to a directory that contains the project. Symlinks are resolved before the check: the real project directory must be inside the trusted tree, so a link inside the tree that points to a project outside it is rejected. |
+| `project_path is not inside a directory configured by MAVEN_TRUSTED_PROJECT_DIRECTORIES` | Set `MAVEN_TRUSTED_PROJECT_DIRECTORIES` in the host configuration (it is not read from your shell or from the host's working directory) to a directory that contains the project. Symlinks are resolved before the check: the real project directory must be inside the trusted directory tree, so a link inside the tree that points to a project outside it is rejected. |
 | `project_path must be an absolute path` | Pass the full path, for example `/home/<user>/work/trusted-projects/my-service`. |
 | `project_path must contain a pom.xml` | Pass the directory of the root `pom.xml`; in a multi-module build, that is the reactor root. |
 | `MAVEN_EXECUTABLE must be an absolute executable path when no Maven Wrapper is available` | Add the Maven Wrapper to the project (executable `mvnw` and `.mvn/wrapper/maven-wrapper.properties`), or set `MAVEN_EXECUTABLE` to the absolute path of `mvn`. |
@@ -2090,7 +2188,7 @@ Inspector and agent-eval tasks require the Node.js and npm versions pinned in
 ## Local Development
 
 ```bash
-cargo test
+cargo test --locked
 cargo run --locked
 ```
 
@@ -2100,7 +2198,7 @@ JARs. Integration tests start the real binary as a child-process STDIO MCP
 server and use a real MCP client. They can also be run separately:
 
 ```bash
-cargo test --test mcp_interface
+cargo test --test mcp_interface --locked
 ```
 
 The integration contract verifies that all project-dependent tools require
@@ -2111,7 +2209,7 @@ error class, and each project tool) is its own test, so a failure names the
 broken contract. Lifecycle tests ensure EOF and SIGTERM stop the process, even
 while index work is blocked, and stdout contains JSON-RPC only.
 
-There are three separate verification levels:
+There are four separate verification levels:
 
 | Level | Command | When | Network, credentials |
 | --- | --- | --- | --- |
@@ -2309,7 +2407,7 @@ scripts/run-agent-eval.sh
 
 The script runs the Promptfoo version locked in `tools/package-lock.json`, regenerates a marker-protected,
 request-scoped project fixture under `target/promptfoo/fixture` from Rust,
-configures its trusted project directory and local execution repository, and
+configures its trusted directory tree and local execution repository, and
 passes the generated absolute `project_path` to every MCP request. Promptfoo
 starts the local server over STDIO, runs the evaluation with caching disabled,
 and exits non-zero on a failed test.
