@@ -15,13 +15,13 @@
 //! failed write only loses the cached copy. The Maven repository is only read.
 
 use std::{
-    collections::BTreeMap,
+    collections::BTreeSet,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -31,17 +31,20 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     build_info,
-    config::{Config, JavaEnvironment, SERVER_ONLY_ENVIRONMENT},
+    config::{Config, JavaEnvironment},
     index::{PersistableRecord, PersistedRecords},
     project_cache::ProjectFingerprint,
     runtime_stats::unix_ms,
 };
 
+mod maven_environment;
 mod model_inputs;
+
+use maven_environment::{ReferenceFiles, environment_digest, referenced_digest};
 
 /// Version of the database layout and of every payload; bump it whenever a stored shape or
 /// the derivation of a stored record changes. Each format uses its own database file.
-pub const INDEX_CACHE_FORMAT: u32 = 3;
+pub const INDEX_CACHE_FORMAT: u32 = 4;
 /// Lock wait of one cache operation before it is treated as a miss or a skipped write.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound of one decoded payload, so a damaged length cannot exhaust memory.
@@ -151,11 +154,12 @@ impl PersistentIndexCache {
         }
     }
 
-    /// Forgets the classpath of a project context; its records stay valid by their stamps.
-    pub fn forget_classpath(&self, context: &str) -> Result<()> {
+    /// Forgets every classpath of the project at `root`, whatever environment or
+    /// configuration it was resolved with; its records stay valid by their stamps.
+    pub fn forget_project_classpaths(&self, root: &Path) -> Result<()> {
         self.open()?.execute(
-            "DELETE FROM entries WHERE kind = ?1 AND key = ?2",
-            params![CLASSPATH_KIND, context],
+            "DELETE FROM entries WHERE kind = ?1 AND substr(key, 1, length(?2)) = ?2",
+            params![CLASSPATH_KIND, project_scope(root)],
         )?;
         Ok(())
     }
@@ -477,7 +481,7 @@ fn create_private_directory(directory: &Path) -> Result<()> {
 pub struct ClasspathManifest {
     context: String,
     project: ProjectFingerprint,
-    inputs: ProjectFingerprint,
+    inputs: ResolutionInputs,
     classpath: Vec<PathBuf>,
 }
 
@@ -486,7 +490,7 @@ impl ClasspathManifest {
     pub fn settled(
         context: &str,
         project: &ProjectFingerprint,
-        inputs: ProjectFingerprint,
+        inputs: ResolutionInputs,
         classpath: Vec<PathBuf>,
     ) -> Option<Self> {
         (project.is_settled() && inputs.is_settled()).then(|| Self {
@@ -497,19 +501,70 @@ impl ClasspathManifest {
         })
     }
 
-    /// The classpath and the input stamps it was resolved from, when the manifest belongs to
-    /// `context`, the project fingerprint is unchanged, no classpath input changed, and every
-    /// classpath entry still exists.
+    /// The classpath and the inputs it was resolved from, when the manifest belongs to
+    /// `context`, the project fingerprint is unchanged, no classpath input (including a
+    /// variable a model POM outside the reactor references) changed, and every classpath
+    /// entry still exists.
     pub fn reusable_classpath(
         self,
         context: &str,
         project: &ProjectFingerprint,
-    ) -> Option<(Vec<PathBuf>, ProjectFingerprint)> {
+    ) -> Option<(Vec<PathBuf>, ResolutionInputs)> {
         (self.context == context
             && self.project == *project
             && self.inputs.is_current()
             && self.classpath.iter().all(|path| path.exists()))
         .then_some((self.classpath, self.inputs))
+    }
+}
+
+/// Every input of one classpath resolution that the classpath context does not cover: the
+/// stamps of the files outside the reactor, and the variables the POMs Maven's model
+/// building read reference. A parent, imported BOM or dependency POM outside the reactor
+/// is known only after the resolution, so its `${env.NAME}` references cannot be part of
+/// the context key; they are stored here by name, and their values only as a digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionInputs {
+    stamps: ProjectFingerprint,
+    model_references: BTreeSet<String>,
+    model_environment: u64,
+}
+
+impl ResolutionInputs {
+    fn new(
+        stamps: ProjectFingerprint,
+        model_references: BTreeSet<String>,
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Self {
+        let model_environment = referenced_digest(variables, &model_references);
+        Self {
+            stamps,
+            model_references,
+            model_environment,
+        }
+    }
+
+    /// Whether every stamp and every referenced variable of this process is unchanged.
+    pub fn is_current(&self) -> bool {
+        self.stamps.is_current() && self.matches_environment(std::env::vars_os())
+    }
+
+    /// Whether the referenced variables among `variables` have the recorded names and values.
+    fn matches_environment(
+        &self,
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> bool {
+        referenced_digest(variables, &self.model_references) == self.model_environment
+    }
+
+    /// See [`ProjectFingerprint::is_settled`].
+    fn is_settled(&self) -> bool {
+        self.stamps.is_settled()
+    }
+
+    /// See [`ProjectFingerprint::was_settled_at`].
+    pub fn was_settled_at(&self, moment: SystemTime) -> bool {
+        self.stamps.was_settled_at(moment)
     }
 }
 
@@ -522,22 +577,50 @@ struct ClasspathContext<'a> {
     execution_repository: Option<&'a Path>,
     network_enabled: bool,
     java: String,
-    /// FNV-1a digest of the whole environment the Maven child inherits, so its values
-    /// (possibly credentials) are never written to the cache.
+    /// FNV-1a digest of the inherited variables that can change Maven's resolution (see
+    /// `maven_environment`), so their values (possibly credentials) are never written to the
+    /// cache.
     environment: String,
 }
 
+/// What one classpath context is derived from besides the configuration.
+pub struct ContextSources<'a> {
+    pub root: &'a Path,
+    pub config: &'a Config,
+    /// Every reactor POM; their `${env.NAME}` references take part.
+    pub reactor_poms: &'a [PathBuf],
+    /// Directories of the Maven installation (global `conf`, `lib/ext`).
+    pub installation: &'a [PathBuf],
+}
+
 /// Exact identity of a classpath resolution: project, scope, the configuration that selects
-/// Maven, the repository and Java, and every inherited variable. POMs, settings, `.mvnrc`
-/// files and Java tool options may read any variable (`${env.X}`, `JAVA_TOOL_OPTIONS`), so
-/// only the variables this server removes from the Maven child are left out.
-pub fn classpath_context(root: &Path, config: &Config) -> String {
+/// Maven, the repository and Java, and every inherited variable Maven can read. Host-session
+/// variables (`CLAUDE_CODE_SESSION_ID`, `PWD`, `SSH_AUTH_SOCK`, ...) are left out, so a host
+/// restart reuses the classpath; see `maven_environment` for the selection.
+pub fn classpath_context(sources: &ContextSources<'_>) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let referenced = ReferenceFiles::of_project(
+        sources.root,
+        sources.reactor_poms,
+        sources.installation,
+        home.as_deref(),
+    )
+    .referenced_names();
+    context_key(
+        sources.root,
+        sources.config,
+        environment_digest(std::env::vars_os(), referenced.as_ref()),
+    )
+}
+
+/// The key of a classpath context: the project scope of `root`, then the identity JSON.
+fn context_key(root: &Path, config: &Config, environment: u64) -> String {
     let execution = &config.execution;
     let java = match &execution.java_environment {
         JavaEnvironment::Inherit => "inherit".to_owned(),
         JavaEnvironment::Jenv { root } => format!("jenv:{}", root.display()),
     };
-    serde_json::to_string(&ClasspathContext {
+    let identity = serde_json::to_string(&ClasspathContext {
         format: INDEX_CACHE_FORMAT,
         project_root: root,
         classpath_scope: "test",
@@ -545,28 +628,16 @@ pub fn classpath_context(root: &Path, config: &Config) -> String {
         execution_repository: execution.execution_repository.as_deref(),
         network_enabled: execution.network_enabled,
         java,
-        environment: format!("{:016x}", environment_digest(std::env::vars_os())),
+        environment: format!("{environment:016x}"),
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+    format!("{}{identity}", project_scope(root))
 }
 
-/// Order-independent digest of `variables` without [`SERVER_ONLY_ENVIRONMENT`].
-fn environment_digest(variables: impl IntoIterator<Item = (OsString, OsString)>) -> u64 {
-    variables
-        .into_iter()
-        .filter(|(name, _)| {
-            !SERVER_ONLY_ENVIRONMENT
-                .iter()
-                .any(|server_only| name.as_os_str() == *server_only)
-        })
-        .collect::<BTreeMap<_, _>>()
-        .iter()
-        .fold(FNV_OFFSET, |hash, (name, value)| {
-            fnv1a(
-                fnv1a(hash, name.as_encoded_bytes()),
-                value.as_encoded_bytes(),
-            )
-        })
+/// The key prefix every classpath context of `root` starts with. The JSON string cannot
+/// contain a raw line break, so no other root's scope is a prefix of it.
+fn project_scope(root: &Path) -> String {
+    format!("{}\n", serde_json::to_string(root).unwrap_or_default())
 }
 
 /// Files outside the reactor that can change which artifacts Maven selects: user settings,
@@ -621,17 +692,18 @@ pub struct ResolutionSources<'a> {
     pub installation: &'a [PathBuf],
 }
 
-/// Stamps of every input of one classpath resolution: [`classpath_inputs`], the Maven
-/// installation's configuration, and the parent and imported BOM POMs of the reactor and of
-/// every repository artifact, transitively. `None` when a parent or import cannot be
-/// identified, so the classpath must not be persisted.
-pub fn resolution_inputs(sources: &ResolutionSources<'_>) -> Option<ProjectFingerprint> {
+/// Every input of one classpath resolution: the stamps of [`classpath_inputs`], of the Maven
+/// installation's configuration, and of the parent and imported BOM POMs of the reactor and
+/// of every repository artifact, transitively, plus the variables those POMs reference with
+/// their current values. `None` when a parent or import cannot be identified, so the
+/// classpath must not be persisted.
+pub fn resolution_inputs(sources: &ResolutionSources<'_>) -> Option<ResolutionInputs> {
     let model = model_inputs::model_inputs(
         sources.reactor_poms,
         &repository_poms(sources.classpath, sources.repository_root),
         sources.repository_root,
     )?;
-    Some(ProjectFingerprint::capture_trees(
+    let stamps = ProjectFingerprint::capture_trees(
         classpath_inputs(
             sources.root,
             sources.config,
@@ -640,7 +712,12 @@ pub fn resolution_inputs(sources: &ResolutionSources<'_>) -> Option<ProjectFinge
         )
         .into_iter()
         .chain(sources.installation.iter().cloned())
-        .chain(model),
+        .chain(model.paths),
+    );
+    Some(ResolutionInputs::new(
+        stamps,
+        model.env_references,
+        std::env::vars_os(),
     ))
 }
 

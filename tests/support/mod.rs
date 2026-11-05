@@ -219,7 +219,7 @@ impl TestServer {
 
     /// The SQLite database of this server's on-disk index cache.
     pub fn index_cache_database(&self) -> PathBuf {
-        self.index_cache.path().join("index-v3.sqlite3")
+        self.index_cache.path().join("index-v4.sqlite3")
     }
 
     /// Replaces the source entries of the project-scoped `org.libs:helper:2.0` artifact.

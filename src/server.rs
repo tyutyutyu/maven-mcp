@@ -28,8 +28,8 @@ use crate::index::{
     UnindexedClasspathEntry, UnindexedReason, validate_exact_coordinate,
 };
 use crate::index_cache::{
-    CacheUpdate, ClasspathManifest, PersistentIndexCache, ResolutionSources, classpath_context,
-    decode_payload, encode_payload, resolution_inputs,
+    CacheUpdate, ClasspathManifest, ContextSources, PersistentIndexCache, ResolutionInputs,
+    ResolutionSources, classpath_context, decode_payload, encode_payload, resolution_inputs,
 };
 use crate::log_safety::{elapsed_ms, error_category};
 use crate::project::{
@@ -533,7 +533,9 @@ struct ResolvedClasspath {
     /// Stamps of every resolution input, captured as Maven returned the classpath; `None`
     /// when an input is unidentifiable or changed after Maven started, so the classpath must
     /// not be persisted.
-    inputs: Option<ProjectFingerprint>,
+    inputs: Option<ResolutionInputs>,
+    /// The persisted classpath context of the resolution; empty without an on-disk cache.
+    context: String,
 }
 
 /// The serialization budget of one tool result: a result that fits one response is never
@@ -902,29 +904,37 @@ impl MavenMcpServer {
     }
 
     /// The classpath of the project's current context: a valid on-disk manifest when one
-    /// exists, otherwise Maven's `dependency:build-classpath` output. `ownership` moves
-    /// through the blocking manifest lookup like through every other blocking job.
+    /// exists, otherwise Maven's `dependency:build-classpath` output. The context reads the
+    /// project's configuration files, so it is derived in the blocking manifest lookup;
+    /// `ownership` moves through it like through every other blocking job.
     async fn resolve_classpath(
         &self,
         root: &Path,
         snapshot: &RunnerSnapshot,
-        context: &str,
         ownership: OwnedMutexGuard<()>,
     ) -> Result<(ResolvedClasspath, OwnedMutexGuard<()>), ErrorData> {
-        let (persisted, ownership) = match self.index_cache.clone() {
+        let (persisted, context, ownership) = match self.index_cache.clone() {
             Some(cache) => {
-                let context = context.to_owned();
+                let root = root.to_owned();
+                let config = self.config.clone();
+                let runner = Arc::clone(&snapshot.runner);
                 let fingerprint = Arc::clone(&snapshot.fingerprint);
                 self.blocking(move || {
+                    let context = classpath_context(&ContextSources {
+                        root: &root,
+                        config: &config,
+                        reactor_poms: &reactor_poms(&runner),
+                        installation: &runner.installation_configuration(),
+                    });
                     let classpath = cache
                         .load_classpath(&context)
                         .and_then(|payload| decode_payload::<ClasspathManifest>(&payload).ok())
                         .and_then(|manifest| manifest.reusable_classpath(&context, &fingerprint));
-                    (classpath, ownership)
+                    (classpath, context, ownership)
                 })
                 .await?
             }
-            None => (None, ownership),
+            None => (None, String::new(), ownership),
         };
         if let Some((paths, inputs)) = persisted {
             return Ok((
@@ -932,6 +942,7 @@ impl MavenMcpServer {
                     paths,
                     persisted: true,
                     inputs: Some(inputs),
+                    context,
                 },
                 ownership,
             ));
@@ -968,6 +979,7 @@ impl MavenMcpServer {
                 paths: classpath.paths,
                 persisted: false,
                 inputs,
+                context,
             },
             ownership,
         ))
@@ -983,7 +995,7 @@ impl MavenMcpServer {
         classpath: &[PathBuf],
         started: SystemTime,
         ownership: OwnedMutexGuard<()>,
-    ) -> Result<(Option<ProjectFingerprint>, OwnedMutexGuard<()>), ErrorData> {
+    ) -> Result<(Option<ResolutionInputs>, OwnedMutexGuard<()>), ErrorData> {
         let root = root.to_owned();
         let config = self.config.clone();
         let runner = Arc::clone(&snapshot.runner);
@@ -991,11 +1003,7 @@ impl MavenMcpServer {
         let classpath = classpath.to_vec();
         self.blocking(move || {
             let repository_root = repository_root_for(&classpath, &root, &config);
-            let reactor_poms = runner
-                .fingerprint_paths()
-                .into_iter()
-                .filter(|path| path.file_name().is_some_and(|name| name == "pom.xml"))
-                .collect::<Vec<_>>();
+            let reactor_poms = reactor_poms(&runner);
             let installation = runner.installation_configuration();
             let inputs = resolution_inputs(&ResolutionSources {
                 root: &root,
@@ -1021,11 +1029,7 @@ impl MavenMcpServer {
         ownership: OwnedMutexGuard<()>,
     ) -> BuildOutcome {
         let started = Instant::now();
-        let context = classpath_context(root, &self.config);
-        let (classpath, ownership) = match self
-            .resolve_classpath(root, snapshot, &context, ownership)
-            .await
-        {
+        let (classpath, ownership) = match self.resolve_classpath(root, snapshot, ownership).await {
             Ok(resolved) => resolved,
             Err(error) => return BuildOutcome::Failed(error),
         };
@@ -1194,7 +1198,7 @@ impl MavenMcpServer {
                 self.persist_build(PersistedBuild {
                     root,
                     generation,
-                    context,
+                    context: classpath.context,
                     fingerprint: Arc::clone(&snapshot.fingerprint),
                     classpath: classpath.paths,
                     inputs: classpath.inputs,
@@ -1215,12 +1219,11 @@ impl MavenMcpServer {
         let Some(cache) = self.index_cache.clone() else {
             return;
         };
-        let context = build.context.clone();
         let written = self
             .blocking(move || {
                 let manifest = build
                     .inputs
-                    .filter(ProjectFingerprint::is_current)
+                    .filter(ResolutionInputs::is_current)
                     .and_then(|inputs| {
                         ClasspathManifest::settled(
                             &build.context,
@@ -1256,18 +1259,20 @@ impl MavenMcpServer {
             .lock_projects()
             .is_ok_and(|projects| projects.is_current(build.root, build.generation));
         if !current {
-            self.forget_persisted_classpath(context).await;
+            self.forget_persisted_classpaths(build.root).await;
         }
     }
 
-    /// Makes the next build of this project context resolve its classpath through Maven,
-    /// in this process and in every other process sharing the on-disk cache.
-    async fn forget_persisted_classpath(&self, context: String) {
+    /// Makes the next build of the project at `root` resolve its classpath through Maven, in
+    /// this process and in every other process sharing the on-disk cache, whatever
+    /// environment the stored classpaths were resolved with.
+    async fn forget_persisted_classpaths(&self, root: &Path) {
         let Some(cache) = self.index_cache.clone() else {
             return;
         };
+        let root = root.to_owned();
         match self
-            .blocking(move || cache.forget_classpath(&context))
+            .blocking(move || cache.forget_project_classpaths(&root))
             .await
         {
             Ok(Ok(())) => {}
@@ -1291,8 +1296,7 @@ impl MavenMcpServer {
         self.lock_projects()?.invalidate_after_maven(&root);
         tracing::debug!(reason = %"maven_ran", "project cache invalidated");
         self.publish_runtime_status();
-        self.forget_persisted_classpath(classpath_context(&root, &self.config))
-            .await;
+        self.forget_persisted_classpaths(&root).await;
         Ok(())
     }
 
@@ -1309,8 +1313,7 @@ impl MavenMcpServer {
         }
         tracing::debug!(reason = %"refresh", "project cache invalidated");
         self.publish_runtime_status();
-        self.forget_persisted_classpath(classpath_context(&root, &self.config))
-            .await;
+        self.forget_persisted_classpaths(&root).await;
         let index = self.index_for(project_path).await.map_err(|error| {
             ErrorData::new(
                 error.code,
@@ -1509,7 +1512,7 @@ struct PersistedBuild<'a> {
     context: String,
     fingerprint: Arc<ProjectFingerprint>,
     classpath: Vec<PathBuf>,
-    inputs: Option<ProjectFingerprint>,
+    inputs: Option<ResolutionInputs>,
     records: RecordReuse,
 }
 
@@ -1555,6 +1558,15 @@ fn maven_failure_detail(build: &MavenBuildResult) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+/// Every reactor POM among the runner's fingerprinted files.
+fn reactor_poms(runner: &MavenRunner) -> Vec<PathBuf> {
+    runner
+        .fingerprint_paths()
+        .into_iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "pom.xml"))
+        .collect()
 }
 
 fn repository_root_for(paths: &[PathBuf], project_root: &Path, config: &Config) -> Option<PathBuf> {
