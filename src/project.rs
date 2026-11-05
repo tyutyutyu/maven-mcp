@@ -1110,8 +1110,8 @@ impl MavenRunner {
         };
         arguments.push(OsString::from("dependency:build-classpath"));
         arguments.push(OsString::from(match kind {
-            ClasspathKind::Build => "-Dmdep.includeScope=compile",
-            ClasspathKind::Test => "-Dmdep.includeScope=test",
+            ClasspathKind::Build => "-DincludeScope=compile",
+            ClasspathKind::Test => "-DincludeScope=test",
         }));
         let executed = self
             .execute_with_raw_stdout(MavenOperation::Classpath, arguments)

@@ -1077,6 +1077,30 @@ printf '%s\n' '[INFO] org.example:core:jar:1.0' '[INFO] +- org.keep:first:jar:2.
 }
 
 #[tokio::test]
+async fn classpath_kinds_pass_the_dependency_plugin_include_scope_user_property() {
+    let (_root, config) = wrapper_project("#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    let runner = MavenRunner::discover(&config).unwrap();
+    for (kind, expected) in [
+        (ClasspathKind::Build, "-DincludeScope=compile"),
+        (ClasspathKind::Test, "-DincludeScope=test"),
+    ] {
+        let classpath = runner.build_classpath(None, kind).await;
+        let arguments = classpath.build.run.stdout.lines().collect::<Vec<_>>();
+        let goal = arguments
+            .iter()
+            .position(|argument| *argument == "dependency:build-classpath")
+            .unwrap_or_else(|| panic!("missing goal in {arguments:?}"));
+        assert_eq!(arguments.get(goal + 1), Some(&expected), "{arguments:?}");
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("includeScope") && *argument != expected),
+            "{arguments:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn dependency_explanation_reports_empty_failure_truncation_and_invalid_output() {
     let (_root, empty_config) = wrapper_project("#!/bin/sh\nexit 0\n");
     let empty = MavenRunner::discover(&empty_config)

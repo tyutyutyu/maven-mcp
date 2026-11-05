@@ -6,7 +6,7 @@
       "id": "find-slf4j-logger-class",
       "description": "Find the project-classpath JARs containing org.slf4j.Logger",
       "shell": {
-        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in *.jar) ;; *) continue ;; esac; entries=$(unzip -Z1 \"$jar\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qi 'org/slf4j/logger.*\\.class$'; then printf '%s\\n' \"$jar\"; fi; done",
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -DincludeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in *.jar) ;; *) continue ;; esac; entries=$(unzip -Z1 \"$jar\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qi 'org/slf4j/logger.*\\.class$'; then printf '%s\\n' \"$jar\"; fi; done",
         "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
@@ -25,7 +25,7 @@
       "id": "list-slf4j-api-versions",
       "description": "List the slf4j-api versions on the project classpath",
       "shell": {
-        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in */org/slf4j/slf4j-api/*/slf4j-api-*.jar) basename \"$(dirname \"$jar\")\" ;; esac; done",
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -DincludeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do case \"$jar\" in */org/slf4j/slf4j-api/*/slf4j-api-*.jar) basename \"$(dirname \"$jar\")\" ;; esac; done",
         "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
@@ -44,7 +44,7 @@
       "id": "read-slf4j-logger-source",
       "description": "Read org.slf4j.Logger from the sources JARs of the project classpath",
       "shell": {
-        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -Dmdep.includeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do src=\"${jar%.jar}-sources.jar\"; if [ -f \"$src\" ]; then entries=$(unzip -Z1 \"$src\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qx 'org/slf4j/Logger.java'; then unzip -p \"$src\" org/slf4j/Logger.java || exit 1; fi; fi; done",
+        "command": "cd \"$PROJECT_PATH\" || exit 1; MVN=mvn; [ -x ./mvnw ] && MVN=./mvnw; cp=$(\"$MVN\" --batch-mode --no-transfer-progress --offline ${MAVEN_EXECUTION_REPO_PATH:+-Dmaven.repo.local=\"$MAVEN_EXECUTION_REPO_PATH\"} dependency:build-classpath -DincludeScope=test) || exit 1; printf '%s\\n' \"$cp\" | awk '/Dependencies classpath:/ {getline; print}' | tr ':' '\\n' | grep -v '^$' | while IFS= read -r jar; do src=\"${jar%.jar}-sources.jar\"; if [ -f \"$src\" ]; then entries=$(unzip -Z1 \"$src\") || exit 1; if printf '%s\\n' \"$entries\" | grep -qx 'org/slf4j/Logger.java'; then unzip -p \"$src\" org/slf4j/Logger.java || exit 1; fi; fi; done",
         "cwd": "${PROJECT_PATH}"
       },
       "mcp": {
