@@ -76,6 +76,37 @@ impl JarRecord {
         &self.fact_strings[(id.0.get() - 1) as usize]
     }
 
+    /// The indexed binary name of `query`: the exact spelling when this JAR has it,
+    /// otherwise the first class in name order that differs only in letter case, matching
+    /// the lower-cased `class_locations` key.
+    fn canonical_class_name(&self, query: &str) -> Option<&str> {
+        if let Ok(position) = self
+            .classes
+            .binary_search_by(|name| name.as_str().cmp(query))
+        {
+            return Some(&self.classes[position]);
+        }
+        let query = query.to_lowercase();
+        self.classes
+            .iter()
+            .find(|name| name.to_lowercase() == query)
+            .map(String::as_str)
+    }
+
+    /// The recorded `SourceFile` attribute of the indexed class `class_name`.
+    fn source_file_of(&self, class_name: &str) -> Option<&str> {
+        self.class_facts
+            .iter()
+            .find(|facts| self.fact_string(facts.source_class) == class_name)
+            .and_then(|facts| facts.source_file)
+            .map(|id| self.fact_string(id))
+    }
+
+    /// The source entry names that may declare the indexed class `class_name`.
+    fn source_entry_names(&self, class_name: &str) -> SourceEntryNames {
+        SourceEntryNames::new(class_name, self.source_file_of(class_name))
+    }
+
     fn summary(&self) -> JarSummary {
         JarSummary {
             coordinate: self.coordinate(),
@@ -379,7 +410,7 @@ pub struct DeclarationSource {
     pub truncated: bool,
 }
 
-/// Why a classfile declaration has no source slice although its source file was read.
+/// Why a classfile declaration has no source slice although its artifact has a sources JAR.
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema, PartialEq, Eq, Ord, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub enum UnresolvedDeclarationReason {
@@ -390,6 +421,8 @@ pub enum UnresolvedDeclarationReason {
     /// Same-named declarations exist, but none provably matches the descriptor;
     /// `candidate_lines` lists them.
     Unproven,
+    /// The sources JAR has no entry that declares the class; `entry` is the expected one.
+    SourceEntryMissing,
 }
 
 /// A classfile declaration whose exact source fragment cannot be proven.
@@ -471,6 +504,9 @@ pub struct ProviderFact {
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct IndexedClassFacts {
     source_class: FactStringId,
+    /// The classfile `SourceFile` attribute when it names a Java or Kotlin file
+    /// (see [`source_file_name`]).
+    source_file: Option<FactStringId>,
     parents: Vec<IndexedTypeParent>,
     references: Vec<IndexedReference>,
 }
@@ -1007,12 +1043,16 @@ impl MavenIndex {
             let Some(source_index) = self.source_jars.get(&binary.key) else {
                 continue;
             };
+            let Some(class_name) = binary.canonical_class_name(&normalized) else {
+                continue;
+            };
             let source_jar = &self.jars[*source_index];
+            let names = binary.source_entry_names(class_name);
             if let Some((entry, source, truncated)) =
-                read_source(&source_jar.path, &normalized, self.max_source_bytes)?
+                read_source(&source_jar.path, &names, self.max_source_bytes)?
             {
                 results.push(SourceResult {
-                    class_name: normalized.clone(),
+                    class_name: class_name.to_owned(),
                     source_jar: self.summary(source_jar),
                     entry,
                     source,
@@ -1576,8 +1616,8 @@ impl MavenIndex {
         jar_selector: Option<&str>,
         version: Option<&str>,
     ) -> Result<DeclarationSourceLookup> {
-        let class_name = normalize_class_query(class_name);
-        let Some(locations) = self.class_locations.get(&class_name.to_lowercase()) else {
+        let query = normalize_class_query(class_name);
+        let Some(locations) = self.class_locations.get(&query.to_lowercase()) else {
             return Ok(DeclarationSourceLookup {
                 results: Vec::new(),
                 ambiguous_candidates: Vec::new(),
@@ -1598,9 +1638,12 @@ impl MavenIndex {
             let Some(source_index) = self.source_jars.get(&binary.key) else {
                 continue;
             };
+            let Some(class_name) = binary.canonical_class_name(&query) else {
+                continue;
+            };
             let candidates = declaration_candidates(
                 binary,
-                &class_name,
+                class_name,
                 member_name.as_deref(),
                 self.max_source_bytes,
             )?;
@@ -1617,9 +1660,23 @@ impl MavenIndex {
                 continue;
             }
             let source_jar = &self.jars[*source_index];
+            let names = binary.source_entry_names(class_name);
             let Some((entry, source, truncated)) =
-                read_source(&source_jar.path, &class_name, self.max_source_bytes)?
+                read_source(&source_jar.path, &names, self.max_source_bytes)?
             else {
+                unresolved.extend(matching.into_iter().map(|declaration| {
+                    LocatedSource {
+                        class_name,
+                        source_jar: self.summary(source_jar),
+                        entry: names.primary(),
+                        truncated: false,
+                    }
+                    .unresolved(
+                        declaration.candidate,
+                        UnresolvedDeclarationReason::SourceEntryMissing,
+                        Vec::new(),
+                    )
+                }));
                 continue;
             };
             let outline = SourceOutline::parse(&source, SourceLanguage::of_entry(&entry));
@@ -1629,12 +1686,12 @@ impl MavenIndex {
             } in matching
             {
                 let located = LocatedSource {
-                    class_name: &class_name,
+                    class_name,
                     source_jar: self.summary(source_jar),
                     entry: &entry,
                     truncated,
                 };
-                match outline.locate(&class_name, &candidate, is_compiler_generated) {
+                match outline.locate(class_name, &candidate, is_compiler_generated) {
                     SliceOutcome::Found(slice) => results.push(located.found(candidate, slice)),
                     SliceOutcome::Unresolved {
                         reason,
@@ -2640,9 +2697,11 @@ fn collect_jar_facts(
         }
         references.sort_unstable();
         references.dedup();
-        if !parents.is_empty() || !references.is_empty() {
+        let source_file = source_file_name(&parsed.attributes).map(|name| strings.intern(name));
+        if source_file.is_some() || !parents.is_empty() || !references.is_empty() {
             class_facts.push(IndexedClassFacts {
                 source_class,
+                source_file,
                 parents,
                 references,
             });
@@ -3384,16 +3443,94 @@ fn matches_selector(jar: &JarRecord, selector: &str) -> bool {
             .is_some_and(|name| name.eq_ignore_ascii_case(selector))
 }
 
+/// Source entry names that may declare one indexed class, in resolution order.
+///
+/// The classfile `SourceFile` attribute in the package directory comes first, then the
+/// class-name convention `{outer}.java` and `{outer}.kt`. Each name also matches below any
+/// leading directory prefix (for example `commonMain/` or `commonMain/kotlin/`) when the
+/// class has a package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceEntryNames {
+    names: Vec<String>,
+    allow_source_set_prefix: bool,
+}
+
+impl SourceEntryNames {
+    fn new(class_name: &str, source_file: Option<&str>) -> Self {
+        let outer_class = class_name.split('$').next().unwrap_or(class_name);
+        let outer_path = outer_class.replace('.', "/");
+        let package_directory = outer_path
+            .rfind('/')
+            .map_or("", |position| &outer_path[..=position]);
+        let mut names = Vec::new();
+        if let Some(source_file) = source_file {
+            names.push(format!("{package_directory}{source_file}"));
+        }
+        for convention in [format!("{outer_path}.java"), format!("{outer_path}.kt")] {
+            if !names.contains(&convention) {
+                names.push(convention);
+            }
+        }
+        Self {
+            allow_source_set_prefix: !package_directory.is_empty(),
+            names,
+        }
+    }
+
+    /// The most specific expected entry, reported when none of the names exists.
+    fn primary(&self) -> &str {
+        // `new` always adds the two class-name convention names.
+        self.names.first().map_or("", String::as_str)
+    }
+
+    /// Resolution rank of a source JAR entry; lower is better and `None` is no match. The
+    /// exact form of a name ranks directly before its source-set prefixed form.
+    fn rank(&self, entry: &str) -> Option<usize> {
+        self.names.iter().enumerate().find_map(|(index, name)| {
+            if entry == name {
+                Some(2 * index)
+            } else if self.allow_source_set_prefix && has_directory_prefix(entry, name) {
+                Some(2 * index + 1)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+/// Whether `entry` is `name` below a non-empty directory prefix of any depth.
+fn has_directory_prefix(entry: &str, name: &str) -> bool {
+    entry
+        .strip_suffix(name)
+        .and_then(|rest| rest.strip_suffix('/'))
+        .is_some_and(|prefix| !prefix.is_empty())
+}
+
+/// The classfile `SourceFile` attribute when it is a plain `.java` or `.kt` file name;
+/// any other value (a path, another language, or an empty name) is ignored.
+fn source_file_name<'a>(attributes: &'a [AttributeInfo<'a>]) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find_map(|attribute| match &attribute.data {
+            AttributeData::SourceFile(name) => {
+                let name = name.as_ref();
+                let stem = name
+                    .strip_suffix(".java")
+                    .or_else(|| name.strip_suffix(".kt"))?;
+                (!stem.is_empty() && !name.contains(['/', '\\'])).then_some(name)
+            }
+            _ => None,
+        })
+}
+
+/// Reads the best ranked entry of `names` from a sources JAR; ties go to the smallest name.
 fn read_source(
     path: &Path,
-    class_name: &str,
+    names: &SourceEntryNames,
     max_bytes: usize,
 ) -> Result<Option<(String, String, bool)>> {
     let mut archive = ZipArchive::new(File::open(path)?)?;
-    let outer_class = class_name.split('$').next().unwrap_or(class_name);
-    let expected_java = format!("{}.java", outer_class.replace('.', "/"));
-    let expected_kotlin = format!("{}.kt", outer_class.replace('.', "/"));
-    let mut selected = None;
+    let mut selected: Option<(usize, String, usize)> = None;
     let mut first_error = None;
     for index in 0..archive.len() {
         let entry = match archive.by_index_raw(index) {
@@ -3405,14 +3542,19 @@ fn read_source(
         };
         let name = entry
             .name()
-            .context("cannot decode source JAR entry name")?;
-        let name = name.replace('\\', "/");
-        if name == expected_java || name == expected_kotlin {
-            selected = Some(index);
-            break;
+            .context("cannot decode source JAR entry name")?
+            .replace('\\', "/");
+        let Some(rank) = names.rank(&name) else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|(best, best_name, _)| (rank, &name) < (*best, best_name))
+        {
+            selected = Some((rank, name, index));
         }
     }
-    let Some(index) = selected else {
+    let Some((_, _, index)) = selected else {
         // An unreadable entry may have been the requested source, so do not
         // report it as a missing result.
         return match first_error {

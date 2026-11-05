@@ -1459,6 +1459,329 @@ fn source_lookup_surfaces_corrupt_local_entry_headers_after_indexing() {
     assert!(error.to_string().contains("cannot read source JAR entry"));
 }
 
+/// A public class without members whose only class attribute is `SourceFile`.
+pub(super) fn source_file_class(class_name: &str, source_file: &str) -> Vec<u8> {
+    let mut bytes = vec![0xca, 0xfe, 0xba, 0xbe];
+    push_u16(&mut bytes, 0);
+    push_u16(&mut bytes, 61);
+    push_u16(&mut bytes, 7);
+    push_utf8(&mut bytes, class_name); // #1
+    push_class(&mut bytes, 1); // #2
+    push_utf8(&mut bytes, "java/lang/Object"); // #3
+    push_class(&mut bytes, 3); // #4
+    push_utf8(&mut bytes, "SourceFile"); // #5
+    push_utf8(&mut bytes, source_file); // #6
+    push_u16(&mut bytes, 0x0021);
+    push_u16(&mut bytes, 2);
+    push_u16(&mut bytes, 4);
+    push_u16(&mut bytes, 0); // interfaces
+    push_u16(&mut bytes, 0); // fields
+    push_u16(&mut bytes, 0); // methods
+    push_u16(&mut bytes, 1); // class attributes
+    push_u16(&mut bytes, 5);
+    push_u32(&mut bytes, 2);
+    push_u16(&mut bytes, 6);
+    bytes
+}
+
+const RESULT_KT: &str =
+    "package org.example\n\nsealed class Result\n\nclass Success(val value: Int) : Result()\n";
+const UTILS_KT: &str =
+    "@file:JvmName(\"UtilsKt\")\npackage org.example\n\nfun greet(): String = \"hi\"\n";
+const PRIMARY_JAVA: &str =
+    "package org.example;\n\npublic class Primary {}\n\nclass Secondary {}\n";
+
+/// A demo artifact whose classes are declared in differently named source files.
+fn source_file_fixture() -> (TempDir, MavenIndex) {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[
+            (
+                "org/example/Success.class",
+                &source_file_class("org/example/Success", "Result.kt"),
+            ),
+            (
+                "org/example/UtilsKt.class",
+                &source_file_class("org/example/UtilsKt", "Utils.kt"),
+            ),
+            (
+                "org/example/Secondary.class",
+                &source_file_class("org/example/Secondary", "Primary.java"),
+            ),
+            (
+                "org/example/Orphan.class",
+                &source_file_class("org/example/Orphan", "Gone.kt"),
+            ),
+            (
+                "org/example/Bare.class",
+                &member_class("org/example/Bare", &[], &[("run", "()V")]),
+            ),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Result.kt", RESULT_KT.as_bytes()),
+            ("org/example/Utils.kt", UTILS_KT.as_bytes()),
+            ("org/example/Primary.java", PRIMARY_JAVA.as_bytes()),
+        ],
+    );
+    let index = build_index(&root, 10, 64 * 1024);
+    (root, index)
+}
+
+#[test]
+fn class_source_follows_the_classfile_source_file_attribute() {
+    let (_root, index) = source_file_fixture();
+
+    for (class_name, entry, source) in [
+        ("org.example.Success", "org/example/Result.kt", RESULT_KT),
+        ("org.example.UtilsKt", "org/example/Utils.kt", UTILS_KT),
+        (
+            "org.example.Secondary",
+            "org/example/Primary.java",
+            PRIMARY_JAVA,
+        ),
+    ] {
+        let sources = index.class_source(class_name, None, None).unwrap();
+        assert_eq!(sources.len(), 1, "{class_name}");
+        assert_eq!(sources[0].class_name, class_name);
+        assert_eq!(sources[0].entry, entry);
+        assert_eq!(sources[0].source, source);
+        assert_eq!(
+            sources[0].source_jar.coordinate,
+            "org.example:demo:1.0:sources"
+        );
+    }
+    assert!(
+        index
+            .class_source("org.example.Orphan", None, None)
+            .unwrap()
+            .is_empty(),
+        "a class whose source entry is absent has no source result"
+    );
+}
+
+#[test]
+fn declaration_source_slices_classes_from_their_source_file_attribute() {
+    let (_root, index) = source_file_fixture();
+
+    let success = index
+        .get_declaration_source("org.example.Success", None, None, None, None)
+        .unwrap();
+    assert_eq!(success.results.len(), 1);
+    assert_eq!(success.results[0].entry, "org/example/Result.kt");
+    assert_eq!(
+        success.results[0].source.trim(),
+        "class Success(val value: Int) : Result()"
+    );
+    let secondary = index
+        .get_declaration_source("org.example.Secondary", None, None, None, None)
+        .unwrap();
+    assert_eq!(secondary.results.len(), 1);
+    assert_eq!(secondary.results[0].entry, "org/example/Primary.java");
+    assert_eq!(secondary.results[0].start_line, 5);
+}
+
+#[test]
+fn source_lookup_is_case_insensitive_and_reports_the_binary_name() {
+    let (_root, index) = source_file_fixture();
+
+    let exact = index
+        .class_source("org.example.Success", None, None)
+        .unwrap();
+    let lower = index
+        .class_source("org.example.success", None, None)
+        .unwrap();
+    assert_eq!(lower, exact);
+    assert_eq!(lower[0].class_name, "org.example.Success");
+
+    let exact = index
+        .get_declaration_source("org/example/Bare", Some("run"), None, None, None)
+        .unwrap();
+    let upper = index
+        .get_declaration_source("ORG.EXAMPLE.BARE", Some("run"), None, None, None)
+        .unwrap();
+    assert_eq!(upper, exact);
+    assert_eq!(upper.unresolved[0].class_name, "org.example.Bare");
+}
+
+#[test]
+fn declaration_lookup_reports_a_missing_source_entry_as_unresolved() {
+    let (_root, index) = source_file_fixture();
+
+    let orphan = index
+        .get_declaration_source("org.example.Orphan", None, None, None, None)
+        .unwrap();
+    assert!(orphan.results.is_empty());
+    assert_eq!(
+        orphan.unresolved,
+        vec![UnresolvedDeclaration {
+            class_name: "org.example.Orphan".to_owned(),
+            kind: DeclarationKind::Class,
+            name: "org.example.Orphan".to_owned(),
+            descriptor: None,
+            source_jar: orphan.unresolved[0].source_jar.clone(),
+            entry: "org/example/Gone.kt".to_owned(),
+            reason: UnresolvedDeclarationReason::SourceEntryMissing,
+            candidate_lines: Vec::new(),
+            truncated: false,
+        }]
+    );
+    assert_eq!(
+        orphan.unresolved[0].source_jar.coordinate,
+        "org.example:demo:1.0:sources"
+    );
+
+    let member = index
+        .get_declaration_source("org.example.Bare", Some("run"), None, None, None)
+        .unwrap();
+    assert!(member.results.is_empty());
+    assert_eq!(member.unresolved.len(), 1);
+    let unresolved = &member.unresolved[0];
+    assert_eq!(
+        (
+            unresolved.kind,
+            unresolved.name.as_str(),
+            unresolved.descriptor.as_deref()
+        ),
+        (DeclarationKind::Method, "run", Some("()V"))
+    );
+    assert_eq!(
+        (unresolved.entry.as_str(), unresolved.reason),
+        (
+            "org/example/Bare.java",
+            UnresolvedDeclarationReason::SourceEntryMissing
+        ),
+        "without a SourceFile attribute the class-name convention is expected"
+    );
+}
+
+#[test]
+fn source_lookup_finds_entries_below_a_source_set_directory() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/x/kmp/1.0");
+    write_jar(
+        &base.join("kmp-1.0.jar"),
+        &[
+            ("org/x/Foo.class", &source_file_class("org/x/Foo", "Foo.kt")),
+            ("org/x/Bar.class", b"bytecode without a SourceFile"),
+            (
+                "org/x/Exact.class",
+                &source_file_class("org/x/Exact", "Exact.kt"),
+            ),
+            (
+                "org/x/Both.class",
+                &source_file_class("org/x/Both", "Both.kt"),
+            ),
+            ("Top.class", &source_file_class("Top", "Top.kt")),
+            (
+                "org/x/Deep.class",
+                &source_file_class("org/x/Deep", "Deep.kt"),
+            ),
+        ],
+    );
+    write_jar(
+        &base.join("kmp-1.0-sources.jar"),
+        &[
+            ("commonMain/org/x/Foo.kt", b"// common Foo"),
+            ("jvmMain/org/x/Bar.kt", b"// jvm Bar"),
+            ("commonMain/org/x/Exact.kt", b"// prefixed Exact"),
+            ("org/x/Exact.kt", b"// exact Exact"),
+            ("jvmMain/org/x/Both.kt", b"// jvm Both"),
+            ("commonMain/org/x/Both.kt", b"// common Both"),
+            ("commonMain/Top.kt", b"// default package"),
+            (
+                "commonMain/kotlin/org/x/Deep.kt",
+                b"// two directories deep",
+            ),
+        ],
+    );
+    let index = build_index(&root, 10, 1024);
+    let entry = |class_name: &str| {
+        index
+            .class_source(class_name, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|source| (source.entry, source.source))
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        entry("org.x.Foo"),
+        vec![(
+            "commonMain/org/x/Foo.kt".to_owned(),
+            "// common Foo".to_owned()
+        )]
+    );
+    assert_eq!(
+        entry("org.x.Bar"),
+        vec![("jvmMain/org/x/Bar.kt".to_owned(), "// jvm Bar".to_owned())],
+        "the class-name fallback also accepts a source-set directory"
+    );
+    assert_eq!(
+        entry("org.x.Exact"),
+        vec![("org/x/Exact.kt".to_owned(), "// exact Exact".to_owned())],
+        "an unprefixed entry wins over a prefixed one"
+    );
+    assert_eq!(
+        entry("org.x.Both"),
+        vec![(
+            "commonMain/org/x/Both.kt".to_owned(),
+            "// common Both".to_owned()
+        )],
+        "equally ranked entries resolve to the smallest name"
+    );
+    assert!(
+        entry("Top").is_empty(),
+        "default-package classes match exactly"
+    );
+    assert_eq!(
+        entry("org.x.Deep"),
+        vec![(
+            "commonMain/kotlin/org/x/Deep.kt".to_owned(),
+            "// two directories deep".to_owned()
+        )],
+        "the prefix may span several directories"
+    );
+}
+
+#[test]
+fn source_entry_names_rank_the_source_file_before_the_class_name_convention() {
+    let names = SourceEntryNames::new("org.x.Success$Inner", Some("Result.kt"));
+    assert_eq!(names.primary(), "org/x/Result.kt");
+    assert_eq!(names.rank("org/x/Result.kt"), Some(0));
+    assert_eq!(names.rank("commonMain/org/x/Result.kt"), Some(1));
+    assert_eq!(names.rank("commonMain/kotlin/org/x/Result.kt"), Some(1));
+    assert_eq!(names.rank("commonMain/kotlin/xorg/x/Result.kt"), None);
+    assert_eq!(names.rank("org/x/Success.java"), Some(2));
+    assert_eq!(names.rank("jvmMain/org/x/Success.kt"), Some(5));
+    assert_eq!(names.rank("/org/x/Result.kt"), None);
+    assert_eq!(names.rank("org/x/Inner.kt"), None);
+
+    let conventional = SourceEntryNames::new("org.x.Foo", Some("Foo.java"));
+    assert_eq!(conventional.names, ["org/x/Foo.java", "org/x/Foo.kt"]);
+    let default_package = SourceEntryNames::new("Top", None);
+    assert_eq!(default_package.primary(), "Top.java");
+    assert_eq!(default_package.rank("main/Top.java"), None);
+}
+
+#[test]
+fn only_plain_java_and_kotlin_source_file_names_are_recorded() {
+    let recorded = |source_file: &str| {
+        let bytes = source_file_class("org/x/Foo", source_file);
+        let parsed = cafebabe::parse_class(&bytes).unwrap();
+        source_file_name(&parsed.attributes).map(str::to_owned)
+    };
+    assert_eq!(recorded("Foo.kt").as_deref(), Some("Foo.kt"));
+    assert_eq!(recorded("Bar.java").as_deref(), Some("Bar.java"));
+    for ignored in ["../Foo.kt", "dir\\Foo.java", ".kt", "Foo.scala", ""] {
+        assert_eq!(recorded(ignored), None, "{ignored:?}");
+    }
+}
+
 #[test]
 fn artifact_versions_are_group_scoped_and_sorted() {
     let root = TempDir::new().unwrap();

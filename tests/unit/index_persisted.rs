@@ -12,7 +12,7 @@ use crate::index::{
     MavenIndex, ReactorLayout, ReferenceDirection, ScopedIndex,
     tests::{
         MULTI_RELEASE_MANIFEST, hierarchy_class, module_info_class, referencing_class,
-        write_class_directory, write_jar, write_module_pom,
+        source_file_class, write_class_directory, write_jar, write_module_pom,
     },
 };
 
@@ -58,7 +58,7 @@ struct Project {
 
 impl Project {
     /// A reactor with one class-directory module and two repository JARs carrying hierarchy,
-    /// reference, provider and multi-release facts, plus a sources JAR.
+    /// reference, provider, `SourceFile` and multi-release facts, plus a sources JAR.
     fn new() -> Self {
         let directory = TempDir::new().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -84,6 +84,10 @@ impl Project {
                 (
                     "org/libs/Caller.class",
                     &referencing_class("org/libs/Caller", "org/libs/Base"),
+                ),
+                (
+                    "org/libs/BaseKt.class",
+                    &source_file_class("org/libs/BaseKt", "Base.java"),
                 ),
                 ("module-info.class", &module_info_class()),
                 ("META-INF/services/org.libs.Spi", b"org.libs.SpiProvider\n"),
@@ -144,8 +148,9 @@ impl Project {
 /// Everything a search can observe, in a deterministic form.
 fn observable(index: &MavenIndex) -> String {
     format!(
-        "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
+        "{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}",
         index.jars,
+        index.class_source("org.libs.BaseKt", None, None).unwrap(),
         index.stats(),
         index.search_classes("", None),
         index.search_type_hierarchy("org.libs.Base", true, None, None),
@@ -322,6 +327,33 @@ fn records_with_dangling_fact_strings_are_rejected() {
     assert!(!stored.class_facts.is_empty());
 
     stored.fact_strings.clear();
+
+    assert!(validate(stored).is_err());
+}
+
+#[test]
+fn source_file_attributes_survive_persistence_and_are_validated() {
+    let project = Project::new();
+    let records = MemoryRecords::default();
+    records.store(&project.build(Some(&records), 1024));
+
+    let reused = project.build(Some(&records), 1024);
+    assert_eq!(reused.records.built, 0);
+    let sources = reused
+        .index
+        .class_source("org.libs.BaseKt", None, None)
+        .unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].entry, "org/libs/Base.java");
+
+    let mut stored =
+        decode_payload::<StoredRecord>(&records.load(&project.classpath[0]).unwrap()).unwrap();
+    let facts = stored
+        .class_facts
+        .iter_mut()
+        .find(|facts| facts.source_file.is_some())
+        .expect("the SourceFile attribute is stored");
+    facts.source_file = Some(u32::try_from(stored.fact_strings.len() + 1).unwrap());
 
     assert!(validate(stored).is_err());
 }
