@@ -41,7 +41,7 @@ mod model_inputs;
 
 /// Version of the database layout and of every payload; bump it whenever a stored shape or
 /// the derivation of a stored record changes. Each format uses its own database file.
-pub const INDEX_CACHE_FORMAT: u32 = 2;
+pub const INDEX_CACHE_FORMAT: u32 = 3;
 /// Lock wait of one cache operation before it is treated as a miss or a skipped write.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound of one decoded payload, so a damaged length cannot exhaust memory.

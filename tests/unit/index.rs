@@ -4856,3 +4856,395 @@ fn measure_indexed_versus_scanning_hierarchy_search() {
         indexed_time.as_millis(),
     );
 }
+
+fn file_names(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn single_source(index: &MavenIndex, class_name: &str) -> (String, String) {
+    let sources = index.class_source(class_name, None, None).unwrap();
+    assert_eq!(sources.len(), 1, "{class_name}");
+    (
+        sources[0].source_jar.coordinate.clone(),
+        sources[0].source.clone(),
+    )
+}
+
+#[test]
+fn source_jar_candidates_follow_the_maven_classifier_conventions() {
+    let base = Path::new("/repo/org/example/demo/1.0");
+    for (file_name, classifier, expected) in [
+        ("demo-1.0.jar", None, vec!["demo-1.0-sources.jar"]),
+        (
+            "demo-1.0-jakarta.jar",
+            Some("jakarta"),
+            vec!["demo-1.0-jakarta-sources.jar", "demo-1.0-sources.jar"],
+        ),
+        (
+            "demo-1.0-native.jar",
+            Some("native"),
+            vec!["demo-1.0-native-sources.jar", "demo-1.0-sources.jar"],
+        ),
+        (
+            "demo-1.0-tests.jar",
+            Some("tests"),
+            vec!["demo-1.0-test-sources.jar"],
+        ),
+        // A custom `finalName` keeps its own name as the base.
+        ("app.jar", None, vec!["app-sources.jar"]),
+        ("app-tests.jar", Some("tests"), vec!["app-test-sources.jar"]),
+        ("demo-1.0-sources.jar", Some("sources"), vec![]),
+        ("demo-1.0-test-sources.jar", Some("test-sources"), vec![]),
+        (
+            "demo-1.0-jakarta-sources.jar",
+            Some("jakarta-sources"),
+            vec![],
+        ),
+        ("test-classes", Some("tests"), vec![]),
+    ] {
+        assert_eq!(
+            file_names(&source_jar_candidates(&base.join(file_name), classifier)),
+            expected,
+            "{file_name}"
+        );
+    }
+}
+
+#[test]
+fn sources_classifiers_document_their_binary_classifier() {
+    for (classifier, expected) in [
+        (None, None),
+        (Some("tests"), None),
+        (Some("jakarta"), None),
+        (Some("sources"), Some(None)),
+        (Some("test-sources"), Some(Some("tests"))),
+        (Some("jakarta-sources"), Some(Some("jakarta"))),
+        (Some("-sources"), None),
+    ] {
+        assert_eq!(
+            documented_classifier(classifier),
+            expected,
+            "{classifier:?}"
+        );
+    }
+}
+
+#[test]
+fn scoped_classifier_artifacts_read_the_sources_jar_maven_publishes() {
+    let repository = TempDir::new().unwrap();
+    let repository_root = repository.path().canonicalize().unwrap();
+    let base = repository_root.join("org/example/demo/1.0");
+    let jakarta = base.join("demo-1.0-jakarta.jar");
+    let tests = base.join("demo-1.0-tests.jar");
+    write_jar(&jakarta, &[("org/example/Jakarta.class", b"x")]);
+    write_jar(&tests, &[("org/example/FooTest.class", b"x")]);
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Jakarta.java", b"// plain"),
+            ("org/example/FooTest.java", b"// not a test source"),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0-test-sources.jar"),
+        &[("org/example/FooTest.java", b"// test source")],
+    );
+    write_jar(
+        &base.join("demo-1.0-tests-sources.jar"),
+        &[("org/example/FooTest.java", b"// wrong convention")],
+    );
+    let project = TempDir::new().unwrap();
+    std::fs::write(project.path().join("pom.xml"), "<project/>").unwrap();
+
+    let scoped = build_reactor_index(
+        Some(&repository_root),
+        project.path(),
+        &["."],
+        &[jakarta, tests],
+    );
+
+    assert!(scoped.unindexed.is_empty());
+    let index = scoped.index;
+    let stats = index.stats();
+    assert_eq!((stats.jar_count, stats.source_jar_count), (2, 2));
+    assert_eq!(
+        single_source(&index, "org.example.Jakarta"),
+        (
+            "org.example:demo:1.0:sources".to_owned(),
+            "// plain".to_owned()
+        )
+    );
+    assert_eq!(
+        single_source(&index, "org.example.FooTest"),
+        (
+            "org.example:demo:1.0:test-sources".to_owned(),
+            "// test source".to_owned()
+        )
+    );
+}
+
+#[test]
+fn scoped_classifier_artifacts_prefer_a_classifier_specific_sources_jar() {
+    let repository = TempDir::new().unwrap();
+    let repository_root = repository.path().canonicalize().unwrap();
+    let base = repository_root.join("org/example/demo/1.0");
+    let native = base.join("demo-1.0-native.jar");
+    write_jar(&native, &[("org/example/Native.class", b"x")]);
+    write_jar(
+        &base.join("demo-1.0-native-sources.jar"),
+        &[("org/example/Native.java", b"// native")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[("org/example/Native.java", b"// plain")],
+    );
+    let project = TempDir::new().unwrap();
+    std::fs::write(project.path().join("pom.xml"), "<project/>").unwrap();
+
+    let scoped = build_reactor_index(
+        Some(&repository_root),
+        project.path(),
+        &["."],
+        std::slice::from_ref(&native),
+    );
+
+    let index = scoped.index;
+    assert_eq!(index.stats().source_jar_count, 1);
+    assert_eq!(
+        single_source(&index, "org.example.Native"),
+        (
+            "org.example:demo:1.0:native-sources".to_owned(),
+            "// native".to_owned()
+        )
+    );
+    let reactor_root = project.path().canonicalize().unwrap();
+    let stamped = source_jar_stamp_paths(
+        Some(&repository_root),
+        &ReactorLayout {
+            root: &reactor_root,
+            modules: std::slice::from_ref(&reactor_root),
+        },
+        &native,
+    );
+    assert_eq!(
+        file_names(&stamped),
+        vec!["demo-1.0-native-sources.jar", "demo-1.0-sources.jar"]
+    );
+    assert!(
+        source_jar_stamp_paths(
+            Some(&repository_root),
+            &ReactorLayout {
+                root: &reactor_root,
+                modules: &[],
+            },
+            &base.join("demo-1.0-missing.jar"),
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn repository_index_pairs_each_classifier_with_its_sources_jar() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Main.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-jakarta.jar"),
+        &[("org/example/Jakarta.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-native.jar"),
+        &[("org/example/Native.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-tests.jar"),
+        &[("org/example/FooTest.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Main.java", b"// main"),
+            ("org/example/Jakarta.java", b"// plain jakarta"),
+            ("org/example/Native.java", b"// plain native"),
+        ],
+    );
+    write_jar(
+        &base.join("demo-1.0-jakarta-sources.jar"),
+        &[("org/example/Jakarta.java", b"// jakarta")],
+    );
+    write_jar(
+        &base.join("demo-1.0-test-sources.jar"),
+        &[("org/example/FooTest.java", b"// test")],
+    );
+
+    let index = build_index(&root, 10, 1024);
+
+    let stats = index.stats();
+    assert_eq!((stats.jar_count, stats.source_jar_count), (4, 3));
+    assert_eq!(stats.class_count, 4);
+    for (class_name, coordinate, source) in [
+        (
+            "org.example.Main",
+            "org.example:demo:1.0:sources",
+            "// main",
+        ),
+        (
+            "org.example.Jakarta",
+            "org.example:demo:1.0:jakarta-sources",
+            "// jakarta",
+        ),
+        (
+            "org.example.Native",
+            "org.example:demo:1.0:sources",
+            "// plain native",
+        ),
+        (
+            "org.example.FooTest",
+            "org.example:demo:1.0:test-sources",
+            "// test",
+        ),
+    ] {
+        assert_eq!(
+            single_source(&index, class_name),
+            (coordinate.to_owned(), source.to_owned())
+        );
+    }
+}
+
+#[test]
+fn reactor_test_jars_read_the_module_test_sources_jar() {
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><groupId>org.reactor</groupId><artifactId>parent</artifactId><version>3.0</version></project>",
+    )
+    .unwrap();
+    let module = project.path().join("core");
+    write_module_pom(&module, "core", "3.0");
+    let tests = module.join("target/core-3.0-tests.jar");
+    write_jar(&tests, &[("org/reactor/CoreTest.class", b"x")]);
+    write_jar(
+        &module.join("target/core-3.0-test-sources.jar"),
+        &[("org/reactor/CoreTest.java", b"// reactor test")],
+    );
+
+    let scoped = build_reactor_index(
+        None,
+        project.path(),
+        &[".", "core"],
+        &[tests.canonicalize().unwrap()],
+    );
+
+    assert!(scoped.unindexed.is_empty());
+    assert_eq!(
+        single_source(&scoped.index, "org.reactor.CoreTest"),
+        (
+            "org.reactor:core:3.0:test-sources".to_owned(),
+            "// reactor test".to_owned()
+        )
+    );
+}
+
+fn searched_source_jars(index: &MavenIndex, selector: &str) -> Vec<String> {
+    let mut coordinates: Vec<String> = index
+        .search_source("needle", false, Some(selector), 0, None)
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|found| found.source_jar.coordinate)
+        .collect();
+    coordinates.sort();
+    coordinates.dedup();
+    coordinates
+}
+
+#[test]
+fn source_search_filtered_to_a_binary_searches_only_its_sources_jar() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    for (file_name, class_entry) in [
+        ("demo-1.0.jar", "org/example/Main.class"),
+        ("demo-1.0-tests.jar", "org/example/FooTest.class"),
+        ("demo-1.0-jakarta.jar", "org/example/Jakarta.class"),
+    ] {
+        write_jar(&base.join(file_name), &[(class_entry, b"x")]);
+    }
+    for (file_name, source_entry) in [
+        ("demo-1.0-sources.jar", "org/example/Main.java"),
+        ("demo-1.0-test-sources.jar", "org/example/FooTest.java"),
+        ("demo-1.0-jakarta-sources.jar", "org/example/Jakarta.java"),
+    ] {
+        write_jar(&base.join(file_name), &[(source_entry, b"// needle")]);
+    }
+
+    let index = build_index(&root, 10, 1024);
+
+    for (selector, expected) in [
+        ("demo-1.0.jar", "org.example:demo:1.0:sources"),
+        ("org.example:demo:1.0", "org.example:demo:1.0:sources"),
+        ("demo-1.0-tests.jar", "org.example:demo:1.0:test-sources"),
+        (
+            "org.example:demo:1.0:tests",
+            "org.example:demo:1.0:test-sources",
+        ),
+        (
+            "demo-1.0-jakarta.jar",
+            "org.example:demo:1.0:jakarta-sources",
+        ),
+        (
+            "demo-1.0-test-sources.jar",
+            "org.example:demo:1.0:test-sources",
+        ),
+        (
+            "org.example:demo:1.0:jakarta-sources",
+            "org.example:demo:1.0:jakarta-sources",
+        ),
+    ] {
+        assert_eq!(
+            searched_source_jars(&index, selector),
+            vec![expected.to_owned()],
+            "{selector}"
+        );
+    }
+}
+
+#[test]
+fn a_tests_binary_without_test_sources_has_no_sources_jar() {
+    let root = TempDir::new().unwrap();
+    let base = root.path().join("org/example/demo/1.0");
+    write_jar(
+        &base.join("demo-1.0.jar"),
+        &[("org/example/Main.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-tests.jar"),
+        &[("org/example/FooTest.class", b"x")],
+    );
+    write_jar(
+        &base.join("demo-1.0-sources.jar"),
+        &[
+            ("org/example/Main.java", b"// needle main"),
+            ("org/example/FooTest.java", b"// needle unrelated"),
+        ],
+    );
+
+    let index = build_index(&root, 10, 1024);
+
+    assert!(
+        index
+            .class_source("org.example.FooTest", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(searched_source_jars(&index, "demo-1.0-tests.jar").is_empty());
+    assert_eq!(
+        searched_source_jars(&index, "demo-1.0.jar"),
+        vec!["org.example:demo:1.0:sources".to_owned()]
+    );
+}
