@@ -265,8 +265,8 @@ impl Config {
 }
 
 /// Variables that configure only this server's own limits, logging, cache and stats. They
-/// are removed from every Maven child, so they cannot change a Maven result and are left out
-/// of the persisted classpath identity, which digests the rest of the environment.
+/// are removed from every Maven child, so they cannot change a Maven result and never take
+/// part in the persisted classpath identity, even when it digests every other variable.
 pub const SERVER_ONLY_ENVIRONMENT: [&str; 19] = [
     "MAX_RESULTS",
     "MAX_SOURCE_BYTES",

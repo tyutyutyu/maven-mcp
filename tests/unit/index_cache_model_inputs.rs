@@ -66,7 +66,9 @@ fn parents_and_imported_boms_are_followed_transitively() {
         &project(&parent("org.d", "dep-parent", "5", "")),
     );
 
-    let inputs = model_inputs(&[reactor], &[dependency], Some(&repository)).unwrap();
+    let inputs = model_inputs(&[reactor], &[dependency], Some(&repository))
+        .unwrap()
+        .paths;
 
     for expected in [
         parent_pom,
@@ -103,7 +105,9 @@ fn a_reactor_parent_is_looked_up_beside_the_pom_and_in_the_repository() {
     let outer = directory.path().join("outer/pom.xml");
     write(&outer, &project(""));
 
-    let inputs = model_inputs(&[module], &[], Some(&repository)).unwrap();
+    let inputs = model_inputs(&[module], &[], Some(&repository))
+        .unwrap()
+        .paths;
 
     assert!(inputs.contains(&local_parent.canonicalize().unwrap()));
     assert!(inputs.contains(&outer.canonicalize().unwrap()));
@@ -133,7 +137,9 @@ fn a_version_maven_decides_stamps_every_version_of_the_artifact() {
         &project(&parent("org.b", "bom-parent", "7", "")),
     );
 
-    let inputs = model_inputs(&[reactor], &[], Some(&repository)).unwrap();
+    let inputs = model_inputs(&[reactor], &[], Some(&repository))
+        .unwrap()
+        .paths;
 
     assert!(inputs.contains(&repository.join("org/b/bom")), "{inputs:?}");
     assert!(

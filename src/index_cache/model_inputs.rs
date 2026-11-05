@@ -11,6 +11,9 @@
 //! repository directory is stamped and every version's POM is followed. A reference whose
 //! groupId or artifactId cannot be read without interpolating arbitrary properties, a POM
 //! that cannot be parsed, or a walk beyond the XML budget declines persistence instead.
+//!
+//! Every POM the walk reads may also select artifacts through `${env.NAME}`, so the walk
+//! collects those names; a POM using an unknown XML entity declines persistence too.
 
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -20,6 +23,7 @@ use std::{
 
 use serde::Deserialize;
 
+use super::maven_environment::env_references;
 use crate::config::XmlBudget;
 
 /// Upper bound of the version directories of one artifact that are followed.
@@ -176,22 +180,34 @@ struct ModelWalk<'a> {
     queue: VecDeque<(PathBuf, bool)>,
     visited: BTreeSet<PathBuf>,
     inputs: BTreeSet<PathBuf>,
+    env_references: BTreeSet<String>,
     budget: XmlBudget,
+}
+
+/// What Maven's model building of one classpath resolution read besides the reactor.
+pub(super) struct ModelInputs {
+    /// Parent and imported POM files and repository artifact directories.
+    pub(super) paths: Vec<PathBuf>,
+    /// Every variable referenced as `env.NAME` by a POM the walk read, including the
+    /// parents, imported BOMs and dependency POMs outside the reactor.
+    pub(super) env_references: BTreeSet<String>,
 }
 
 /// The parent and imported POM files and repository artifact directories that
 /// `reactor_poms` (whose relative parent paths count) and `repository_poms` inherit from or
-/// import, transitively. `None` when one of them cannot be identified.
+/// import, transitively, and the variables every visited POM references. `None` when one of
+/// them cannot be identified.
 pub(super) fn model_inputs(
     reactor_poms: &[PathBuf],
     repository_poms: &[PathBuf],
     repository: Option<&Path>,
-) -> Option<Vec<PathBuf>> {
+) -> Option<ModelInputs> {
     let mut walk = ModelWalk {
         repository,
         queue: VecDeque::new(),
         visited: BTreeSet::new(),
         inputs: BTreeSet::new(),
+        env_references: BTreeSet::new(),
         budget: XmlBudget::default(),
     };
     for pom in reactor_poms {
@@ -203,7 +219,10 @@ pub(super) fn model_inputs(
     while let Some((pom, in_reactor)) = walk.queue.pop_front() {
         walk.visit(&pom, in_reactor)?;
     }
-    Some(walk.inputs.into_iter().collect())
+    Some(ModelInputs {
+        paths: walk.inputs.into_iter().collect(),
+        env_references: walk.env_references,
+    })
 }
 
 impl ModelWalk<'_> {
@@ -213,12 +232,14 @@ impl ModelWalk<'_> {
         }
     }
 
-    /// Follows the parent and imports of one POM; a missing POM is stamped as missing.
+    /// Follows the parent and imports of one POM and collects its variable references; a
+    /// missing POM is stamped as missing.
     fn visit(&mut self, pom: &Path, in_reactor: bool) -> Option<()> {
         if !pom.is_file() {
             return Some(());
         }
         let xml = self.budget.read(pom).ok()?;
+        self.env_references.extend(env_references(xml.as_bytes())?);
         let model: ModelPom = quick_xml::de::from_str(&xml).ok()?;
         if let Some(parent) = &model.parent {
             if in_reactor {

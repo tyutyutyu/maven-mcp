@@ -108,3 +108,18 @@ becomes the GitHub Release notes.
   JARs, not binary JARs, in `index_stats` and the search tools. The on-disk
   index cache format is now 3 (`index-v3.sqlite3`), so existing caches are
   rebuilt once on first use.
+- A restarted MCP host reuses the persisted classpath instead of running
+  `dependency:build-classpath` again. The classpath key digested the whole
+  inherited environment, so per-session host variables such as
+  `CLAUDE_CODE_SESSION_ID`, `VSCODE_IPC_HOOK`, `SSH_AUTH_SOCK` or `PWD` forced a
+  new Maven run after every restart. The key now covers only the variables Maven
+  can read: `HOME`, `PATH`, `JAVA_HOME`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`,
+  `M2_HOME`, every `MAVEN_*`, `MVNW_*`, `JENV_*` and proxy variable, and every
+  variable the reactor POMs, `.mvn` configuration, settings, toolchains or
+  `mavenrc` files reference (see "Environment in the classpath key" in
+  `README.md`). A stored classpath also records the variables its parent,
+  imported BOM and dependency POMs outside the reactor reference as
+  `${env.NAME}`, and is resolved again when one of them changes. `run_maven`, `run_maven_lifecycle` and `refresh_maven_project`
+  forget every stored classpath of the project. The on-disk index cache format
+  is now 4 (`index-v4.sqlite3`), so existing caches are rebuilt once on first
+  use.

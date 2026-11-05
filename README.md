@@ -556,11 +556,9 @@ version:
 - one **classpath** per project context, keyed by the canonical project root,
   the classpath scope, `MAVEN_EXECUTABLE`, `MAVEN_EXECUTION_REPO_PATH`,
   `MAVEN_EXECUTION_NETWORK`, the Java selection (inherited or `--jenv` with its
-  root) and a digest of the whole inherited environment (only the digest is
-  stored), because POMs, settings, `mavenrc` files and `JAVA_TOOL_OPTIONS` may
-  read any variable. Only the server's own settings (`MAX_*` limits,
-  `MAVEN_TIMEOUT_SECONDS`, `MAVEN_MCP_*`, `RUST_LOG`) are left out; they are
-  removed from every Maven child. It is reused instead of running Maven only
+  root) and a digest of the inherited variables Maven can read (only the digest
+  is stored; see [Environment in the classpath key](#environment-in-the-classpath-key)).
+  It is reused instead of running Maven only
   while the project fingerprint (see [Project index cache](#project-index-cache))
   is identical, every resolution input is unchanged, and every classpath entry
   still exists. The resolution inputs are `~/.m2/settings.xml`,
@@ -579,9 +577,51 @@ version:
   properties, an unparsable POM, no known repository), the classpath is not
   stored and every process resolves it through Maven.
 
+#### Environment in the classpath key
+
+MCP hosts start the server with per-session variables (for example
+`CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `VSCODE_IPC_HOOK`, `SSH_AUTH_SOCK` or
+`PWD`). They do not change what Maven resolves, so they are not part of the key
+and a restarted host reuses the stored classpath. These variable classes take
+part, by name and value, together with the list of names that are set:
+
+- Maven launcher and Java: `HOME`, `PATH`, `JAVA_HOME`, `JAVA_TOOL_OPTIONS`,
+  `JDK_JAVA_OPTIONS`, `M2_HOME`, and every `MAVEN_*` variable (`MAVEN_OPTS`,
+  `MAVEN_ARGS`, `MAVEN_CONFIG`, `MAVEN_USER_HOME`, `MAVEN_HOME`,
+  `MAVEN_PROJECTBASEDIR`, `MAVEN_SKIP_RC`, ...);
+- Maven Wrapper and jenv: every `MVNW_*` and `JENV_*` variable (`JENV_ROOT`,
+  `JENV_VERSION`, ...);
+- proxies: every variable ending in `_PROXY` or `_proxy` (`HTTP_PROXY`,
+  `https_proxy`, `NO_PROXY`, ...);
+- referenced variables: every `NAME` used as `${env.NAME}` (or as an `env.NAME`
+  profile activation property) in the reactor POMs, `.mvn/maven.config`,
+  `.mvn/jvm.config`, `~/.m2/settings.xml`, `~/.m2/toolchains.xml` and the Maven
+  installation's `conf/settings.xml` and `conf/toolchains.xml`, and every shell
+  variable (`$NAME`, `${NAME}`) in `/etc/mavenrc`, `~/.mavenrc` and
+  `.mvn/jvm.config`. XML character and predefined entity references are decoded
+  first, as Maven's XML parser does (`${env.A&#95;B}` reads `A_B`).
+
+The server's own settings (`MAX_*` limits, `MAVEN_TIMEOUT_SECONDS`,
+`MAVEN_MCP_*`, `RUST_LOG`) never take part; they are removed from every Maven
+child. When one of the scanned files exists but cannot be read (or exceeds
+16 MiB) or uses an XML entity declared in a DTD, the references are unknown and
+every other inherited variable takes part, so an unseen reference never reuses a
+stale classpath.
+
+The parent POMs (local `relativePath` parents outside the reactor and repository
+parents), imported BOMs and dependency POMs are known only after Maven resolved
+the classpath, so their `${env.NAME}` references are not part of the key.
+Instead, the stored classpath records the names those POMs reference and a
+digest of their values, and it is reused only while every recorded variable is
+unchanged; a changed, added or removed one resolves the classpath through Maven
+again. A variable that only a plugin or another script reads is not detected:
+after changing it, call `refresh_maven_project`. Because the key depends on the
+environment, `run_maven`, `run_maven_lifecycle` and `refresh_maven_project` forget
+every stored classpath of the project, whatever environment it was resolved with.
+
 So a new or edited POM, parent or imported BOM, a deleted classpath artifact, a
-changed setting or environment variable resolves the classpath through Maven
-again, and a modified JAR or reactor output re-reads only that entry; every other
+changed setting or Maven-relevant environment variable resolves the classpath
+through Maven again, and a modified JAR or reactor output re-reads only that entry; every other
 valid record is reused. The resolution inputs are stamped as Maven returns the
 classpath and must all have been at least two seconds old when Maven started, and
 they must still carry those stamps when the classpath is stored; otherwise the
@@ -589,7 +629,7 @@ classpath is used but not stored, because Maven may have read an older version o
 a file that changed during the run or the index build. Likewise, files modified
 less than two seconds before a build are indexed but not persisted, because a
 coarse filesystem clock could hide a second change with the same stamp.
-`run_maven` and `run_maven_lifecycle` also forget the project's stored classpath
+`run_maven` and `run_maven_lifecycle` also forget the project's stored classpaths
 (records stay valid by their stamps), and `refresh_maven_project` additionally
 re-reads every archive of the project and replaces its stored records.
 
@@ -597,8 +637,9 @@ Location and lifecycle:
 
 - Directory: `MAVEN_MCP_CACHE_DIR` when set (must be absolute), otherwise
   `$XDG_CACHE_HOME/maven-mcp/index` or `~/.cache/maven-mcp/index`. The directory
-  is made `0700` and the SQLite database `index-v3.sqlite3` is `0600`; it contains
-  local paths, class and entry names, never source content. The file name carries
+  is made `0700` and the SQLite database `index-v4.sqlite3` is `0600`; it contains
+  local paths, class and entry names and the names (never the values) of the
+  variables the model POMs reference, never source content. The file name carries
   the cache format, so an older or newer binary with another format never reads it.
 - Disable with `MAVEN_MCP_INDEX_CACHE=false`; every process then starts cold, as
   before. With no known location (neither variable nor `HOME`) the cache is off.
@@ -614,7 +655,7 @@ Location and lifecycle:
   deleted and rebuilt automatically, and a damaged or mismatching entry is a miss
   that is rebuilt; none of these is ever served as a result. Rebuilding a damaged
   database is serialized between processes by an exclusive lock on the private
-  `index-v3.sqlite3.lock` file, which counts the rebuilds: a process deletes the
+  `index-v4.sqlite3.lock` file, which counts the rebuilds: a process deletes the
   database only when no other process rebuilt it since its own diagnosis, and
   creates the new schema before releasing the lock, so concurrent recoveries never
   delete each other's new database or its journal. A failed cache write only loses

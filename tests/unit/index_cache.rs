@@ -1,4 +1,4 @@
-use std::{fs::File, time::SystemTime};
+use std::{collections::BTreeSet, ffi::OsString, fs::File, time::SystemTime};
 
 use tempfile::TempDir;
 
@@ -76,9 +76,45 @@ fn records_and_classpaths_are_stored_privately_and_read_back() {
     assert_eq!(mode(&directory.path().join("index")), 0o700);
     assert_eq!(mode(&cache.database_path()), 0o600);
 
-    cache.forget_classpath("context").unwrap();
-    assert_eq!(cache.load_classpath("context"), None);
+    cache
+        .forget_project_classpaths(Path::new("/projects/a"))
+        .unwrap();
+    assert_eq!(
+        cache.load_classpath("context"),
+        Some(b"manifest".to_vec()),
+        "a key outside the project scope stays"
+    );
     assert!(stored(&cache, "/repo/a.jar").is_some(), "records stay");
+}
+
+#[test]
+fn forgetting_a_project_drops_every_context_of_that_root_only() {
+    let directory = TempDir::new().unwrap();
+    let cache = cache(&directory, 1 << 20);
+    let config = Config::from_env().unwrap();
+    let first = context_key(Path::new("/projects/a"), &config, 1);
+    let second = context_key(Path::new("/projects/a"), &config, 2);
+    let sibling = context_key(Path::new("/projects/ab"), &config, 1);
+    for key in [&first, &second, &sibling] {
+        cache
+            .write(&CacheUpdate {
+                classpath: Some((key, b"manifest".to_vec())),
+                ..CacheUpdate::default()
+            })
+            .unwrap();
+    }
+
+    cache
+        .forget_project_classpaths(Path::new("/projects/a"))
+        .unwrap();
+
+    assert_eq!(cache.load_classpath(&first), None);
+    assert_eq!(cache.load_classpath(&second), None, "every environment");
+    assert_eq!(
+        cache.load_classpath(&sibling),
+        Some(b"manifest".to_vec()),
+        "a root sharing the prefix stays"
+    );
 }
 
 #[test]
@@ -259,6 +295,15 @@ fn settled_file(path: &Path) {
         .unwrap();
 }
 
+/// Resolution inputs of only `paths`, without any model POM variable reference.
+fn stamps_only(paths: &[PathBuf]) -> ResolutionInputs {
+    ResolutionInputs::new(
+        ProjectFingerprint::capture(paths.to_vec()),
+        BTreeSet::new(),
+        std::iter::empty(),
+    )
+}
+
 #[test]
 fn a_classpath_manifest_is_reusable_only_while_everything_it_depends_on_is_unchanged() {
     let directory = TempDir::new().unwrap();
@@ -275,7 +320,7 @@ fn a_classpath_manifest_is_reusable_only_while_everything_it_depends_on_is_uncha
         ClasspathManifest::settled(
             "context",
             &project,
-            ProjectFingerprint::capture([settings.clone()]),
+            stamps_only(std::slice::from_ref(&settings)),
             vec![jar.clone()],
         )
         .unwrap()
@@ -285,7 +330,7 @@ fn a_classpath_manifest_is_reusable_only_while_everything_it_depends_on_is_uncha
         manifest().reusable_classpath("context", &project),
         Some((
             vec![jar.clone()],
-            ProjectFingerprint::capture([settings.clone()])
+            stamps_only(std::slice::from_ref(&settings))
         ))
     );
     assert_eq!(manifest().reusable_classpath("other", &project), None);
@@ -306,7 +351,7 @@ fn a_classpath_manifest_is_reusable_only_while_everything_it_depends_on_is_uncha
         ClasspathManifest::settled(
             "context",
             &project,
-            ProjectFingerprint::capture([settings.clone()]),
+            stamps_only(std::slice::from_ref(&settings)),
             Vec::new(),
         )
         .is_none(),
@@ -356,73 +401,186 @@ fn classpath_inputs_name_settings_and_sibling_poms_of_repository_artifacts() {
 #[test]
 fn the_classpath_context_separates_projects_and_maven_selection() {
     let config = Config::from_env().unwrap();
-    let context = classpath_context(Path::new("/projects/a"), &config);
+    let context = context_key(Path::new("/projects/a"), &config, 1);
 
-    assert_eq!(
-        context,
-        classpath_context(Path::new("/projects/a"), &config)
-    );
-    assert_ne!(
-        context,
-        classpath_context(Path::new("/projects/b"), &config)
-    );
+    assert_eq!(context, context_key(Path::new("/projects/a"), &config, 1));
+    assert!(context.starts_with(&project_scope(Path::new("/projects/a"))));
+    assert_ne!(context, context_key(Path::new("/projects/b"), &config, 1));
+    assert_ne!(context, context_key(Path::new("/projects/a"), &config, 2));
     let mut other_repository = config.clone();
     other_repository.execution.execution_repository = Some(PathBuf::from("/other-repo"));
     assert_ne!(
         context,
-        classpath_context(Path::new("/projects/a"), &other_repository)
+        context_key(Path::new("/projects/a"), &other_repository, 1)
     );
     let mut jenv = config.clone();
     jenv.execution.java_environment = JavaEnvironment::Jenv {
         root: PathBuf::from("/jenv"),
     };
-    assert_ne!(context, classpath_context(Path::new("/projects/a"), &jenv));
+    assert_ne!(context, context_key(Path::new("/projects/a"), &jenv, 1));
     let mut network = config;
     network.execution.network_enabled = !network.execution.network_enabled;
-    assert_ne!(
-        context,
-        classpath_context(Path::new("/projects/a"), &network)
+    assert_ne!(context, context_key(Path::new("/projects/a"), &network, 1));
+}
+
+fn variables(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    pairs
+        .iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+}
+
+/// The context key of `/projects/a` for `pairs` and a POM referencing `${env.BUILD_FLAVOR}`.
+fn key_for(pairs: &[(&str, &str)]) -> String {
+    let config = Config::from_env().unwrap();
+    let referenced = BTreeSet::from(["BUILD_FLAVOR".to_owned()]);
+    context_key(
+        Path::new("/projects/a"),
+        &config,
+        environment_digest(variables(pairs), Some(&referenced)),
+    )
+}
+
+const MAVEN_ENVIRONMENT: [(&str, &str); 5] = [
+    ("HOME", "/home/dev"),
+    ("JAVA_HOME", "/opt/jdk-21"),
+    ("MAVEN_OPTS", "-Xmx1g"),
+    ("PATH", "/usr/bin"),
+    ("BUILD_FLAVOR", "release"),
+];
+
+fn with(overrides: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+    MAVEN_ENVIRONMENT
+        .iter()
+        .filter(|(name, _)| !overrides.iter().any(|(changed, _)| changed == name))
+        .chain(overrides)
+        .copied()
+        .collect()
+}
+
+#[test]
+fn host_session_variables_keep_the_classpath_context_key() {
+    let first = key_for(&with(&[
+        ("CLAUDE_CODE_SESSION_ID", "session-1"),
+        ("PWD", "/home/dev/a"),
+        ("SSH_AUTH_SOCK", "/tmp/ssh-1/agent"),
+        ("VSCODE_IPC_HOOK", "/run/user/1000/vscode-1.sock"),
+        ("RUST_LOG", "maven_mcp=info"),
+    ]));
+    let second = key_for(&with(&[
+        ("CLAUDE_CODE_SESSION_ID", "session-2"),
+        ("PWD", "/home/dev/b"),
+        ("SSH_AUTH_SOCK", "/tmp/ssh-2/agent"),
+        ("VSCODE_IPC_HOOK", "/run/user/1000/vscode-2.sock"),
+        ("RUST_LOG", "maven_mcp=debug"),
+    ]));
+
+    assert_eq!(first, second);
+    assert_eq!(
+        first,
+        key_for(&MAVEN_ENVIRONMENT),
+        "absent session variables"
     );
 }
 
 #[test]
-fn the_environment_digest_covers_every_variable_but_server_only_ones() {
-    let variables = |pairs: &[(&str, &str)]| {
-        pairs
-            .iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-            .collect::<Vec<_>>()
-    };
-    let base = environment_digest(variables(&[("DEPENDENCY_LINE", "1"), ("HOME", "/h")]));
+fn maven_relevant_variables_change_the_classpath_context_key() {
+    let base = key_for(&MAVEN_ENVIRONMENT);
 
-    assert_eq!(
-        base,
-        environment_digest(variables(&[("HOME", "/h"), ("DEPENDENCY_LINE", "1")])),
-        "order independent"
-    );
-    assert_eq!(
-        base,
-        environment_digest(variables(&[
-            ("DEPENDENCY_LINE", "1"),
-            ("HOME", "/h"),
-            ("MAVEN_MCP_RUNTIME_DIR", "/run/a"),
-            ("MAX_RESULTS", "7"),
-            ("RUST_LOG", "debug"),
-        ])),
-        "server-only variables never reach Maven"
-    );
+    for changed in [
+        ("MAVEN_OPTS", "-Xmx2g"),
+        ("JAVA_HOME", "/opt/jdk-17"),
+        ("PATH", "/opt/maven/bin:/usr/bin"),
+        ("BUILD_FLAVOR", "debug"),
+    ] {
+        assert_ne!(base, key_for(&with(&[changed])), "{}", changed.0);
+    }
     assert_ne!(
         base,
-        environment_digest(variables(&[("DEPENDENCY_LINE", "2"), ("HOME", "/h")]))
+        key_for(&with(&[("HTTPS_PROXY", "http://proxy:3128")])),
+        "an added relevant variable"
     );
-    assert_ne!(
-        base,
-        environment_digest(variables(&[
-            ("DEPENDENCY_LINE", "1"),
-            ("HOME", "/h"),
-            ("JAVA_TOOL_OPTIONS", "-Dline=2"),
-        ]))
+}
+
+#[test]
+fn the_classpath_context_reads_env_references_of_the_project_poms() {
+    let directory = TempDir::new().unwrap();
+    let pom = directory.path().join("pom.xml");
+    fs::write(&pom, "<project><name>${env.BUILD_FLAVOR}</name></project>").unwrap();
+    let config = Config::from_env().unwrap();
+
+    let context = classpath_context(&ContextSources {
+        root: directory.path(),
+        config: &config,
+        reactor_poms: &[pom],
+        installation: &[],
+    });
+
+    assert!(context.starts_with(&project_scope(directory.path())));
+    assert!(context.contains("\"environment\":"));
+}
+
+#[test]
+fn a_variable_only_a_parent_or_bom_outside_the_reactor_references_is_a_resolution_input() {
+    let directory = TempDir::new().unwrap();
+    let repository = directory.path().join("repo");
+    let reactor = directory.path().join("app/pom.xml");
+    let local_parent = directory.path().join("parent/pom.xml");
+    let bom = repository.join("org/b/bom/2/bom-2.pom");
+    for (path, content) in [
+        (
+            &reactor,
+            "<project><parent><groupId>org.p</groupId><artifactId>parent</artifactId>\
+             <version>1</version><relativePath>../parent/pom.xml</relativePath></parent>\
+             <artifactId>app</artifactId><dependencyManagement><dependencies><dependency>\
+             <groupId>org.b</groupId><artifactId>bom</artifactId><version>2</version>\
+             <type>pom</type><scope>import</scope></dependency></dependencies>\
+             </dependencyManagement></project>",
+        ),
+        (
+            &local_parent,
+            "<project><artifactId>parent</artifactId>\
+             <properties><dep.version>${env.DEP_VERSION}</dep.version></properties></project>",
+        ),
+        (
+            &bom,
+            "<project><artifactId>bom</artifactId>\
+             <properties><flavor>${env.BOM_FLAVOR}</flavor></properties></project>",
+        ),
+    ] {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    let model = model_inputs::model_inputs(&[reactor], &[], Some(&repository)).unwrap();
+    let first_session = [
+        ("DEP_VERSION", "1.0"),
+        ("BOM_FLAVOR", "a"),
+        ("CLAUDE_CODE_SESSION_ID", "session-1"),
+        ("PWD", "/a"),
+    ];
+
+    let inputs = ResolutionInputs::new(
+        ProjectFingerprint::capture(model.paths),
+        model.env_references,
+        variables(&first_session),
     );
+
+    assert!(inputs.matches_environment(variables(&[
+        ("BOM_FLAVOR", "a"),
+        ("DEP_VERSION", "1.0"),
+        ("CLAUDE_CODE_SESSION_ID", "session-2"),
+        ("SSH_AUTH_SOCK", "/tmp/agent"),
+    ])));
+    assert!(
+        !inputs.matches_environment(variables(&[("DEP_VERSION", "2.0"), ("BOM_FLAVOR", "a")])),
+        "a variable of the local parent outside the reactor"
+    );
+    assert!(
+        !inputs.matches_environment(variables(&[("DEP_VERSION", "1.0")])),
+        "a variable of the imported BOM"
+    );
+    let decoded = decode_payload::<ResolutionInputs>(&encode_payload(&inputs).unwrap()).unwrap();
+    assert_eq!(decoded, inputs, "the references survive the manifest");
 }
 
 #[test]

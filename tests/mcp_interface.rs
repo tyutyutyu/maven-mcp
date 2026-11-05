@@ -4845,17 +4845,63 @@ async fn the_persisted_cache_is_size_bounded_and_forgotten_by_maven_runs_and_ref
     Ok(())
 }
 
+/// [`persisted_project`] whose Maven configuration references the `CLASSPATH_VARIANT` the
+/// controlled wrapper reads, so the variable takes part in the classpath identity.
+async fn persisted_project_reading_the_classpath_variant() -> Result<(TestServer, PathBuf)> {
+    let (server, project) = persisted_project().await?;
+    std::fs::create_dir_all(project.join(".mvn"))?;
+    std::fs::write(
+        project.join(".mvn/maven.config"),
+        "-Dclasspath.variant=${env.CLASSPATH_VARIANT}\n",
+    )?;
+    support::settle_tree(&project)?;
+    Ok((server, project))
+}
+
+#[tokio::test]
+async fn a_restarted_host_with_new_session_variables_reuses_the_persisted_classpath() -> Result<()>
+{
+    let (server, project) = persisted_project().await?;
+    let first_session = [
+        PERSISTED,
+        &[
+            ("CLAUDE_CODE_SESSION_ID", "session-1"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh-1/agent"),
+            ("VSCODE_IPC_HOOK", "/run/user/1000/vscode-1.sock"),
+        ],
+    ]
+    .concat();
+    let second_session = [
+        PERSISTED,
+        &[
+            ("CLAUDE_CODE_SESSION_ID", "session-2"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh-2/agent"),
+            ("VSCODE_IPC_HOOK", "/run/user/1000/vscode-2.sock"),
+        ],
+    ]
+    .concat();
+    search_in_new_process(&server, &project, "One", &first_session).await?;
+
+    let (found, cache) = search_in_new_process(&server, &project, "One", &second_session).await?;
+
+    assert_eq!(found, every_class());
+    assert_eq!(persisted_counters(&cache).0, 1, "a classpath cache hit");
+    assert_eq!(support::controlled_classpath_runs(&project), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_changed_inherited_environment_or_maven_installation_resolves_the_classpath_again()
 -> Result<()> {
-    let (server, project) = persisted_project().await?;
+    let (server, project) = persisted_project_reading_the_classpath_variant().await?;
     let classes = project.join("target/classes");
     let alpha_only = [repository_jar(&project, "alpha"), classes];
     let reactor_and_alpha = names(&["org.example.ReactorOne", "org.t.AlphaOne"]);
     search_in_new_process(&server, &project, "One", PERSISTED).await?;
 
-    // A variable the build reads (here: the classpath the wrapper prints) selects another
-    // dependency set; the stored classpath of the old environment is not served.
+    // A variable the build reads (here: the classpath the wrapper prints, referenced through
+    // `${env.CLASSPATH_VARIANT}`) selects another dependency set; the stored classpath of the
+    // old environment is not served.
     let alpha_line = alpha_only
         .iter()
         .map(|path| path.display().to_string())
@@ -4969,6 +5015,65 @@ async fn edited_or_deleted_external_parents_and_imported_boms_resolve_the_classp
     assert_eq!(found, every_class());
     assert_eq!(persisted_counters(&cache).0, 0);
     assert_eq!(support::controlled_classpath_runs(&project), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_variable_only_a_parent_outside_the_reactor_references_resolves_the_classpath_again()
+-> Result<()> {
+    let (server, project) = persisted_project().await?;
+    let parent = project.join("execution-repository/org/t/corp-parent/1/corp-parent-1.pom");
+    std::fs::create_dir_all(parent.parent().unwrap())?;
+    std::fs::write(
+        &parent,
+        "<project><groupId>org.t</groupId><artifactId>corp-parent</artifactId>\
+         <properties><classpath.variant>${env.CLASSPATH_VARIANT}</classpath.variant>\
+         </properties></project>",
+    )?;
+    std::fs::write(
+        project.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion>\
+         <parent><groupId>org.t</groupId><artifactId>corp-parent</artifactId><version>1</version><relativePath/></parent>\
+         <artifactId>fixture-project</artifactId><version>1.0</version></project>",
+    )?;
+    let alpha_only = [
+        repository_jar(&project, "alpha"),
+        project.join("target/classes"),
+    ];
+    let alpha_line = alpha_only
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    std::fs::write(project.join("classpath-alpha.txt"), alpha_line)?;
+    support::settle_tree(&project)?;
+    let alpha_environment = [PERSISTED, &[("CLASSPATH_VARIANT", "alpha")]].concat();
+    search_in_new_process(&server, &project, "One", PERSISTED).await?;
+
+    // Only the repository parent reads the variable, so it is not part of the context key,
+    // but the stored classpath records it and is not served after it changed.
+    let (found, cache) =
+        search_in_new_process(&server, &project, "One", &alpha_environment).await?;
+    assert_eq!(found, names(&["org.example.ReactorOne", "org.t.AlphaOne"]));
+    assert_eq!(persisted_counters(&cache).0, 0, "no stale classpath");
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
+
+    let session = [
+        PERSISTED,
+        &[
+            ("CLASSPATH_VARIANT", "alpha"),
+            ("CLAUDE_CODE_SESSION_ID", "another-session"),
+        ],
+    ]
+    .concat();
+    let (found, cache) = search_in_new_process(&server, &project, "One", &session).await?;
+    assert_eq!(found, names(&["org.example.ReactorOne", "org.t.AlphaOne"]));
+    assert_eq!(
+        persisted_counters(&cache).0,
+        1,
+        "an unchanged variable is reused"
+    );
+    assert_eq!(support::controlled_classpath_runs(&project), 2);
     Ok(())
 }
 
