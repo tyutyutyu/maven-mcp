@@ -163,6 +163,7 @@ type StoredReference = (u32, Option<u32>, Option<u32>, ClassReferenceKind);
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredClassFacts {
     source_class: u32,
+    source_file: Option<u32>,
     parents: Vec<(u32, TypeRelation)>,
     references: Vec<StoredReference>,
 }
@@ -273,6 +274,7 @@ pub(super) fn restore(
 fn store_class_facts(facts: &IndexedClassFacts) -> StoredClassFacts {
     StoredClassFacts {
         source_class: facts.source_class.0.get(),
+        source_file: facts.source_file.map(|id| id.0.get()),
         parents: facts
             .parents
             .iter()
@@ -299,6 +301,7 @@ fn validate(stored: StoredRecord) -> Result<StoredRecord> {
     let in_range = |id: u32| id >= 1 && (id as usize) <= count;
     let valid = stored.class_facts.iter().all(|facts| {
         in_range(facts.source_class)
+            && facts.source_file.is_none_or(in_range)
             && facts.parents.iter().all(|(parent, _)| in_range(*parent))
             && facts.references.iter().all(|(owner, name, descriptor, _)| {
                 in_range(*owner) && name.is_none_or(in_range) && descriptor.is_none_or(in_range)
@@ -338,6 +341,7 @@ fn into_record(stored: StoredRecord, path: &Path, identity: &JarIdentity) -> Jar
             .into_iter()
             .map(|facts| IndexedClassFacts {
                 source_class: fact_id(facts.source_class),
+                source_file: facts.source_file.map(fact_id),
                 parents: facts
                     .parents
                     .into_iter()

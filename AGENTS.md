@@ -103,7 +103,11 @@ agent-specific development rules.
   `groupId:artifactId:version[:classifier]`.
 - Treat `-sources.jar` artifacts as source archives, not binary class JARs.
 - Deduplicate classes from multi-release JARs. Source lookup for inner classes
-  must resolve to the enclosing class source.
+  must resolve to the enclosing class source. Source lookup resolves the query to
+  the indexed binary name case-insensitively, then selects the sources JAR entry
+  through the recorded classfile `SourceFile` attribute before the
+  `{outer}.java`/`{outer}.kt` convention (see "Source entry resolution" in
+  `README.md`).
 - Searches are case-insensitive, and `limit` is capped by `MAX_RESULTS`. Keep
   result ordering deterministic so snapshots do not become flaky.
 - The root of an MCP `outputSchema` must be an object. The public shape of

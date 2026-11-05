@@ -221,7 +221,9 @@ The server exposes the following MCP tools:
   restricted to one JAR.
 - `list_jar_classes` – paginated class listing for a selected JAR.
 - `get_class_source` – reads Java/Kotlin source from the associated
-  `-sources.jar` by fully qualified class name and optional JAR or version.
+  `-sources.jar` by fully qualified class name and optional JAR or version; the
+  entry is found through the classfile `SourceFile` attribute (see
+  [Source entry resolution](#source-entry-resolution)).
 - `describe_class` – reads classfile hierarchy, modifiers, generic signatures,
   constructors, methods, fields, and annotations without a sources JAR, using a
   `public` or `all` view.
@@ -301,12 +303,40 @@ version of your project:
   `+11`, or `011`) or are below 9 are never selected.
 - `search_jar_entries` still lists the raw entries, including every versioned one.
 
+### Source entry resolution
+
+`get_class_source` and `get_declaration_source` first resolve the requested class
+name case-insensitively to the binary name indexed in each matching JAR, so
+`org.example.foo` returns the same source as `org.example.Foo`, and results report
+the indexed binary name. Nested classes (`Outer$Inner`) resolve to the source of
+their enclosing class. The source entry of the `-sources.jar` is then selected in
+this order:
+
+1. The package directory plus the classfile `SourceFile` attribute, recorded when
+   the class is indexed (for example `org/example/Result.kt` for a Kotlin class
+   `Success` declared in `Result.kt`, `org/example/Utils.kt` for the file facade
+   `UtilsKt` or a `@file:JvmName` class, or `org/example/Primary.java` for a
+   secondary top-level Java class). Only plain `.java` and `.kt` file names are
+   used; other values are ignored.
+2. The same name below any leading directory prefix, as in Kotlin
+   Multiplatform sources JARs (`commonMain/org/example/Result.kt` or
+   `commonMain/kotlin/org/example/Result.kt`).
+3. The class-name convention `{outer}.java`, then `{outer}.kt`, also below any
+   leading directory prefix. This keeps classfiles without a `SourceFile`
+   attribute, such as obfuscated ones, working as before.
+
+For the same name, the exact entry wins over a prefixed one, and equally ranked
+entries (for example `commonMain/` and `jvmMain/` copies) resolve to the smallest
+entry name.
+Classes in the default package match only exact entries.
+
 ### Declaration source slices
 
 `get_declaration_source` reads the classfile of the class to find the requested
 declaration (class, field, or method with its JVM descriptor) and then locates it
-in the matching `.java` or `.kt` entry of the `-sources.jar`. The source is split
-into code tokens first, so comments, string and character literals, Java text
+in the source entry selected by
+[Source entry resolution](#source-entry-resolution). The source is split into
+code tokens first, so comments, string and character literals, Java text
 blocks, and Kotlin raw strings and `${...}` templates never move a declaration
 boundary, and brackets are matched across lines. A slice consists of whole lines:
 it starts at the first annotation or modifier of the declaration (Javadoc is not
@@ -336,8 +366,10 @@ Supported cases:
   parameters of enum constructors are accepted.
 
 Every classfile declaration that is not returned as a slice is listed in
-`unresolved` with a `reason`: `not_found` (no such declaration in the source
-type), `ambiguous` (several source declarations match equally, for example
+`unresolved` with a `reason`: `source_entry_missing` (the artifact has a
+`-sources.jar`, but it contains no entry for the class; `entry` is the expected
+entry name, `candidate_lines` is empty, and `truncated` is `false`), `not_found`
+(no such declaration in the source type), `ambiguous` (several source declarations match equally, for example
 parameter types with the same simple name from different packages), or
 `unproven` (same-named declarations exist, but none provably matches the
 descriptor, for example a compiler-generated bridge or synthetic method, which
@@ -350,8 +382,10 @@ Each source is read up to `MAX_SOURCE_BYTES`. When it was cut, `truncated` is
 `true` on both results and unresolved entries, a declaration that runs past the
 limit ends at the last code token that was read, and an overload whose parameter
 list was cut off is never returned as a match: it is reported as `ambiguous`
-together with a complete match, and as `unproven` when no complete match exists. An artifact without a `-sources.jar` or
-without the source entry produces neither a result nor an unresolved entry.
+together with a complete match, and as `unproven` when no complete match exists. An artifact without a `-sources.jar`
+produces neither a result nor an unresolved entry. A Kotlin file facade (`UtilsKt`)
+has no type declaration in its source, so its class and top-level members are
+reported as `not_found`; `get_class_source` returns the whole file.
 
 Project inspection and execution use the same request `project_path`:
 
@@ -558,7 +592,7 @@ Location and lifecycle:
 
 - Directory: `MAVEN_MCP_CACHE_DIR` when set (must be absolute), otherwise
   `$XDG_CACHE_HOME/maven-mcp/index` or `~/.cache/maven-mcp/index`. The directory
-  is made `0700` and the SQLite database `index-v1.sqlite3` is `0600`; it contains
+  is made `0700` and the SQLite database `index-v2.sqlite3` is `0600`; it contains
   local paths, class and entry names, never source content. The file name carries
   the cache format, so an older or newer binary with another format never reads it.
 - Disable with `MAVEN_MCP_INDEX_CACHE=false`; every process then starts cold, as
@@ -575,7 +609,7 @@ Location and lifecycle:
   deleted and rebuilt automatically, and a damaged or mismatching entry is a miss
   that is rebuilt; none of these is ever served as a result. Rebuilding a damaged
   database is serialized between processes by an exclusive lock on the private
-  `index-v1.sqlite3.lock` file, which counts the rebuilds: a process deletes the
+  `index-v2.sqlite3.lock` file, which counts the rebuilds: a process deletes the
   database only when no other process rebuilt it since its own diagnosis, and
   creates the new schema before releasing the lock, so concurrent recoveries never
   delete each other's new database or its journal. A failed cache write only loses
@@ -1674,10 +1708,13 @@ Surefire failures follow the existing report-error contract.
 | `RUST_LOG` | `maven_mcp=info` | Logging level/filter for stderr diagnostics; an invalid filter falls back to the default. `maven_mcp=debug` adds correlated per-call events; see [Debug logging](#debug-logging). MCP transport (`rmcp`) events are always suppressed; see [Redaction and data minimization](#redaction-and-data-minimization). |
 
 `get_class_source` returns a result only when the corresponding sources artifact
-is present in the local repository. For Maven projects, these artifacts can be
-downloaded with commands such as `mvn dependency:sources`. Missing source entries
-produce empty results; unreadable source archives or entries are reported as MCP
-errors.
+is present in the local repository and contains the entry selected by
+[Source entry resolution](#source-entry-resolution). For Maven projects, these
+artifacts can be downloaded with commands such as `mvn dependency:sources`. A
+missing sources artifact and a sources artifact without the class's entry both
+produce empty results; use `get_declaration_source`, which reports the second case
+as `source_entry_missing`, to tell them apart. Unreadable source archives or
+entries are reported as MCP errors.
 
 ## Troubleshooting
 
@@ -1786,7 +1823,9 @@ session then builds its first index cold.
 
 **Source artifacts.** `get_class_source`, `search_source` and
 `get_declaration_source` read `-sources.jar` files from the local repository. An
-empty result means that the sources artifact is not there: run
+empty result usually means that the sources artifact is not there;
+`get_declaration_source` reports a sources artifact that lacks the class's entry
+as `source_entry_missing` instead. To fetch missing sources artifacts, run
 `./mvnw -B dependency:sources` (with `-Dmaven.repo.local=...` when
 `MAVEN_EXECUTION_REPO_PATH` is set), or call `run_maven` with
 `["dependency:sources"]`. `run_maven` passes only the arguments you give it and

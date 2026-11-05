@@ -70,6 +70,23 @@ scenarios:
           source: "package org.example; public class Foo { int scoped = 2; }"
           truncated: false
 
+  - id: source-case-insensitive-class-name
+    title: Source for a class name in another letter case
+    description: A query that differs from the binary name only in letter case returns the same source, reported under the indexed binary name.
+    tool: get_class_source
+    arguments:
+      class_name: ORG.EXAMPLE.foo
+      version: "2.0"
+    expect:
+      result_count: 1
+      contains:
+        - class_name: org.example.Foo
+          source_jar:
+            coordinate: org.libs:helper:2.0:sources
+          entry: org/example/Foo.java
+          source: "package org.example; public class Foo { int scoped = 2; }"
+          truncated: false
+
   - id: artifact-versions-scoped
     title: Available versions of a scoped artifact
     description: Only the helper version present in the project classpath index is visible.

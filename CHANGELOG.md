@@ -85,3 +85,16 @@ becomes the GitHub Release notes.
   ignores, so the build classpath also listed test-scope dependencies; it now
   passes the plugin's `-DincludeScope` user property for both kinds. The
   `benchmark.json` shell baselines use the same property.
+- `get_class_source` and `get_declaration_source` find the source entry through
+  the classfile `SourceFile` attribute before the `{outer}.java` / `{outer}.kt`
+  class-name convention, also below any leading directory prefix such as
+  `commonMain/` or `commonMain/kotlin/`. Kotlin classes declared in a
+  differently named file, Kotlin file facades (`UtilsKt`, `@file:JvmName`),
+  secondary top-level Java classes, and Kotlin Multiplatform sources JARs now
+  return their source. A class name that
+  differs from the binary name only in letter case returns the same source, and
+  results report the indexed binary name instead of the query spelling.
+  `get_declaration_source` lists the declarations of a class whose sources JAR
+  lacks its entry in `unresolved` with the new `reason` `source_entry_missing`
+  instead of returning nothing. The on-disk index cache format is now 2
+  (`index-v2.sqlite3`), so existing caches are rebuilt once on first use.
