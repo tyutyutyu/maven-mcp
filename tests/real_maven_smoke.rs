@@ -57,7 +57,8 @@ impl SmokeEnvironment {
 }
 
 /// A trusted project and a private local repository: a copy of the prepared plugin
-/// repository plus the synthetic artifacts of `tests/fixtures/dependency_tree.txt`.
+/// repository plus the synthetic artifacts of `tests/fixtures/dependency_tree.txt` and
+/// the test-scope artifact of `SCOPED_PROJECT_POM`.
 struct SmokeProject {
     _root: TempDir,
     trusted_directory: PathBuf,
@@ -67,6 +68,10 @@ struct SmokeProject {
 
 impl SmokeProject {
     fn new(environment: &SmokeEnvironment) -> Result<Self> {
+        Self::with_pom(environment, PROJECT_POM)
+    }
+
+    fn with_pom(environment: &SmokeEnvironment, pom: &str) -> Result<Self> {
         let root = TempDir::new()?;
         let trusted_directory = root.path().join("trusted");
         let project = trusted_directory.join("fixture-project");
@@ -74,7 +79,7 @@ impl SmokeProject {
         copy_tree(&environment.plugin_repository, &repository)?;
         write_artifacts(&repository)?;
         std::fs::create_dir_all(project.join(".mvn"))?;
-        std::fs::write(project.join("pom.xml"), PROJECT_POM)?;
+        std::fs::write(project.join("pom.xml"), pom)?;
         // Maven 3.9 reads one argument per line; the server's Maven runs must not
         // fall back to the user's settings.
         std::fs::write(
@@ -109,6 +114,27 @@ const PROJECT_POM: &str = r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
       <plugins>
         <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.8.1</version></plugin>
         <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-help-plugin</artifactId><version>3.5.1</version></plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>
+"#;
+
+/// One `compile` and one `test` scope dependency: the build classpath must contain only
+/// the first, the test classpath both.
+const SCOPED_PROJECT_POM: &str = r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example</groupId>
+  <artifactId>scoped-project</artifactId>
+  <version>1.0</version>
+  <dependencies>
+    <dependency><groupId>org.libs</groupId><artifactId>helper</artifactId><version>2.0</version><scope>compile</scope></dependency>
+    <dependency><groupId>org.libs</groupId><artifactId>testkit</artifactId><version>1.0</version><scope>test</scope></dependency>
+  </dependencies>
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.8.1</version></plugin>
       </plugins>
     </pluginManagement>
   </build>
@@ -175,6 +201,13 @@ fn write_artifacts(repository: &Path) -> Result<()> {
         Some("linux"),
         "",
         &["org/example/NativeBinding"],
+    )?;
+    write_artifact(
+        repository,
+        ("org.libs", "testkit", "1.0"),
+        None,
+        "",
+        &["org/example/TestKit"],
     )
 }
 
@@ -256,6 +289,33 @@ async fn call(
         .with_context(|| format!("{tool} returned no structured content"))
 }
 
+/// The sorted artifact coordinates of one `get_maven_classpath` call.
+async fn classpath_artifacts(
+    client: &RunningService<RoleClient, ()>,
+    project_path: &str,
+    kind: &str,
+) -> Result<Vec<String>> {
+    let classpath = call(
+        client,
+        "get_maven_classpath",
+        json!({ "project_path": project_path, "kind": kind }),
+    )
+    .await?;
+    ensure!(
+        classpath["build"]["outcome"] == "success" && classpath["incomplete"] == false,
+        "{kind} classpath failed: {classpath:#}"
+    );
+    let mut artifacts = classpath["artifacts"]
+        .as_array()
+        .context("classpath artifacts")?
+        .iter()
+        .map(|artifact| artifact.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .context("classpath artifacts must be strings")?;
+    artifacts.sort_unstable();
+    Ok(artifacts)
+}
+
 #[test]
 #[ignore = "needs a pinned real Maven; run scripts/real-maven-smoke.sh"]
 fn real_maven_reproduces_the_captured_dependency_tree_fixture() -> Result<()> {
@@ -318,22 +378,12 @@ async fn real_maven_drives_the_project_tools_through_stdio() -> Result<()> {
         .collect::<Vec<_>>();
     assert_eq!(tree["dependencies"], json!(expected_tree));
 
-    let classpath = call(
-        &client,
-        "get_maven_classpath",
-        json!({ "project_path": project_path, "kind": "test" }),
-    )
-    .await?;
-    let mut artifacts = classpath["artifacts"]
-        .as_array()
-        .context("classpath artifacts")?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    artifacts.sort_unstable();
     let mut expected_artifacts = EXPECTED_TREE.map(|(coordinate, _, _)| coordinate);
     expected_artifacts.sort_unstable();
-    assert_eq!(artifacts, expected_artifacts, "{classpath:#}");
+    assert_eq!(
+        classpath_artifacts(&client, &project_path, "test").await?,
+        expected_artifacts
+    );
 
     for (query, class_name, coordinate) in [
         ("Foo", "org.example.Foo", "org.libs:helper:2.0"),
@@ -368,6 +418,27 @@ async fn real_maven_drives_the_project_tools_through_stdio() -> Result<()> {
     assert_eq!(
         effective["projects"][0]["coordinate"]["artifact_id"],
         "fixture-project"
+    );
+
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs a pinned real Maven; run scripts/real-maven-smoke.sh"]
+async fn real_maven_build_classpath_excludes_test_scope_dependencies() -> Result<()> {
+    let environment = SmokeEnvironment::from_env()?;
+    let project = SmokeProject::with_pom(&environment, SCOPED_PROJECT_POM)?;
+    let client = connect(&environment, &project).await?;
+    let project_path = project.project_path();
+
+    assert_eq!(
+        classpath_artifacts(&client, &project_path, "build").await?,
+        ["org.libs:helper:2.0"]
+    );
+    assert_eq!(
+        classpath_artifacts(&client, &project_path, "test").await?,
+        ["org.libs:helper:2.0", "org.libs:testkit:1.0"]
     );
 
     client.cancel().await?;

@@ -2280,7 +2280,9 @@ runs Maven offline, never reading `~/.m2` or the user's Maven settings or
 `~/.mavenrc`. The ignored Cargo tests in `tests/real_maven_smoke.rs` check that
 real Maven reproduces the versioned `tests/fixtures/dependency_tree.txt` capture
 and that the server's dependency, classpath, class search and effective-POM
-tools work against real Maven over STDIO. `target/real-maven-smoke/` is a local
+tools work against real Maven over STDIO, including that the `build` classpath
+omits a `test` scope dependency that the `test` classpath includes.
+`target/real-maven-smoke/` is a local
 cache; do not commit it.
 
 ### Multi-project dogfood smoke

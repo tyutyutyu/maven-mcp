@@ -77,3 +77,11 @@ becomes the GitHub Release notes.
   `run_maven_lifecycle`, `list_maven_test_classes`,
   `get_last_maven_test_failures`, `refresh_maven_project`, `search_source`, and
   `search_jar_content` descriptions use these terms.
+
+### Fixed
+
+- `get_maven_classpath` with `kind: "build"` now returns only the compile-scope
+  classpath. It passed `-Dmdep.includeScope`, which `maven-dependency-plugin`
+  ignores, so the build classpath also listed test-scope dependencies; it now
+  passes the plugin's `-DincludeScope` user property for both kinds. The
+  `benchmark.json` shell baselines use the same property.
