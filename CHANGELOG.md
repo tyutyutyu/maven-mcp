@@ -98,3 +98,13 @@ becomes the GitHub Release notes.
   lacks its entry in `unresolved` with the new `reason` `source_entry_missing`
   instead of returning nothing. The on-disk index cache format is now 2
   (`index-v2.sqlite3`), so existing caches are rebuilt once on first use.
+- Source tools find the sources of classifier JARs. A classified JAR such as
+  `artifact-1.0-jakarta.jar` used to look only for
+  `artifact-1.0-jakarta-sources.jar` and returned no source when Maven published
+  the plain `artifact-1.0-sources.jar`; it now prefers the classifier-specific
+  sources JAR and falls back to the plain one. A `tests` JAR now reads
+  `artifact-1.0-test-sources.jar` instead of `artifact-1.0-tests-sources.jar`.
+  `-test-sources.jar` and `-{classifier}-sources.jar` archives count as sources
+  JARs, not binary JARs, in `index_stats` and the search tools. The on-disk
+  index cache format is now 3 (`index-v3.sqlite3`), so existing caches are
+  rebuilt once on first use.

@@ -59,6 +59,11 @@ struct JarRecord {
 }
 
 impl JarRecord {
+    /// Whether this record is a sources JAR rather than a binary JAR.
+    fn is_source(&self) -> bool {
+        documented_classifier(self.classifier.as_deref()).is_some()
+    }
+
     fn coordinate(&self) -> String {
         match &self.classifier {
             Some(classifier) => format!(
@@ -584,7 +589,9 @@ pub struct IndexStats {
 pub struct MavenIndex {
     root: PathBuf,
     jars: Vec<JarRecord>,
-    source_jars: HashMap<ArtifactKey, usize>,
+    /// Sources JAR per artifact, keyed by the binary classifier it documents
+    /// (see [`documented_classifier`]).
+    source_jars: HashMap<ArtifactKey, HashMap<Option<String>, usize>>,
     class_locations: HashMap<String, Vec<usize>>,
     /// ASCII-lowercased parent type name to its direct children in the deterministic search
     /// order (child name, JAR path, relation); see [`build_children_by_parent`].
@@ -658,9 +665,15 @@ impl MavenIndex {
                     continue;
                 }
             };
-            if let Some(source_path) = source_jar_path(&path)
-                && source_path.is_file()
-                && let Ok(source_identity) = scoped_identity(repository_root, reactor, &source_path)
+            if let Some((source_path, source_identity)) =
+                source_jar_candidates(&path, identity.classifier.as_deref())
+                    .into_iter()
+                    .filter(|candidate| candidate.is_file())
+                    .find_map(|candidate| {
+                        scoped_identity(repository_root, reactor, &candidate)
+                            .ok()
+                            .map(|source_identity| (candidate, source_identity))
+                    })
             {
                 jars.insert(source_path, source_identity);
             }
@@ -763,15 +776,20 @@ impl MavenIndex {
         for record in records {
             let key = record.key.clone();
             let jar_index = index.jars.len();
-            let is_source = record.classifier.as_deref() == Some("sources");
+            let documented =
+                documented_classifier(record.classifier.as_deref()).map(|c| c.map(str::to_owned));
 
             index
                 .artifacts
                 .entry((key.group_id.clone(), key.artifact_id.clone()))
                 .or_default()
                 .insert(key.version.clone());
-            if is_source {
-                index.source_jars.insert(key, jar_index);
+            if let Some(documented) = documented {
+                index
+                    .source_jars
+                    .entry(key)
+                    .or_default()
+                    .insert(documented, jar_index);
             } else {
                 for class_name in &record.classes {
                     index
@@ -790,12 +808,12 @@ impl MavenIndex {
 
     pub fn stats(&self) -> IndexStats {
         IndexStats {
-            jar_count: self.jars.len() - self.source_jars.len(),
-            source_jar_count: self.source_jars.len(),
+            jar_count: self.jars.len() - self.source_jar_count(),
+            source_jar_count: self.source_jar_count(),
             class_count: self
                 .jars
                 .iter()
-                .filter(|jar| jar.classifier.as_deref() != Some("sources"))
+                .filter(|jar| !jar.is_source())
                 .map(|jar| jar.classes.len())
                 .sum(),
             unique_class_count: self.class_locations.len(),
@@ -858,7 +876,22 @@ impl MavenIndex {
                 })
                 .sum::<usize>();
         }
-        total += self.source_jars.len() * (size_of::<ArtifactKey>() + NODE_OVERHEAD);
+        total += self
+            .source_jars
+            .values()
+            .map(|by_classifier| {
+                size_of::<ArtifactKey>()
+                    + NODE_OVERHEAD
+                    + by_classifier
+                        .keys()
+                        .map(|classifier| {
+                            size_of::<(Option<String>, usize)>()
+                                + classifier.as_deref().map_or(0, str::len)
+                                + NODE_OVERHEAD
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
         total += self
             .class_locations
             .iter()
@@ -985,7 +1018,7 @@ impl MavenIndex {
         let limit = self.limit(limit);
         self.selected_jars(Some(jar_selector))
             .into_iter()
-            .filter(|jar| jar.classifier.as_deref() != Some("sources"))
+            .filter(|jar| !jar.is_source())
             .map(|jar| ClassList {
                 jar: self.summary(jar),
                 total: jar.classes.len(),
@@ -1040,13 +1073,13 @@ impl MavenIndex {
             {
                 continue;
             }
-            let Some(source_index) = self.source_jars.get(&binary.key) else {
+            let Some(source_index) = self.source_jar_of(binary) else {
                 continue;
             };
             let Some(class_name) = binary.canonical_class_name(&normalized) else {
                 continue;
             };
-            let source_jar = &self.jars[*source_index];
+            let source_jar = &self.jars[source_index];
             let names = binary.source_entry_names(class_name);
             if let Some((entry, source, truncated)) =
                 read_source(&source_jar.path, &names, self.max_source_bytes)?
@@ -1236,7 +1269,7 @@ impl MavenIndex {
         for jar in self
             .selected_jars(jar_selector)
             .into_iter()
-            .filter(|jar| jar.classifier.as_deref() != Some("sources"))
+            .filter(|jar| !jar.is_source())
         {
             if jar.classes.is_empty() {
                 continue;
@@ -1422,7 +1455,7 @@ impl MavenIndex {
         'jars: for jar in self
             .selected_jars(jar_selector)
             .into_iter()
-            .filter(|jar| jar.classifier.as_deref() != Some("sources"))
+            .filter(|jar| !jar.is_source())
         {
             let mut archive = ClassArchive::open(&jar.path)?;
             for entry_path in jar.entries.iter().filter(|entry| is_text_resource(entry)) {
@@ -1547,9 +1580,8 @@ impl MavenIndex {
         let mut results = Vec::new();
         let mut scanned_bytes = 0usize;
         let mut incomplete = false;
-        'jars: for source_jar in self.jars.iter().filter(|jar| {
-            jar.classifier.as_deref() == Some("sources")
-                && self.source_matches_selector(jar, jar_selector)
+        'jars: for (_, source_jar) in self.jars.iter().enumerate().filter(|(source_index, jar)| {
+            jar.is_source() && self.source_matches_selector(*source_index, jar, jar_selector)
         }) {
             let mut archive = ZipArchive::new(File::open(&source_jar.path)?)?;
             for entry_path in source_jar
@@ -1635,7 +1667,7 @@ impl MavenIndex {
             {
                 continue;
             }
-            let Some(source_index) = self.source_jars.get(&binary.key) else {
+            let Some(source_index) = self.source_jar_of(binary) else {
                 continue;
             };
             let Some(class_name) = binary.canonical_class_name(&query) else {
@@ -1659,7 +1691,7 @@ impl MavenIndex {
                 ambiguous_candidates.extend(matching.into_iter().map(|value| value.candidate));
                 continue;
             }
-            let source_jar = &self.jars[*source_index];
+            let source_jar = &self.jars[source_index];
             let names = binary.source_entry_names(class_name);
             let Some((entry, source, truncated)) =
                 read_source(&source_jar.path, &names, self.max_source_bytes)?
@@ -1756,7 +1788,7 @@ impl MavenIndex {
             .jars
             .iter()
             .filter(|jar| {
-                jar.classifier.as_deref() != Some("sources")
+                !jar.is_source()
                     && jar_selector.is_none_or(|selector| matches_selector(jar, selector))
             })
             .flat_map(|jar| {
@@ -1893,13 +1925,38 @@ impl MavenIndex {
             .collect()
     }
 
-    fn source_matches_selector(&self, source_jar: &JarRecord, selector: Option<&str>) -> bool {
+    /// The index of the sources JAR of `binary`, following [`source_jar_candidates`]: the one
+    /// published for its classifier, otherwise, for a classifier other than `tests`, the one
+    /// of the unclassified artifact.
+    fn source_jar_of(&self, binary: &JarRecord) -> Option<usize> {
+        let by_classifier = self.source_jars.get(&binary.key)?;
+        let exact = by_classifier.get(&binary.classifier);
+        match binary.classifier.as_deref() {
+            None | Some(TESTS_CLASSIFIER) => exact,
+            Some(_) => exact.or_else(|| by_classifier.get(&None)),
+        }
+        .copied()
+    }
+
+    fn source_jar_count(&self) -> usize {
+        self.source_jars.values().map(HashMap::len).sum()
+    }
+
+    /// Whether the sources JAR at `source_index` is selected: directly by `selector`, or as
+    /// the sources JAR of a selected binary JAR (see [`Self::source_jar_of`]).
+    fn source_matches_selector(
+        &self,
+        source_index: usize,
+        source_jar: &JarRecord,
+        selector: Option<&str>,
+    ) -> bool {
         selector.is_none_or(|selector| {
             matches_selector(source_jar, selector)
                 || self.jars.iter().any(|jar| {
                     jar.key == source_jar.key
-                        && jar.classifier.as_deref() != Some("sources")
+                        && !jar.is_source()
                         && matches_selector(jar, selector)
+                        && self.source_jar_of(jar) == Some(source_index)
                 })
         })
     }
@@ -2260,11 +2317,12 @@ fn load_jar_record(
             return None;
         }
     };
-    let (class_facts, providers, fact_strings) = if classifier.as_deref() == Some("sources") {
-        (Vec::new(), Vec::new(), Vec::new())
-    } else {
-        collect_jar_facts(path, &entries, &class_entries, max_entry_bytes)
-    };
+    let (class_facts, providers, fact_strings) =
+        if documented_classifier(classifier.as_deref()).is_some() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            collect_jar_facts(path, &entries, &class_entries, max_entry_bytes)
+        };
     Some(JarRecord {
         key,
         classifier,
@@ -2590,8 +2648,33 @@ fn reactor_module_coordinate(reactor_root: &Path, module_directory: &Path) -> Op
     })
 }
 
+/// Classifier of the sources JAR of an unclassified artifact.
+const SOURCES_CLASSIFIER: &str = "sources";
+/// Classifier of the test JAR (`maven-jar-plugin:test-jar`).
+const TESTS_CLASSIFIER: &str = "tests";
+/// Classifier of the sources JAR of the `tests` artifact (`maven-source-plugin:test-jar`).
+const TEST_SOURCES_CLASSIFIER: &str = "test-sources";
+
 /// Classifiers recognized at the end of a custom `finalName` archive.
-const OUTPUT_CLASSIFIER_SUFFIXES: [&str; 3] = ["test-sources", "sources", "tests"];
+const OUTPUT_CLASSIFIER_SUFFIXES: [&str; 3] = [
+    TEST_SOURCES_CLASSIFIER,
+    SOURCES_CLASSIFIER,
+    TESTS_CLASSIFIER,
+];
+
+/// The binary classifier whose sources a JAR with `classifier` contains, or `None` when it
+/// is not a sources JAR: `sources` documents the unclassified artifact, `test-sources` the
+/// `tests` artifact, and `{classifier}-sources` the artifact with that classifier.
+fn documented_classifier(classifier: Option<&str>) -> Option<Option<&str>> {
+    match classifier? {
+        SOURCES_CLASSIFIER => Some(None),
+        TEST_SOURCES_CLASSIFIER => Some(Some(TESTS_CLASSIFIER)),
+        other => other
+            .strip_suffix("-sources")
+            .filter(|documented| !documented.is_empty())
+            .map(Some),
+    }
+}
 
 /// Identifies a reactor module output: a JAR (conventionally or `finalName`-named) or a
 /// class directory below the module build directory. `test-classes` maps to `tests`.
@@ -2623,13 +2706,55 @@ fn reactor_identity(
     })
 }
 
-pub(crate) fn source_jar_path(binary_jar: &Path) -> Option<PathBuf> {
-    let file_name = binary_jar.file_name()?.to_str()?;
-    if file_name.ends_with("-sources.jar") {
-        return None;
+/// The sibling sources JARs Maven may publish for the binary JAR `binary_jar` with the
+/// parsed `classifier`, in preference order. With `base` the file stem without the
+/// classifier (`{artifactId}-{version}` in the repository layout):
+///
+/// - no classifier: `{base}-sources.jar`;
+/// - `tests`: `{base}-test-sources.jar`;
+/// - any other classifier: the classifier-specific `{base}-{classifier}-sources.jar`, then
+///   the plain `{base}-sources.jar` that Maven publishes for the whole artifact.
+///
+/// Sources JARs and paths that are not JAR files have no candidates.
+pub(crate) fn source_jar_candidates(binary_jar: &Path, classifier: Option<&str>) -> Vec<PathBuf> {
+    let Some(stem) = binary_jar
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jar"))
+        .filter(|stem| !stem.ends_with("-sources"))
+    else {
+        return Vec::new();
+    };
+    let sibling = |name: String| binary_jar.with_file_name(format!("{name}.jar"));
+    let classified = classifier.and_then(|classifier| {
+        let base = stem.strip_suffix(classifier)?.strip_suffix('-')?;
+        Some((classifier, base))
+    });
+    match classified {
+        None => vec![sibling(format!("{stem}-{SOURCES_CLASSIFIER}"))],
+        Some((TESTS_CLASSIFIER, base)) => {
+            vec![sibling(format!("{base}-{TEST_SOURCES_CLASSIFIER}"))]
+        }
+        Some((_, base)) => vec![
+            sibling(format!("{stem}-{SOURCES_CLASSIFIER}")),
+            sibling(format!("{base}-{SOURCES_CLASSIFIER}")),
+        ],
     }
-    let stem = file_name.strip_suffix(".jar")?;
-    Some(binary_jar.with_file_name(format!("{stem}-sources.jar")))
+}
+
+/// Every sources JAR [`MavenIndex::build_scoped`] may pair with the classpath entry `path`,
+/// whether or not it exists, so that adding, changing or removing one is detected.
+pub(crate) fn source_jar_stamp_paths(
+    repository_root: Option<&Path>,
+    reactor: &ReactorLayout<'_>,
+    path: &Path,
+) -> Vec<PathBuf> {
+    let Ok(path) = path.canonicalize() else {
+        return Vec::new();
+    };
+    scoped_identity(repository_root, reactor, &path)
+        .map(|identity| source_jar_candidates(&path, identity.classifier.as_deref()))
+        .unwrap_or_default()
 }
 
 fn collect_jar_facts(

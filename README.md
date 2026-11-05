@@ -427,8 +427,13 @@ parent-directory symlink pointing outside it (even a dangling one) is rejected
 without reading or returning external content; absent artifacts still report
 `found: false`. Other repository-search tools ask Maven for
 the effective test classpath, build the lazy project index only from those local JARs and
-their sibling `-sources.jar` files, and cache that index by canonical
-project root. For a multi-module reactor, classpath sections from every module
+their sibling sources JARs, and cache that index by canonical
+project root. The sources JAR follows the Maven classifier convention: an
+unclassified `artifact-1.0.jar` uses `artifact-1.0-sources.jar`, a `tests`
+JAR (`artifact-1.0-tests.jar`) uses `artifact-1.0-test-sources.jar`, and any
+other classifier (`artifact-1.0-jakarta.jar`) uses a classifier-specific
+`artifact-1.0-jakarta-sources.jar` when it exists and otherwise the plain
+`artifact-1.0-sources.jar`. For a multi-module reactor, classpath sections from every module
 are aggregated; empty parent or aggregator POM sections do not hide dependencies
 reported by later modules. Reactor outputs on that classpath are indexed with the
 repository artifacts: packaged JARs (conventionally named or with a custom
@@ -592,7 +597,7 @@ Location and lifecycle:
 
 - Directory: `MAVEN_MCP_CACHE_DIR` when set (must be absolute), otherwise
   `$XDG_CACHE_HOME/maven-mcp/index` or `~/.cache/maven-mcp/index`. The directory
-  is made `0700` and the SQLite database `index-v2.sqlite3` is `0600`; it contains
+  is made `0700` and the SQLite database `index-v3.sqlite3` is `0600`; it contains
   local paths, class and entry names, never source content. The file name carries
   the cache format, so an older or newer binary with another format never reads it.
 - Disable with `MAVEN_MCP_INDEX_CACHE=false`; every process then starts cold, as
@@ -609,7 +614,7 @@ Location and lifecycle:
   deleted and rebuilt automatically, and a damaged or mismatching entry is a miss
   that is rebuilt; none of these is ever served as a result. Rebuilding a damaged
   database is serialized between processes by an exclusive lock on the private
-  `index-v2.sqlite3.lock` file, which counts the rebuilds: a process deletes the
+  `index-v3.sqlite3.lock` file, which counts the rebuilds: a process deletes the
   database only when no other process rebuilt it since its own diagnosis, and
   creates the new schema before releasing the lock, so concurrent recoveries never
   delete each other's new database or its journal. A failed cache write only loses

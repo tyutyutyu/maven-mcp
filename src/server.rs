@@ -1036,15 +1036,27 @@ impl MavenMcpServer {
                 None,
             ));
         }
+        let modules = snapshot.runner.module_directories();
         // Class directories are stamped file by file, so editing a nested class invalidates.
         let stamped_paths = classpath.paths.clone();
+        let stamped_repository = repository_root.clone();
+        let stamped_root = root.to_owned();
+        let stamped_modules = modules.clone();
         let (artifacts, ownership) = match self
             .blocking(move || {
+                let reactor = ReactorLayout {
+                    root: &stamped_root,
+                    modules: &stamped_modules,
+                };
                 let artifacts =
                     ProjectFingerprint::capture_trees(stamped_paths.iter().flat_map(|path| {
                         [path.clone()]
                             .into_iter()
-                            .chain(crate::index::source_jar_path(path))
+                            .chain(crate::index::source_jar_stamp_paths(
+                                stamped_repository.as_deref(),
+                                &reactor,
+                                path,
+                            ))
                     }));
                 (artifacts, ownership)
             })
@@ -1075,7 +1087,6 @@ impl MavenMcpServer {
                 }
             }
         };
-        let modules = snapshot.runner.module_directories();
         let project_root = root.to_owned();
         let fingerprint = Arc::clone(&snapshot.fingerprint);
         let (max_results, max_source_bytes) =
