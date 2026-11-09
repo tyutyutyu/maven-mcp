@@ -5,11 +5,11 @@
   "license": "MIT",
   "engines": {
     "node": "v26.13.0",
-    "npm": "12.2.1"
+    "npm": "12.2.2"
   },
-  "packageManager": "npm@12.2.1",
+  "packageManager": "npm@12.2.2",
   "devDependencies": {
-    "@modelcontextprotocol/inspector": "2.13.0",
+    "@modelcontextprotocol/inspector": "2.14.0",
     "promptfoo": "0.125.1"
   }
 }
