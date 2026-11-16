@@ -4,12 +4,12 @@
   "description": "Pinned Node.js tools for the optional MCP Inspector and Promptfoo agent evaluation scripts; installed with npm ci from package-lock.json.",
   "license": "MIT",
   "engines": {
-    "node": "v26.13.0",
+    "node": "26.13.1",
     "npm": "12.2.2"
   },
   "packageManager": "npm@12.2.2",
   "devDependencies": {
-    "@modelcontextprotocol/inspector": "2.14.0",
+    "@modelcontextprotocol/inspector": "2.15.0",
     "promptfoo": "0.125.1"
   }
 }
